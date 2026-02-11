@@ -122,15 +122,16 @@ def isaaclab_29dof_joint_names():
 
 
 # ---------------------------------------------------------------------------
-# Sample data fixtures (will be expanded in Phase 2 when dataclasses exist)
+# Sample data fixtures
 # ---------------------------------------------------------------------------
+
+from src.robot.base import RobotState
+from src.config import Config, load_config, Q_HOME_29DOF, G1_29DOF_JOINTS
+
 
 @pytest.fixture
 def sample_robot_state_dict():
-    """Plausible standing robot state as raw arrays (pre-dataclass).
-
-    Will be replaced by a proper RobotState fixture in Phase 2.
-    """
+    """Plausible standing robot state as raw arrays."""
     n_dof = 29
     return {
         "timestamp": 0.0,
@@ -149,6 +150,29 @@ def sample_robot_state_dict():
         "base_position": np.array([0.0, 0.0, 0.793]),
         "base_velocity": np.zeros(3),
     }
+
+
+@pytest.fixture
+def sample_robot_state():
+    """Plausible standing RobotState for 29-DOF."""
+    home = np.array([Q_HOME_29DOF[j] for j in G1_29DOF_JOINTS])
+    return RobotState(
+        timestamp=0.0,
+        joint_positions=home.copy(),
+        joint_velocities=np.zeros(29),
+        joint_torques=np.zeros(29),
+        imu_quaternion=np.array([1.0, 0.0, 0.0, 0.0]),
+        imu_angular_velocity=np.zeros(3),
+        imu_linear_acceleration=np.array([0.0, 0.0, 9.81]),
+        base_position=np.array([0.0, 0.0, 0.793]),
+        base_velocity=np.zeros(3),
+    )
+
+
+@pytest.fixture
+def sample_config():
+    """Default Config loaded from configs/default.yaml."""
+    return load_config(str(PROJECT_ROOT / "configs" / "default.yaml"))
 
 
 # ---------------------------------------------------------------------------

@@ -130,8 +130,80 @@ tests/test_scaffolding.py — 16 passed in 3.01s
 
 ### Pending for Future Phases
 
-- `sample_robot_state` fixture (proper `RobotState` dataclass) — Phase 2
-- `sample_config` fixture (proper `Config` dataclass) — Phase 2
+- ~~`sample_robot_state` fixture — Phase 2~~ DONE
+- ~~`sample_config` fixture — Phase 2~~ DONE
 - `patch_unitree_threading()` in conftest.py — Phase 3
 - Scene XML files (`scene_29dof.xml`, `scene_23dof.xml`) — Phase 7
-- Config YAML files (`configs/default.yaml`, etc.) — Phase 2
+- ~~Config YAML files (`configs/default.yaml`, etc.) — Phase 2~~ DONE
+
+---
+
+## Pass 1, Step 3: Phase 2 — Core Data Structures and Configuration [Shared]
+
+**Date:** 2026-02-11
+**Status:** COMPLETE
+
+### Task 2.1: Robot Constants (`src/config.py` - Part 1)
+
+All constants implemented:
+- `G1_29DOF_JOINTS` (29 entries), `G1_23DOF_JOINTS` (23 entries)
+- `G1_29DOF_MUJOCO_JOINTS`, `G1_23DOF_MUJOCO_JOINTS` — config name to MuJoCo name
+- `ISAACLAB_G1_29DOF_JOINTS` — 29 MuJoCo names in IsaacLab order
+- `ISAACLAB_TO_NATIVE_INDICES` — 29-element index mapping
+- `Q_HOME_29DOF`, `Q_HOME_23DOF` — home positions
+- `JOINT_LIMITS_29DOF`, `JOINT_LIMITS_23DOF` — position limits (min, max) tuples
+- `TORQUE_LIMITS_29DOF`, `TORQUE_LIMITS_23DOF` — max torque per joint
+- DDS/IDL name mappings (`_DDS_TO_CONFIG_29DOF`, `_DDS_TO_CONFIG_23DOF`)
+- `resolve_joint_name()` — accepts config, MuJoCo, or DDS names
+
+**Note on 23-DOF MuJoCo names:** The 23-DOF config names differ from MuJoCo joint names in the XML:
+- `torso` -> `waist_yaw_joint`
+- `left_elbow_pitch` -> `left_elbow_joint`
+- `left_elbow_roll` -> `left_wrist_roll_joint`
+- (same pattern for right arm)
+
+### Task 2.2: Dataclasses (`src/robot/base.py`)
+
+- `RobotState` with `zeros(n_dof)` factory and `copy()` method
+- `RobotCommand` with `damping(n_dof, kd)` factory
+
+### Task 2.3: RobotInterface ABC (`src/robot/base.py`)
+
+- `connect()`, `disconnect()`, `get_state()`, `send_command()`, `step()`, `reset()`, `n_dof`
+
+### Task 2.4: PolicyInterface ABC (`src/policy/base.py`)
+
+- `load()`, `reset()`, `get_action()`, `observation_dim`, `action_dim`
+
+### Task 2.5: Config Dataclasses and Loading (`src/config.py` - Part 2)
+
+- 7 config dataclasses: `RobotConfig`, `PolicyConfig`, `ControlConfig`, `SafetyConfig`, `NetworkConfig`, `ViewerConfig`, `LoggingConfig`, `Config`
+- `load_config(path)` — YAML loading with validation
+- `merge_configs(base, override)` — non-None override values win
+- Validation: variant, idl_mode, joint names, gain list lengths, frequency divisibility, logging format
+
+### Task 2.6: YAML Config Files
+
+- `configs/default.yaml` — full default config
+- `configs/g1_29dof.yaml` — 29-DOF variant (with BeyondMimic reference gains as comments)
+- `configs/g1_23dof.yaml` — 23-DOF variant
+
+### Fixtures Added to conftest.py
+
+- `sample_robot_state` — proper `RobotState` at home position
+- `sample_config` — `Config` loaded from `configs/default.yaml`
+
+### Tests
+
+38 tests in `tests/test_config.py` — **all passing**.
+54 total tests (Phase 1 + Phase 2) — **all passing**.
+
+```
+tests/test_config.py — 38 passed in 0.54s
+Full suite — 54 passed in 0.99s
+```
+
+### Pending for Future Phases
+
+- `patch_unitree_threading()` in conftest.py — Phase 3
+- Scene XML files (`scene_29dof.xml`, `scene_23dof.xml`) — Phase 7

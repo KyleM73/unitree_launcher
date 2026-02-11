@@ -1,0 +1,37 @@
+robot:
+  variant: g1_29dof
+  idl_mode: 0
+
+policy:
+  observed_joints: null
+  controlled_joints: null
+  use_onnx_metadata: true
+  use_estimator: true
+
+control:
+  policy_frequency: 50
+  sim_frequency: 200
+  kp: 100.0
+  kd: 10.0
+  ka: 0.5
+  kd_damp: 5.0
+  q_home: null
+
+safety:
+  joint_position_limits: true
+  joint_velocity_limits: true
+  torque_limits: true
+
+network:
+  interface: "auto"
+  domain_id: 1
+
+viewer:
+  enabled: true
+  sync: true
+
+logging:
+  enabled: true
+  format: hdf5
+  compression: gzip
+  log_frequency: 50
