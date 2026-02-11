@@ -6,8 +6,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-# Phase 3 will add: from src.compat import patch_unitree_threading
-# patch_unitree_threading()  # Must be called before any SDK imports
+from src.compat import patch_unitree_threading
+patch_unitree_threading()  # Must be called before any SDK imports
 
 # ---------------------------------------------------------------------------
 # Project root

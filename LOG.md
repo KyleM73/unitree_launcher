@@ -1,6 +1,8 @@
 # LOG.md — Build Progress
 
 > **DO NOT DELETE this file.** Running log of implementation progress.
+>
+> This is a running log of progress, roadblocks, issues, etc. Not verbose — just enough detail to allow future engineers to pick up where we left off and understand the state of the codebase.
 
 ---
 
@@ -205,5 +207,42 @@ Full suite — 54 passed in 0.99s
 
 ### Pending for Future Phases
 
-- `patch_unitree_threading()` in conftest.py — Phase 3
+- ~~`patch_unitree_threading()` in conftest.py — Phase 3~~ DONE
+- Scene XML files (`scene_29dof.xml`, `scene_23dof.xml`) — Phase 7
+
+---
+
+## Pass 1, Step 4: Phase 3 — Cross-Platform Compatibility Layer [Shared]
+
+**Date:** 2026-02-11
+**Status:** COMPLETE
+
+### Task 3.1: `src/compat.py`
+
+Implemented:
+- `RecurrentThread` — drop-in replacement using `threading.Thread` + `time.sleep()` loop
+- `get_loopback_interface()` — returns `lo0` (macOS) / `lo` (Linux)
+- `resolve_network_interface()` — resolves `"auto"` to platform loopback, passes through explicit values
+- `patch_unitree_threading()` — monkey-patches SDK on macOS, no-op on Linux, idempotent
+
+### Task 3.2: conftest.py Updated
+
+`patch_unitree_threading()` now called at top of `tests/conftest.py` before any SDK imports.
+
+### Issues Encountered & Fixes
+
+1. **SDK timerfd import fails at module level** — `unitree_sdk2py.utils.thread` does `from .timerfd import *` at the top level, and `timerfd.py` calls `clib["timerfd_create"]` (a Linux syscall) during module init. This means you can't even `import unitree_sdk2py.utils.thread` on macOS. **Fix:** `patch_unitree_threading()` stubs out `unitree_sdk2py.utils.timerfd` in `sys.modules` with an empty module *before* importing `thread`, then injects our `RecurrentThread` onto the thread module. Also catches `AttributeError` (not just `ImportError`/`OSError`) since the ctypes dlsym lookup raises `AttributeError`.
+
+### Tests
+
+14 tests in `tests/test_compat.py` — **all passing**.
+68 total tests (Phase 1 + 2 + 3) — **all passing**.
+
+```
+tests/test_compat.py — 14 passed
+Full suite — 68 passed in 2.03s
+```
+
+### Pending for Future Phases
+
 - Scene XML files (`scene_29dof.xml`, `scene_23dof.xml`) — Phase 7
