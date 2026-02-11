@@ -1,0 +1,23 @@
+[project]
+name = "unitree-launcher"
+version = "0.1.0"
+requires-python = ">=3.8,<3.11"
+dependencies = [
+    "mujoco>=3.0",
+    "onnxruntime>=1.16",
+    "numpy",
+    "pyyaml",
+    "h5py",
+    "cyclonedds==0.10.2",
+    "unitree-sdk2py @ git+https://github.com/unitreerobotics/unitree_sdk2_python.git",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov",
+    "onnx>=1.14",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

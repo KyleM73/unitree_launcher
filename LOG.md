@@ -48,7 +48,7 @@ VERDICT: macOS bare metal is VIABLE.
 - Created `scripts/test_viewer.py` for manual verification
 - Headless sim verified: 29 actuators, 36 qpos, 35 dof. Sim steps correctly.
 - `mujoco.viewer.launch_passive` is importable
-- **Manual step required:** Run `source .venv/bin/activate && python scripts/test_viewer.py` to confirm the native window opens with mouse orbit/pan/zoom
+- **Manual step verified (2026-02-11):** Native MuJoCo viewer opens with G1 model, mouse orbit/pan/zoom works, window closes cleanly.
 
 ### Environment Summary
 
@@ -76,3 +76,62 @@ VERDICT: macOS bare metal is VIABLE.
 ### Verdict
 
 **macOS bare metal is VIABLE. Proceed with PLAN_METAL.md Phase 1.**
+
+---
+
+## Pass 1, Step 2: Phase 1 — Project Scaffolding
+
+**Date:** 2026-02-11
+**Status:** COMPLETE
+
+### Task 1.1: Directory Structure
+
+Created full directory tree per PLAN_METAL. All `__init__.py` files in place. `.python-version` contains `3.10`.
+
+### Task 1.2: MuJoCo Model Files
+
+Copied from `reference/unitree_mujoco/unitree_robots/g1/`:
+- `g1_29dof.xml` → `assets/robots/g1/`
+- `g1_23dof.xml` → `assets/robots/g1/`
+- `meshes/` (60 STL files) → `assets/robots/g1/meshes/`
+
+Both models load successfully from the new location. Mesh paths resolve correctly (XML uses `<compiler meshdir="meshes"/>` relative).
+
+Scene files (`scene_29dof.xml`, `scene_23dof.xml`) are Phase 7 work — not yet created.
+
+### Task 1.3: pyproject.toml
+
+- SDK dependency uses git URL: `unitree-sdk2py @ git+https://github.com/unitreerobotics/unitree_sdk2_python.git`
+- Dev deps: pytest, pytest-cov, onnx
+- `uv pip install -e ".[dev]"` succeeds
+- `pytest --co` runs without import errors
+
+### Task 1.4: conftest.py
+
+Fixtures created:
+- `g1_29dof_joint_names` — 29 config names in robot-native order
+- `g1_23dof_joint_names` — 23 config names in robot-native order
+- `isaaclab_29dof_joint_names` — 29 MuJoCo names in IsaacLab order
+- `sample_robot_state_dict` — plausible standing state (raw dict, will become `RobotState` in Phase 2)
+- `mujoco_model_path_29dof` / `mujoco_model_path_23dof` — absolute paths to MJCF files
+- `tmp_log_dir` — temp directory for log output
+
+Helper functions: `create_isaaclab_onnx()`, `create_beyondmimic_onnx()` — for creating test ONNX fixtures.
+
+Note: `sample_config` fixture deferred to Phase 2 (depends on `Config` dataclass). `patch_unitree_threading()` call deferred to Phase 3.
+
+### Tests
+
+16 tests in `tests/test_scaffolding.py` — **all passing**.
+
+```
+tests/test_scaffolding.py — 16 passed in 3.01s
+```
+
+### Pending for Future Phases
+
+- `sample_robot_state` fixture (proper `RobotState` dataclass) — Phase 2
+- `sample_config` fixture (proper `Config` dataclass) — Phase 2
+- `patch_unitree_threading()` in conftest.py — Phase 3
+- Scene XML files (`scene_29dof.xml`, `scene_23dof.xml`) — Phase 7
+- Config YAML files (`configs/default.yaml`, etc.) — Phase 2
