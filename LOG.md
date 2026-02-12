@@ -693,3 +693,53 @@ Test categories:
 ### Pending for Future Phases
 
 - None (all shared modules now complete — Pass 1 finished)
+
+---
+
+## Pass 2, Step 12: Phase 9 — MuJoCo Viewer Integration [Metal-specific]
+
+**Date:** 2026-02-11
+**Status:** COMPLETE
+
+### Task 9.1: `src/main.py` — `run_with_viewer()`
+
+Implemented:
+- `GLFW_KEY_MAP` — 13 keycodes mapped to string names (space, a-e, n-s, w-z)
+- `run_with_viewer(sim_robot, controller)` — opens MuJoCo passive viewer in main thread, control loop runs in background thread
+- Key callback dispatches GLFW keycodes through `GLFW_KEY_MAP` to `controller.handle_key()`
+- Viewer loop runs at ~60 FPS (`viewer.sync()` + 16ms sleep)
+- Clean shutdown: `controller.stop()` in `finally` block, handles `KeyboardInterrupt`
+
+### Task 9.2: `src/main.py` — `run_headless()`
+
+Implemented:
+- `run_headless(sim_robot, controller, duration, max_steps)` — headless simulation for batch evaluation
+- Auto-starts policy: calls `controller.start()` + `controller.safety.start()` (no viewer to press Space)
+- Sets `controller._max_steps` if `max_steps` provided
+- Termination conditions: duration limit, `controller.is_running` becomes False, KeyboardInterrupt
+- Polls at 100ms intervals
+- Clean shutdown: `controller.stop()` in `finally` block
+
+### Task 9.3: Status Overlay
+
+Deferred (optional per plan). Controller already prints 1 Hz status to stdout which is sufficient.
+
+### Tests
+
+25 tests in `tests/test_viewer.py` — **all passing**.
+334 total tests (Phase 1–8 + 10 + 11 + 9) — **all passing**.
+
+```
+tests/test_viewer.py — 25 passed in 1.33s
+Full suite — 334 passed in 7.10s
+```
+
+Test categories:
+- **GLFW key map** (14 tests): individual keycode→name mappings verified, type assertions
+- **Key callback dispatch** (3 tests): mapped key dispatches to handle_key, unmapped key ignored, all mapped keys verified
+- **run_with_viewer** (3 tests): starts/stops controller, key_callback wired to launch_passive, unmapped keycodes filtered
+- **run_headless** (5 tests): starts policy (controller.start + safety.start), duration termination (~0.3s), max_steps setter, trajectory-end exit, stop always called
+
+### Pending for Future Phases
+
+- Phase 12: Full CLI with argparse, entry points, shell scripts (`src/main.py` will be extended)
