@@ -28,7 +28,7 @@ This eliminates the need for Docker, Viser, EGL/OSMesa, and headless rendering w
 |---|---|
 | Native macOS + `uv` virtualenv | Docker container (Ubuntu 20.04) |
 | MuJoCo native viewer | Viser browser-based visualization |
-| Keyboard controls (WASD + hotkeys) | Viser UI panel (buttons, sliders, dropdowns) |
+| Keyboard controls (arrows + hotkeys) | Viser UI panel (buttons, sliders, dropdowns) |
 | `--headless` flag for server evals | Docker with `MUJOCO_GL=egl` |
 | Python 3.10 (CycloneDDS ceiling) | Python 3.8+ in Docker |
 | `RecurrentThread` shim in `src/compat.py` | Uses SDK's native `RecurrentThread` (Linux) |
@@ -1382,20 +1382,22 @@ class SimRobot(RobotInterface):
         return self._lock
 ```
 
-**Threading model:**
-
-The control loop calls `get_state()`, `send_command()`, and `step()` synchronously from a single thread. There is no separate physics thread. The only background thread is DDS state publishing.
+**Threading model (3 threads when viewer is active):**
 
 ```
-Control loop thread:  get_state() → policy → send_command() → step() → sleep
-DDS publishing thread: periodically reads mj_data and publishes LowState_ (read-only)
-[Metal] MuJoCo viewer: runs in main thread, calls viewer.sync() which reads mj_data
+Main thread:           drain key queue → handle_key() → lock → viewer.sync() → unlock → sleep
+Control loop thread:   get_state() → policy → send_command() → lock → mj_step() → unlock → sleep
+Viewer thread:         GLFW rendering + event loop → key_callback enqueues to SimpleQueue
+DDS publishing thread: lock → snapshot sensor data → unlock → publish LowState_
 ```
 
 **Thread safety:** A `threading.Lock` (`self._lock`) protects `mj_data`:
 - The control loop holds the lock during `step()` (which calls `mj_step()`)
+- The main thread holds the lock during `viewer.sync()` (which calls `mj_copyDataVisual`)
 - The DDS thread briefly acquires the lock to snapshot sensor data
-- **[Metal]** The viewer's `sync()` call reads `mj_data`. The `launch_passive` context manager handles its own internal locking for the MuJoCo viewer. However, the control loop should call `step()` inside a `with self._lock:` block, and DDS publishing should also use `with self._lock:`. The viewer's `sync()` is called from the main thread between control loop ticks and is safe because `launch_passive` uses its own synchronization.
+- The `key_callback` fires on MuJoCo's viewer thread and must **never** acquire the lock. Instead it enqueues key names into a `queue.SimpleQueue`. The main loop drains the queue *outside* the lock to avoid cross-thread deadlocks.
+
+**macOS requirement:** Use `mjpython` instead of `python` to run with viewer (`mjpython -m src.main sim ...`). MuJoCo's `launch_passive` requires the main thread on macOS.
 
 **Use `src.compat.RecurrentThread`** instead of the SDK's native version:
 ```python
@@ -1503,23 +1505,18 @@ class Controller:
         Thread-safe. Stops control loop if running, loads new policy, resets state."""
 
     def handle_key(self, key: str) -> None:
-        """Handle keyboard input from MuJoCo viewer or CLI.
-        Called from the main thread (viewer callback). Thread-safe.
+        """Handle keyboard input (from main thread key queue drain).
 
-        Key mappings:
-            space  - Toggle start/stop
-            e      - E-stop (latching)
-            c      - Clear E-stop
-            r      - Reset simulation
-            w      - Increase Vx by 0.1 (clamped to [-1.0, 1.0])
-            s      - Decrease Vx by 0.1
-            a      - Increase Vy by 0.1 (clamped to [-0.5, 0.5])
-            d      - Decrease Vy by 0.1
-            q      - Increase yaw_rate by 0.1 (clamped to [-1.0, 1.0])
-            z      - Decrease yaw_rate by 0.1
-            x      - Zero all velocity commands
-            n      - Load next policy from --policy-dir (if provided)
-            p      - Load previous policy from --policy-dir (if provided)
+        Keys avoid MuJoCo viewer conflicts (no letter keys):
+            space      - Toggle start/stop
+            backspace  - E-stop (latching)
+            enter      - Clear E-stop
+            delete     - Reset simulation (Fn+Backspace on Mac)
+            up/down    - Increase/decrease Vx by 0.1 (clamped to [-1.0, 1.0])
+            left/right - Increase/decrease Vy by 0.1 (clamped to [-0.5, 0.5])
+            comma/period - Increase/decrease yaw by 0.1 (clamped to [-1.0, 1.0])
+            slash      - Zero all velocity commands
+            equal/minus - Next/previous policy from --policy-dir
         """
         if key == "space":
             if self.safety.state == SystemState.IDLE:
@@ -1528,48 +1525,40 @@ class Controller:
             elif self.safety.state == SystemState.RUNNING:
                 self.safety.stop()
                 self.stop()
-        elif key == "e":
+        elif key == "backspace":
             self.safety.estop()
-        elif key == "c":
+        elif key == "enter":
             self.safety.clear_estop()
-        elif key == "r":
+        elif key == "delete":
             self.robot.reset()
-        elif key == "w":
-            vc = self._velocity_command.copy()
-            vc[0] = min(vc[0] + 0.1, 1.0)
-            self._velocity_command = vc
-        elif key == "s":
-            vc = self._velocity_command.copy()
-            vc[0] = max(vc[0] - 0.1, -1.0)
-            self._velocity_command = vc
-        elif key == "a":
-            vc = self._velocity_command.copy()
-            vc[1] = min(vc[1] + 0.1, 0.5)
-            self._velocity_command = vc
-        elif key == "d":
-            vc = self._velocity_command.copy()
-            vc[1] = max(vc[1] - 0.1, -0.5)
-            self._velocity_command = vc
-        elif key == "q":
-            vc = self._velocity_command.copy()
-            vc[2] = min(vc[2] + 0.1, 1.0)
-            self._velocity_command = vc
-        elif key == "z":
-            vc = self._velocity_command.copy()
-            vc[2] = max(vc[2] - 0.1, -1.0)
-            self._velocity_command = vc
-        elif key == "x":
+        elif key == "up":
+            self._adjust_velocity(0, 0.1, -1.0, 1.0)
+        elif key == "down":
+            self._adjust_velocity(0, -0.1, -1.0, 1.0)
+        elif key == "left":
+            self._adjust_velocity(1, 0.1, -0.5, 0.5)
+        elif key == "right":
+            self._adjust_velocity(1, -0.1, -0.5, 0.5)
+        elif key == "comma":
+            self._adjust_velocity(2, 0.1, -1.0, 1.0)
+        elif key == "period":
+            self._adjust_velocity(2, -0.1, -1.0, 1.0)
+        elif key == "slash":
             self._velocity_command = np.zeros(3)
+        elif key == "equal":
+            self._cycle_policy(1)
+        elif key == "minus":
+            self._cycle_policy(-1)
 ```
 
 **Velocity command ranges (from SPEC section 6.5):**
 
 | Command | Range | Step Size | Key Up / Key Down |
 |---------|-------|-----------|-------------------|
-| Vx (forward/back) | [-1.0, 1.0] m/s | 0.1 | W / S |
-| Vy (left/right) | [-0.5, 0.5] m/s | 0.1 | A / D |
-| Yaw rate | [-1.0, 1.0] rad/s | 0.1 | Q / Z |
-| Zero all | — | — | X |
+| Vx (forward/back) | [-1.0, 1.0] m/s | 0.1 | Up / Down |
+| Vy (left/right) | [-0.5, 0.5] m/s | 0.1 | Left / Right |
+| Yaw rate | [-1.0, 1.0] rad/s | 0.1 | , / . |
+| Zero all | — | — | / |
 
 **Control loop pseudocode:**
 
@@ -1695,17 +1684,17 @@ This is important for headless mode where there's no viewer.
 - `test_velocity_command_thread_safe`: Set velocity from one thread, read from another, no corruption
 - `test_telemetry_updates`: After running, telemetry dict contains expected keys with reasonable values
 
-*Key handling (complete coverage):*
+*Key handling (complete coverage — keys avoid MuJoCo viewer conflicts):*
 - `test_handle_key_space_toggles`: Space from IDLE -> RUNNING, Space from RUNNING -> STOPPED
-- `test_handle_key_estop`: 'e' triggers E-stop, verify state == ESTOP
-- `test_handle_key_clear_estop`: 'c' from ESTOP -> STOPPED
-- `test_handle_key_reset`: 'r' calls `robot.reset()` (mock and verify)
-- `test_handle_key_velocity_wasd`: W increases vx by 0.1, S decreases, A increases vy, D decreases
-- `test_handle_key_velocity_clamps`: After 20 W presses, vx is clamped to 1.0 (not 2.0)
-- `test_handle_key_qz_yaw`: Q increases yaw by 0.1, Z decreases, clamped to [-1.0, 1.0]
-- `test_handle_key_x_zeros_velocity`: X zeros all velocity components
-- `test_handle_key_next_policy`: 'n' calls `reload_policy()` with next policy from `--policy-dir` (mock and verify)
-- `test_handle_key_prev_policy`: 'p' calls `reload_policy()` with previous policy
+- `test_handle_key_estop`: 'backspace' triggers E-stop, verify state == ESTOP
+- `test_handle_key_clear_estop`: 'enter' from ESTOP -> STOPPED
+- `test_handle_key_reset`: 'delete' calls `robot.reset()` (mock and verify)
+- `test_handle_key_velocity_arrows`: Up increases vx by 0.1, Down decreases, Left increases vy, Right decreases
+- `test_handle_key_velocity_clamps`: After 20 Up presses, vx is clamped to 1.0 (not 2.0)
+- `test_handle_key_comma_period_yaw`: comma increases yaw by 0.1, period decreases, clamped to [-1.0, 1.0]
+- `test_handle_key_slash_zeros_velocity`: slash zeros all velocity components
+- `test_handle_key_next_policy`: 'equal' calls `reload_policy()` with next policy from `--policy-dir` (mock and verify)
+- `test_handle_key_prev_policy`: 'minus' calls `reload_policy()` with previous policy
 - `test_handle_key_unknown_noop`: Unknown key (e.g., 'j') does nothing, no error
 
 *Policy reloading:*
@@ -1733,39 +1722,46 @@ Use `mujoco.viewer.launch_passive()` to create a non-blocking viewer in the main
 
 ```python
 import mujoco.viewer
+import queue
 
-# GLFW key constants (subset). Full list: https://www.glfw.org/docs/latest/group__keys.html
-# These match ASCII for letter keys and common keys.
+# GLFW key constants. Avoid letter keys — MuJoCo viewer binds them for
+# rendering toggles (w=wireframe, s=shadow, a=analytic, d=geom, etc.).
 GLFW_KEY_MAP = {
-    32: "space",     # GLFW_KEY_SPACE
-    67: "c",         # GLFW_KEY_C
-    69: "e",         # GLFW_KEY_E
-    82: "r",         # GLFW_KEY_R
-    87: "w",         # GLFW_KEY_W
-    83: "s",         # GLFW_KEY_S
-    65: "a",         # GLFW_KEY_A
-    68: "d",         # GLFW_KEY_D
-    81: "q",         # GLFW_KEY_Q
-    90: "z",         # GLFW_KEY_Z
-    88: "x",         # GLFW_KEY_X
+    32: "space",        # GLFW_KEY_SPACE  — start / stop
+    265: "up",          # GLFW_KEY_UP     — vx +
+    264: "down",        # GLFW_KEY_DOWN   — vx -
+    263: "left",        # GLFW_KEY_LEFT   — vy +
+    262: "right",       # GLFW_KEY_RIGHT  — vy -
+    44: "comma",        # GLFW_KEY_COMMA  — yaw +
+    46: "period",       # GLFW_KEY_PERIOD — yaw -
+    47: "slash",        # GLFW_KEY_SLASH  — zero velocity
+    259: "backspace",   # GLFW_KEY_BACKSPACE — e-stop
+    257: "enter",       # GLFW_KEY_ENTER  — clear e-stop
+    45: "minus",        # GLFW_KEY_MINUS  — prev policy
+    61: "equal",        # GLFW_KEY_EQUAL  — next policy
+    261: "delete",      # GLFW_KEY_DELETE (Fn+Backspace on Mac) — reset
 }
 
 
 def run_with_viewer(sim_robot: SimRobot, controller: Controller):
     """Run simulation with interactive MuJoCo viewer.
 
-    The viewer runs in the main thread. The control loop runs in a
-    background thread (started by controller.start()). MuJoCo's
-    launch_passive handles its own thread-safety for rendering.
+    Threading model:
+        Main thread   — drain key queue + viewer.sync() under lock
+        Control thread — get_state / send_command / mj_step (controller)
+        Viewer thread  — GLFW rendering + event loop (MuJoCo internal)
 
-    Key callback fires on key PRESS only (not repeat or release).
+    The key callback fires on MuJoCo's viewer thread. To avoid
+    cross-thread deadlocks with sim_robot.lock, the callback only
+    enqueues key names; the main loop drains the queue *outside*
+    the lock before calling viewer.sync().
     """
+    key_queue: queue.SimpleQueue = queue.SimpleQueue()
 
-    def key_callback(keycode):
-        """Called by MuJoCo viewer on key press. Runs in main thread."""
+    def key_callback(keycode: int) -> None:
         key = GLFW_KEY_MAP.get(keycode)
         if key:
-            controller.handle_key(key)
+            key_queue.put(key)  # Non-blocking, no locks
 
     with mujoco.viewer.launch_passive(
         sim_robot.mj_model,
@@ -1775,9 +1771,12 @@ def run_with_viewer(sim_robot: SimRobot, controller: Controller):
         controller.start()
         try:
             while viewer.is_running():
-                # sync() copies mj_data into the viewer's internal buffer
-                # for rendering. This is thread-safe with launch_passive.
-                viewer.sync()
+                # Drain key events (no lock held — safe to call handle_key).
+                while not key_queue.empty():
+                    controller.handle_key(key_queue.get_nowait())
+
+                with sim_robot.lock:
+                    viewer.sync()
                 time.sleep(1.0 / 60.0)  # ~60 FPS viewer update
         except KeyboardInterrupt:
             pass
@@ -1785,21 +1784,28 @@ def run_with_viewer(sim_robot: SimRobot, controller: Controller):
             controller.stop()
 ```
 
-**Note on GLFW key callbacks:** `mujoco.viewer.launch_passive()` accepts a `key_callback` parameter (since MuJoCo 3.0+). The callback receives a single `int` argument which is a GLFW keycode. GLFW keycodes for printable ASCII characters match their ASCII values (A=65, B=66, etc.). The callback fires once per key press (not on repeat or release). Shift state is ignored — 'e' and 'E' both fire keycode 69.
+**Note on GLFW key callbacks:** `mujoco.viewer.launch_passive()` accepts a `key_callback` parameter (since MuJoCo 3.0+). The callback receives a single `int` argument (GLFW keycode) and fires on the **viewer thread** (not the main thread). It fires once per key press (not on repeat or release).
 
-**Note on WASD conflict with MuJoCo viewer:** The MuJoCo viewer does NOT use WASD for camera control (it uses mouse for orbit/pan/zoom). WASD keys are free for application use.
+**Note on MuJoCo viewer key conflicts:** MuJoCo's built-in viewer binds most letter keys for rendering toggles (w=wireframe, s=shadow, a=analytic, d=geom, e=frame, r=reflect, c=contact, n=overlay, x=connect, z=perturb, etc.). We use arrow keys, punctuation, and modifier keys instead.
+
+**Note on deadlock avoidance:** The key callback fires on the viewer thread while the main thread may hold `sim_robot.lock` (for `viewer.sync()`). If the callback acquired the same lock (e.g., for `robot.reset()`), it would deadlock. The queue-based pattern ensures the callback never touches any lock.
+
+**macOS requirement:** Use `mjpython` instead of `python` to launch the viewer (`mjpython -m src.main sim ...`).
 
 **Tests (`tests/test_viewer.py`):**
-- `test_glfw_key_map_values`: Verify `GLFW_KEY_MAP[32] == "space"`, `[69] == "e"`, `[65] == "a"`, etc. Catches typos in keycode constants.
-- `test_key_callback_dispatches_to_controller`: Mock `controller.handle_key`, simulate `key_callback(32)` (space), verify `controller.handle_key("space")` was called
-- `test_key_callback_unmapped_ignored`: Simulate `key_callback(999)` (unmapped code), verify `controller.handle_key` is NOT called
+- `test_glfw_key_map_*`: Verify `GLFW_KEY_MAP[32] == "space"`, `[265] == "up"`, `[259] == "backspace"`, etc.
+- `test_glfw_key_map_no_letter_keys`: Verify no ASCII letter keys (65-90) are mapped — they conflict with MuJoCo viewer.
+- `test_key_callback_enqueues_mapped_key`: key_callback(32) enqueues "space" into SimpleQueue
+- `test_key_callback_unmapped_ignored`: key_callback(999) enqueues nothing
+- `test_main_loop_drains_queue_to_handle_key`: Simulates main loop drain → handle_key called
+- `test_run_with_viewer_sync_under_lock`: Verifies viewer.sync() is called while lock is held
 
 **Acceptance criteria (manual):**
-- Viewer opens and shows the G1 robot
+- Viewer opens and shows the G1 robot (use `mjpython` on macOS)
 - Space bar starts/stops the policy
-- E key triggers E-stop
-- R key resets the simulation
-- WASD/QZ adjust velocity commands
+- Backspace triggers E-stop, Enter clears it
+- Arrow keys adjust velocity commands
+- No deadlocks on key press during simulation
 - X zeros velocity commands
 - Closing the viewer window cleanly shuts down the control loop
 

@@ -24,9 +24,18 @@ htmlcov/
 .coverage
 coverage.xml
 
-# Logs (keep directory via .gitkeep)
-logs/*.hdf5
-logs/*.npz
+# Logs
+logs/
+*.hdf5
+
+# MuJoCo
+MUJOCO_LOG.TXT
+
+# Diagnostic scripts
+diag_*.py
+
+# Lock files
+uv.lock
 
 # Reference implementations (large, not our code)
 reference/

@@ -176,12 +176,12 @@ class TestEstopRecovery:
         assert safety.state == SystemState.RUNNING
 
         # E-stop
-        ctrl.handle_key("e")
+        ctrl.handle_key("backspace")
         time.sleep(0.1)
         assert safety.state == SystemState.ESTOP
 
         # Clear E-stop → STOPPED
-        ctrl.handle_key("c")
+        ctrl.handle_key("enter")
         time.sleep(0.05)
         assert safety.state == SystemState.STOPPED
 

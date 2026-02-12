@@ -15,7 +15,15 @@ from typing import TYPE_CHECKING, Dict, List, Optional
 
 import numpy as np
 
-from src.config import Config, G1_29DOF_JOINTS, G1_23DOF_JOINTS, Q_HOME_29DOF, Q_HOME_23DOF
+from src.config import (
+    Config,
+    G1_29DOF_JOINTS,
+    G1_23DOF_JOINTS,
+    Q_HOME_29DOF,
+    Q_HOME_23DOF,
+    STANDBY_KP_29DOF,
+    STANDBY_KD_29DOF,
+)
 from src.control.safety import SafetyController, SystemState
 from src.policy.base import PolicyInterface, detect_policy_format
 from src.policy.joint_mapper import JointMapper
@@ -102,6 +110,7 @@ class Controller:
 
         # Control thread
         self._running = False
+        self._policy_active = False
         self._thread: Optional[threading.Thread] = None
 
         # Policy directory cycling
@@ -115,11 +124,19 @@ class Controller:
         self._max_steps = max_steps
         self._max_duration = max_duration
 
-        # BeyondMimic end-of-trajectory interpolation
+        # BeyondMimic end-of-trajectory handling
+        self._completing_cycle = False  # extending ref past trajectory end
+        self._cycle_period: int = 0
+        self._cycle_target_step: int = 0  # step at which cycle completion ends
         self._interpolating = False
         self._interp_start_pos: Optional[np.ndarray] = None
         self._interp_step: int = 0
         self._interp_total_steps: int = int(2.0 * config.control.policy_frequency)  # 2 seconds
+        self._interp_start_ref_q: Optional[np.ndarray] = None
+        self._interp_start_ref_dq: Optional[np.ndarray] = None
+        self._interp_end_ref_q: Optional[np.ndarray] = None
+        self._interp_end_ref_dq: Optional[np.ndarray] = None
+
 
         # Stdout status
         self._last_print_time = 0.0
@@ -129,12 +146,20 @@ class Controller:
     # ------------------------------------------------------------------
 
     def start(self) -> None:
-        """Start the control loop in a background thread."""
+        """Start the control loop thread (idempotent).
+
+        The loop runs continuously: in IDLE/STOPPED it holds the home pose;
+        in RUNNING it executes the policy.  Policy state is reset on the
+        IDLE → RUNNING transition inside the loop.
+        """
         if self._running:
             return
         self._running = True
         self._time_step = 0
+        self._completing_cycle = False
         self._interpolating = False
+        self._policy_active = False
+        self.policy.reset()
         self._thread = threading.Thread(target=self._control_loop, daemon=True)
         self._thread.start()
 
@@ -177,44 +202,58 @@ class Controller:
         self.policy.load(policy_path)
         self.policy.reset()
         self._time_step = 0
+        self._completing_cycle = False
         self._interpolating = False
 
     def handle_key(self, key: str) -> None:
         """Handle keyboard input (from MuJoCo viewer or CLI).
+
+        Key map (avoids MuJoCo viewer letter-key conflicts):
+            Space      — start / stop
+            Backspace  — e-stop
+            Enter      — clear e-stop
+            Delete     — reset (Fn+Backspace on Mac)
+            Up/Down    — vx +/-
+            Left/Right — vy +/-
+            ,/.        — yaw +/-
+            /          — zero velocity
+            -/=        — prev/next policy
 
         Called from the main thread. Thread-safe.
         """
         if key == "space":
             if self.safety.state in (SystemState.IDLE, SystemState.STOPPED):
                 self.safety.start()
-                self.start()
+                # Control loop is already running (hold pose mode);
+                # it will detect the RUNNING transition and activate policy.
+                if not self._running:
+                    self.start()
             elif self.safety.state == SystemState.RUNNING:
                 self.safety.stop()
-                self.stop()
-        elif key == "e":
+        elif key == "backspace":
             self.safety.estop()
-        elif key == "c":
+        elif key == "enter":
             self.safety.clear_estop()
-        elif key == "r":
+        elif key == "delete":
             self.robot.reset()
-        elif key == "w":
+        elif key == "up":
             self._adjust_velocity(0, 0.1, -1.0, 1.0)
-        elif key == "s":
+        elif key == "down":
             self._adjust_velocity(0, -0.1, -1.0, 1.0)
-        elif key == "a":
+        elif key == "left":
             self._adjust_velocity(1, 0.1, -0.5, 0.5)
-        elif key == "d":
+        elif key == "right":
             self._adjust_velocity(1, -0.1, -0.5, 0.5)
-        elif key == "q":
+        elif key == "comma":
             self._adjust_velocity(2, 0.1, -1.0, 1.0)
-        elif key == "z":
+        elif key == "period":
             self._adjust_velocity(2, -0.1, -1.0, 1.0)
-        elif key == "x":
+        elif key == "slash":
             with self._vel_lock:
                 self._velocity_command = np.zeros(3)
-        elif key == "n":
+        elif key == "equal":
             self._cycle_policy(1)
-        elif key == "p":
+        elif key == "minus":
             self._cycle_policy(-1)
 
     # ------------------------------------------------------------------
@@ -224,13 +263,14 @@ class Controller:
     def _build_command(self, state: RobotState, action: np.ndarray) -> RobotCommand:
         """Build a RobotCommand from policy action output.
 
-        For IsaacLab:
-            target_pos = q_home + Ka * action
-            kp, kd from config; dq_target = 0, tau = 0
+        Both IsaacLab and BeyondMimic use the same control law from training:
+            tau = Kp * (default_q + Ka * action - q) - Kd * dq
 
-        For BeyondMimic:
-            target_pos = target_q + Ka * action
-            kp, kd from metadata (or config); dq_target = target_dq, tau = 0
+        The ONNX ``joint_pos`` / ``joint_vel`` outputs are reference trajectory
+        data from constant-table lookups (observation-independent).  They feed
+        the ``command`` and ``motion_anchor_*`` observation terms but are NOT
+        used as PD targets — the learned actor network output (``action``) is
+        what drives the robot through the training control law.
         """
         n_total = self.joint_mapper.n_total
         n_ctrl = self.joint_mapper.n_controlled
@@ -255,8 +295,9 @@ class Controller:
             ctrl_kd = bm.damping if bm.damping is not None else self._kd
             ctrl_ka = bm.action_scale if bm.action_scale is not None else self._ka
 
-            ctrl_target_pos = bm.target_q + ctrl_ka * action
-            ctrl_target_vel = bm.target_dq.copy()
+            # Training control law: target = default_q + Ka * action
+            ctrl_target_pos = bm.default_joint_pos + ctrl_ka * action
+            ctrl_target_vel = np.zeros(n_ctrl)
         else:
             ctrl_kp = self._kp
             ctrl_kd = self._kd
@@ -314,6 +355,64 @@ class Controller:
             kd=kd,
         )
 
+    def _build_hold_command(self, state: RobotState) -> RobotCommand:
+        """Build command to hold the robot at home pose (IDLE/STOPPED state).
+
+        Uses high standby PD gains (Kp=150-350 legs, 40 arms) from the
+        BeyondMimic deployment reference.  These are much higher than the
+        walking policy gains and sufficient to hold the robot upright in
+        MuJoCo without gravity compensation.
+
+        Torques are applied via ``qfrc_applied`` (see ``SimRobot.send_command``)
+        which bypasses actuator ctrlrange limits in the XML.
+        """
+        n_total = self.joint_mapper.n_total
+        ctrl_idx = self.joint_mapper.controlled_indices
+        non_ctrl_idx = self.joint_mapper.non_controlled_indices
+
+        target_pos = np.zeros(n_total)
+        target_vel = np.zeros(n_total)
+        target_tau = np.zeros(n_total)
+        kp = np.zeros(n_total)
+        kd = np.zeros(n_total)
+
+        # Determine home pose (BeyondMimic default_joint_pos or config q_home)
+        from src.policy.beyondmimic_policy import BeyondMimicPolicy
+        if isinstance(self.policy, BeyondMimicPolicy):
+            bm: BeyondMimicPolicy = self.policy
+            hold_pos = bm.default_joint_pos
+        else:
+            hold_pos = self._q_home
+
+        target_pos[ctrl_idx] = hold_pos
+
+        # Use high standby gains from BeyondMimic deployment reference.
+        # These are keyed by config joint names (controlled_joints order).
+        ctrl_joints = self.joint_mapper.controlled_joints
+        standby_kp = np.array(
+            [STANDBY_KP_29DOF.get(j, 100.0) for j in ctrl_joints],
+            dtype=np.float64,
+        )
+        standby_kd = np.array(
+            [STANDBY_KD_29DOF.get(j, 5.0) for j in ctrl_joints],
+            dtype=np.float64,
+        )
+        kp[ctrl_idx] = standby_kp
+        kd[ctrl_idx] = standby_kd
+
+        # Non-controlled joints: damping mode
+        if len(non_ctrl_idx) > 0:
+            target_pos[non_ctrl_idx] = state.joint_positions[non_ctrl_idx]
+            kd[non_ctrl_idx] = self._kd_damp
+
+        return RobotCommand(
+            joint_positions=target_pos,
+            joint_velocities=target_vel,
+            joint_torques=target_tau,
+            kp=kp,
+            kd=kd,
+        )
+
     # ------------------------------------------------------------------
     # Control loop
     # ------------------------------------------------------------------
@@ -337,26 +436,149 @@ class Controller:
                     self._sleep_until_next_tick(loop_start)
                     continue
 
-                # 2. Not RUNNING: keep sim alive but don't send commands
+                # 2. IDLE/STOPPED: hold the robot at home pose.
+                #    This keeps the robot standing under gravity while
+                #    the user hasn't yet pressed Space to start the policy.
                 if self.safety.state != SystemState.RUNNING:
+                    self._policy_active = False
+                    state = self.robot.get_state()
+
+                    # BeyondMimic: use the policy frozen at time_step=0
+                    # for active balance.  Simple PD hold can't stabilize
+                    # the undamped BM training model because the ankle
+                    # torque limit saturates before the pitching moment
+                    # is arrested.  The trained actor network adjusts
+                    # actions based on observations to keep the base upright.
+                    from src.policy.beyondmimic_policy import BeyondMimicPolicy
+                    if isinstance(self.policy, BeyondMimicPolicy):
+                        bm: BeyondMimicPolicy = self.policy
+                        if hasattr(self.robot, 'get_body_state') and bm.anchor_body_name:
+                            anchor_pos, anchor_quat = self.robot.get_body_state(
+                                bm.anchor_body_name
+                            )
+                        else:
+                            anchor_pos = state.base_position
+                            anchor_quat = state.imu_quaternion
+                        obs = bm.build_observation(state, anchor_pos, anchor_quat)
+                        action = bm.get_action(obs, time_step=0)
+                        cmd = self._build_command(state, action)
+                    else:
+                        cmd = self._build_hold_command(state)
+
+                    self.robot.send_command(cmd)
                     self.robot.step()
                     self._sleep_until_next_tick(loop_start)
                     continue
 
-                # 3. Get robot state
+                # 3. Detect IDLE/STOPPED → RUNNING transition
+                if not self._policy_active:
+                    self._policy_active = True
+                    self._time_step = 0
+                    self._completing_cycle = False
+                    self._interpolating = False
+                    self.policy.reset()
+                    last_action = np.zeros(self.joint_mapper.n_controlled)
+                    step_count = 0
+                    loop_start_time = time.perf_counter()
+                    self._last_print_time = 0.0
+
+                    from src.policy.beyondmimic_policy import BeyondMimicPolicy
+                    if isinstance(self.policy, BeyondMimicPolicy):
+                        bm: BeyondMimicPolicy = self.policy
+                        # Prefetch reference data for time_step=0 so the
+                        # observation builder has _prev_target_q/dq.
+                        # No teleport — hold mode already used the policy
+                        # at time_step=0, so the robot is already near the
+                        # reference starting pose.
+                        bm.prefetch_reference(0)
+                        print("[controller] Policy activated — starting from hold pose.")
+                    else:
+                        print("[controller] Policy activated.")
+
+                # 4. Get robot state
                 state = self.robot.get_state()
 
-                # 4. Handle BeyondMimic end-of-trajectory interpolation
+                # 4a. Gait cycle completion: extend the reference past
+                #     the end of the trajectory using the periodic gait
+                #     pattern.  Runs the policy at (time_step - period) to
+                #     get the equivalent reference from one cycle back.
+                if self._completing_cycle:
+                    from src.policy.beyondmimic_policy import BeyondMimicPolicy
+                    bm: BeyondMimicPolicy = self.policy
+                    ref_ts = self._time_step - self._cycle_period
+                    if hasattr(self.robot, 'get_body_state') and bm.anchor_body_name:
+                        anchor_pos, anchor_quat = self.robot.get_body_state(
+                            bm.anchor_body_name
+                        )
+                    else:
+                        anchor_pos = state.base_position
+                        anchor_quat = state.imu_quaternion
+                    obs = bm.build_observation(state, anchor_pos, anchor_quat)
+                    action = bm.get_action(obs, time_step=ref_ts)
+                    cmd = self._build_command(state, action)
+                    cmd = self.safety.clamp_command(cmd)
+                    self.robot.send_command(cmd)
+                    self.robot.step()
+                    self._time_step += 1
+                    if self._time_step >= self._cycle_target_step:
+                        self._completing_cycle = False
+                        # Cache current reference as interpolation start
+                        self._interp_start_ref_q = bm._prev_target_q.copy()
+                        self._interp_start_ref_dq = bm._prev_target_dq.copy()
+                        # Fetch frame-0 as interpolation target
+                        bm.prefetch_reference(0)
+                        self._interp_end_ref_q = bm._prev_target_q.copy()
+                        self._interp_end_ref_dq = bm._prev_target_dq.copy()
+                        self._interpolating = True
+                        self._interp_step = 0
+                        print(
+                            "[controller] Gait cycle complete. "
+                            "Interpolating to stance."
+                        )
+                    self._sleep_until_next_tick(loop_start)
+                    continue
+
+                # 4b. Smooth interpolation from double-support to stance.
+                #     BeyondMimic: interpolate the command reference from the
+                #     cycle-completion pose to frame 0 while the policy at
+                #     time_step=0 provides active balance.
+                #     Non-BM: PD interpolation from last position to q_home.
                 if self._interpolating:
-                    cmd = self._build_interpolation_command(state)
+                    from src.policy.beyondmimic_policy import BeyondMimicPolicy
+                    if isinstance(self.policy, BeyondMimicPolicy):
+                        bm: BeyondMimicPolicy = self.policy
+                        alpha = self._interp_step / self._interp_total_steps
+
+                        # Interpolate command reference for observation
+                        bm._prev_target_q = (
+                            (1.0 - alpha) * self._interp_start_ref_q
+                            + alpha * self._interp_end_ref_q
+                        )
+                        bm._prev_target_dq = (
+                            (1.0 - alpha) * self._interp_start_ref_dq
+                            + alpha * self._interp_end_ref_dq
+                        )
+
+                        if hasattr(self.robot, 'get_body_state') and bm.anchor_body_name:
+                            anchor_pos, anchor_quat = self.robot.get_body_state(
+                                bm.anchor_body_name
+                            )
+                        else:
+                            anchor_pos = state.base_position
+                            anchor_quat = state.imu_quaternion
+                        obs = bm.build_observation(state, anchor_pos, anchor_quat)
+                        action = bm.get_action(obs, time_step=0)
+                        cmd = self._build_command(state, action)
+                    else:
+                        cmd = self._build_interpolation_command(state)
                     cmd = self.safety.clamp_command(cmd)
                     self.robot.send_command(cmd)
                     self.robot.step()
                     self._interp_step += 1
                     if self._interp_step >= self._interp_total_steps:
                         self._interpolating = False
+                        print("[controller] Returned to stance. Switching to hold mode.")
                         self.safety.stop()
-                        self._running = False
                     self._sleep_until_next_tick(loop_start)
                     continue
 
@@ -367,16 +589,47 @@ class Controller:
                     obs = self.obs_builder.build(state, last_action, vel_cmd)
                     action = self.policy.get_action(obs)
                 else:
-                    # BeyondMimic: policy builds its own observations
+                    # BeyondMimic: single ONNX call per step matching the
+                    # motion_tracking_controller C++ sim2sim deployment.
+                    #
+                    # 1. Build obs using PREVIOUS step's cached trajectory
+                    #    (_prev_target_q/dq for "command" term, etc.)
+                    # 2. Run ONNX with current time_step → gets action +
+                    #    new trajectory data (target_q/dq, body poses)
+                    # 3. Post-increment time_step (matching C++ timeStep_++)
                     from src.policy.beyondmimic_policy import BeyondMimicPolicy
                     bm: BeyondMimicPolicy = self.policy
-                    # Get anchor body state from sim
-                    anchor_pos = state.base_position
-                    anchor_quat = state.imu_quaternion
+
+                    # Get anchor body (e.g. torso_link) state from sim
+                    if hasattr(self.robot, 'get_body_state') and bm.anchor_body_name:
+                        anchor_pos, anchor_quat = self.robot.get_body_state(
+                            bm.anchor_body_name
+                        )
+                    else:
+                        anchor_pos = state.base_position
+                        anchor_quat = state.imu_quaternion
                     obs = bm.build_observation(state, anchor_pos, anchor_quat)
                     action = bm.get_action(obs, time_step=self._time_step)
                     self._time_step += 1
+
+                    # Detect end of reference trajectory
+                    if self._time_step >= bm.trajectory_length:
+                        period, extra = self._compute_cycle_extension(bm)
+                        self._cycle_period = period
+                        self._cycle_target_step = self._time_step + extra
+                        self._completing_cycle = True
+                        print(
+                            f"[controller] End of trajectory at step "
+                            f"{self._time_step}. Completing gait cycle: "
+                            f"{extra} extra steps (period={period}) to "
+                            f"step {self._cycle_target_step}."
+                        )
                 inference_time = time.perf_counter() - inference_start
+
+                # Safety: replace NaN/Inf in policy output with zeros
+                if not np.all(np.isfinite(action)):
+                    print("[controller] WARNING: NaN/Inf in policy action, using zeros")
+                    action = np.zeros_like(action)
 
                 # 6. Build and clamp command
                 cmd = self._build_command(state, action)
@@ -488,6 +741,74 @@ class Controller:
             print(f"[controller] Loaded policy: {os.path.basename(path)}")
         except Exception as exc:
             print(f"[controller] Failed to load policy: {exc}")
+
+    def _compute_cycle_extension(self, bm) -> tuple:
+        """Compute gait cycle period and extra steps to reach best transition.
+
+        Analyzes the reference trajectory to detect the steady-state gait
+        period and find the double-support phase with minimum reference
+        joint velocity — the most stable point where both feet are on
+        the ground and the base momentum is lowest.
+
+        Returns:
+            (period, extra_steps): Gait period and steps to extend.
+        """
+        traj_len = bm.trajectory_length
+        obs_dummy = np.zeros((1, bm.observation_dim), dtype=np.float32)
+        tq_name = bm._output_names[bm._target_q_idx]
+        tdq_name = bm._output_names[bm._target_dq_idx]
+
+        def get_ref_q(ts: int) -> np.ndarray:
+            return bm._session.run(
+                [tq_name],
+                {"obs": obs_dummy, "time_step": np.array([[ts]], dtype=np.float32)},
+            )[0].flatten()
+
+        def get_ref_dq(ts: int) -> np.ndarray:
+            return bm._session.run(
+                [tdq_name],
+                {"obs": obs_dummy, "time_step": np.array([[ts]], dtype=np.float32)},
+            )[0].flatten()
+
+        # Detect gait period from auto-correlation of the first joint
+        # (left hip pitch) in the last 150 steps.
+        n_analyze = min(150, traj_len)
+        start_ts = traj_len - n_analyze
+        hip_vals = np.array([get_ref_q(ts)[0] for ts in range(start_ts, traj_len)])
+
+        best_period, best_corr = 20, 1e9
+        for lag in range(20, 80):
+            if lag >= len(hip_vals):
+                break
+            diff = hip_vals[lag:] - hip_vals[:-lag]
+            corr = np.mean(diff ** 2)
+            if corr < best_corr:
+                best_corr = corr
+                best_period = lag
+
+        period = best_period
+
+        # Find the double-support phase with minimum reference joint velocity.
+        # This is where both feet are stably on the ground — the safest
+        # point to begin the transition back to stance.
+        cycle_start = traj_len - period
+        best_phase, best_vel = 0, np.inf
+        for phase in range(period):
+            ts = cycle_start + phase
+            if ts >= traj_len:
+                break
+            vel = np.linalg.norm(get_ref_dq(ts))
+            if vel < best_vel:
+                best_vel = vel
+                best_phase = phase
+
+        # Compute how many extra steps from current time_step to best phase.
+        current_phase = (self._time_step - 1 - cycle_start) % period
+        extra = (best_phase - current_phase) % period
+        if extra < 3:
+            extra += period
+
+        return period, extra
 
     @staticmethod
     def _expand_gain(value, n: int) -> np.ndarray:

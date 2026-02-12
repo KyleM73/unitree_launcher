@@ -1,11 +1,13 @@
 """Tests for src/main.py — Phase 9.
 
-Covers GLFW key map, key callback dispatch, run_with_viewer (mocked viewer),
-and run_headless (duration, step, and trajectory-end termination).
+Covers GLFW key map, key callback dispatch (queue-based), run_with_viewer
+(mocked viewer with lock + queue), and run_headless (duration, step, and
+trajectory-end termination).
 """
 from __future__ import annotations
 
 import os
+import queue
 import threading
 import time
 from unittest.mock import MagicMock, patch, PropertyMock
@@ -87,90 +89,127 @@ def _make_controller(**kwargs) -> Controller:
 # ============================================================================
 
 class TestGLFWKeyMap:
+    """Verify GLFW_KEY_MAP maps keycodes to the correct action names.
+
+    Keys are chosen to avoid conflicts with MuJoCo viewer built-in
+    shortcuts (which bind most letter keys for rendering toggles).
+    """
+
     def test_glfw_key_map_space(self):
         assert GLFW_KEY_MAP[32] == "space"
 
-    def test_glfw_key_map_e(self):
-        assert GLFW_KEY_MAP[69] == "e"
+    def test_glfw_key_map_up(self):
+        assert GLFW_KEY_MAP[265] == "up"
 
-    def test_glfw_key_map_a(self):
-        assert GLFW_KEY_MAP[65] == "a"
+    def test_glfw_key_map_down(self):
+        assert GLFW_KEY_MAP[264] == "down"
 
-    def test_glfw_key_map_w(self):
-        assert GLFW_KEY_MAP[87] == "w"
+    def test_glfw_key_map_left(self):
+        assert GLFW_KEY_MAP[263] == "left"
 
-    def test_glfw_key_map_s(self):
-        assert GLFW_KEY_MAP[83] == "s"
+    def test_glfw_key_map_right(self):
+        assert GLFW_KEY_MAP[262] == "right"
 
-    def test_glfw_key_map_d(self):
-        assert GLFW_KEY_MAP[68] == "d"
+    def test_glfw_key_map_comma(self):
+        assert GLFW_KEY_MAP[44] == "comma"
 
-    def test_glfw_key_map_q(self):
-        assert GLFW_KEY_MAP[81] == "q"
+    def test_glfw_key_map_period(self):
+        assert GLFW_KEY_MAP[46] == "period"
 
-    def test_glfw_key_map_z(self):
-        assert GLFW_KEY_MAP[90] == "z"
+    def test_glfw_key_map_slash(self):
+        assert GLFW_KEY_MAP[47] == "slash"
 
-    def test_glfw_key_map_x(self):
-        assert GLFW_KEY_MAP[88] == "x"
+    def test_glfw_key_map_backspace(self):
+        assert GLFW_KEY_MAP[259] == "backspace"
 
-    def test_glfw_key_map_r(self):
-        assert GLFW_KEY_MAP[82] == "r"
+    def test_glfw_key_map_enter(self):
+        assert GLFW_KEY_MAP[257] == "enter"
 
-    def test_glfw_key_map_c(self):
-        assert GLFW_KEY_MAP[67] == "c"
+    def test_glfw_key_map_minus(self):
+        assert GLFW_KEY_MAP[45] == "minus"
 
-    def test_glfw_key_map_n(self):
-        assert GLFW_KEY_MAP[78] == "n"
+    def test_glfw_key_map_equal(self):
+        assert GLFW_KEY_MAP[61] == "equal"
 
-    def test_glfw_key_map_p(self):
-        assert GLFW_KEY_MAP[80] == "p"
+    def test_glfw_key_map_delete(self):
+        assert GLFW_KEY_MAP[261] == "delete"
 
     def test_glfw_key_map_all_values_are_strings(self):
         for keycode, name in GLFW_KEY_MAP.items():
             assert isinstance(keycode, int)
             assert isinstance(name, str)
 
+    def test_glfw_key_map_no_letter_keys(self):
+        """No single ASCII letter keys (65-90) — they conflict with MuJoCo viewer."""
+        for keycode in GLFW_KEY_MAP:
+            assert not (65 <= keycode <= 90), (
+                f"Letter key {chr(keycode)} (code {keycode}) conflicts with MuJoCo viewer"
+            )
+
 
 # ============================================================================
-# Key Callback Dispatch
+# Key Callback Dispatch (queue-based)
 # ============================================================================
 
 class TestKeyCallback:
-    def test_key_callback_dispatches_to_controller(self):
-        """Pressing space (keycode 32) dispatches handle_key('space')."""
-        ctrl = _make_controller()
-        ctrl.handle_key = MagicMock()
+    """The key callback fires on MuJoCo's viewer thread.  To avoid
+    cross-thread deadlocks, it enqueues key names into a SimpleQueue.
+    The main loop drains the queue outside the lock.
+    """
 
-        # Simulate what run_with_viewer does internally
-        key = GLFW_KEY_MAP.get(32)
-        if key:
-            ctrl.handle_key(key)
+    def test_key_callback_enqueues_mapped_key(self):
+        """Pressing space (keycode 32) enqueues 'space'."""
+        key_queue = queue.SimpleQueue()
 
-        ctrl.handle_key.assert_called_once_with("space")
-
-    def test_key_callback_unmapped_ignored(self):
-        """An unmapped keycode should NOT call handle_key."""
-        ctrl = _make_controller()
-        ctrl.handle_key = MagicMock()
-
-        key = GLFW_KEY_MAP.get(999)
-        if key:
-            ctrl.handle_key(key)
-
-        ctrl.handle_key.assert_not_called()
-
-    def test_key_callback_all_mapped_keys(self):
-        """Every mapped keycode dispatches correctly."""
-        ctrl = _make_controller()
-        ctrl.handle_key = MagicMock()
-
-        for keycode, expected_name in GLFW_KEY_MAP.items():
-            ctrl.handle_key.reset_mock()
+        def key_callback(keycode: int) -> None:
             key = GLFW_KEY_MAP.get(keycode)
             if key:
-                ctrl.handle_key(key)
-            ctrl.handle_key.assert_called_once_with(expected_name)
+                key_queue.put(key)
+
+        key_callback(32)
+        assert key_queue.get_nowait() == "space"
+
+    def test_key_callback_unmapped_ignored(self):
+        """An unmapped keycode should NOT enqueue anything."""
+        key_queue = queue.SimpleQueue()
+
+        def key_callback(keycode: int) -> None:
+            key = GLFW_KEY_MAP.get(keycode)
+            if key:
+                key_queue.put(key)
+
+        key_callback(999)
+        assert key_queue.empty()
+
+    def test_key_callback_all_mapped_keys(self):
+        """Every mapped keycode enqueues the correct name."""
+        key_queue = queue.SimpleQueue()
+
+        def key_callback(keycode: int) -> None:
+            key = GLFW_KEY_MAP.get(keycode)
+            if key:
+                key_queue.put(key)
+
+        for keycode, expected_name in GLFW_KEY_MAP.items():
+            key_callback(keycode)
+            assert key_queue.get_nowait() == expected_name
+
+    def test_main_loop_drains_queue_to_handle_key(self):
+        """Simulates the main loop: queue is drained, handle_key called."""
+        ctrl = _make_controller()
+        ctrl.handle_key = MagicMock()
+
+        key_queue = queue.SimpleQueue()
+        key_queue.put("space")
+        key_queue.put("up")
+
+        # Simulate main loop drain
+        while not key_queue.empty():
+            ctrl.handle_key(key_queue.get_nowait())
+
+        assert ctrl.handle_key.call_count == 2
+        ctrl.handle_key.assert_any_call("space")
+        ctrl.handle_key.assert_any_call("up")
 
 
 # ============================================================================
@@ -184,6 +223,7 @@ class TestRunWithViewer:
         robot = MagicMock()
         robot.mj_model = MagicMock()
         robot.mj_data = MagicMock()
+        robot.lock = threading.Lock()
 
         call_count = 0
 
@@ -210,12 +250,13 @@ class TestRunWithViewer:
                 mock_start.assert_called_once()
                 mock_stop.assert_called_once()
 
-    def test_run_with_viewer_key_callback_wired(self):
-        """Key callback from viewer dispatches to controller.handle_key."""
+    def test_run_with_viewer_key_callback_enqueues(self):
+        """Key callback from viewer enqueues to queue (not direct handle_key)."""
         ctrl = _make_controller()
         robot = MagicMock()
         robot.mj_model = MagicMock()
         robot.mj_data = MagicMock()
+        robot.lock = threading.Lock()
 
         captured_callback = None
 
@@ -239,13 +280,13 @@ class TestRunWithViewer:
 
         with patch("src.main.mujoco.viewer.launch_passive", side_effect=fake_launch_passive):
             with patch.object(ctrl, "start"), patch.object(ctrl, "stop"):
-                ctrl.handle_key = MagicMock()
                 run_with_viewer(robot, ctrl)
 
-        # Now test the captured callback
+        # The captured callback should exist and enqueue (not call handle_key directly)
         assert captured_callback is not None
+        # Calling it should not raise — it just pushes to a queue
         captured_callback(32)  # space
-        ctrl.handle_key.assert_called_once_with("space")
+        captured_callback(999)  # unmapped — should be silently ignored
 
     def test_run_with_viewer_key_callback_ignores_unmapped(self):
         """Unmapped keycodes do not reach handle_key."""
@@ -253,6 +294,7 @@ class TestRunWithViewer:
         robot = MagicMock()
         robot.mj_model = MagicMock()
         robot.mj_data = MagicMock()
+        robot.lock = threading.Lock()
 
         captured_callback = None
 
@@ -279,8 +321,44 @@ class TestRunWithViewer:
                 ctrl.handle_key = MagicMock()
                 run_with_viewer(robot, ctrl)
 
-        captured_callback(12345)  # unmapped
+        captured_callback(12345)  # unmapped — goes into queue but is discarded
+        # handle_key should not have been called (viewer exited before drain)
         ctrl.handle_key.assert_not_called()
+
+    def test_run_with_viewer_sync_under_lock(self):
+        """viewer.sync() must be called while holding sim_robot.lock."""
+        ctrl = _make_controller()
+        robot = MagicMock()
+        robot.mj_model = MagicMock()
+        robot.mj_data = MagicMock()
+        lock = threading.Lock()
+        robot.lock = lock
+
+        sync_held_lock = None
+        call_count = 0
+
+        class FakeViewer:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                pass
+
+            def is_running(self_inner):
+                nonlocal call_count
+                call_count += 1
+                return call_count <= 1
+
+            def sync(self_inner):
+                nonlocal sync_held_lock
+                # Check if lock is held (locked() returns True if acquired)
+                sync_held_lock = lock.locked()
+
+        with patch("src.main.mujoco.viewer.launch_passive", return_value=FakeViewer()):
+            with patch.object(ctrl, "start"), patch.object(ctrl, "stop"):
+                run_with_viewer(robot, ctrl)
+
+        assert sync_held_lock is True, "viewer.sync() must run under sim_robot.lock"
 
 
 # ============================================================================

@@ -12,6 +12,7 @@ from src.compat import patch_unitree_threading
 patch_unitree_threading()
 
 import argparse
+import queue
 import time
 from datetime import datetime
 from pathlib import Path
@@ -37,22 +38,24 @@ from src.policy.observations import ObservationBuilder
 from src.robot.real_robot import RealRobot
 from src.robot.sim_robot import SimRobot
 
-# GLFW key constants — printable ASCII chars match their ASCII values.
+# GLFW key constants.
+# Avoid letters bound by MuJoCo viewer (w=wireframe, s=shadow, a=analytic,
+# d=geom, e=frame, r=reflect, c=contact, n=overlay, x=connect, z=perturb).
 # See: https://www.glfw.org/docs/latest/group__keys.html
 GLFW_KEY_MAP = {
-    32: "space",   # GLFW_KEY_SPACE
-    65: "a",       # GLFW_KEY_A
-    67: "c",       # GLFW_KEY_C
-    68: "d",       # GLFW_KEY_D
-    69: "e",       # GLFW_KEY_E
-    78: "n",       # GLFW_KEY_N
-    80: "p",       # GLFW_KEY_P
-    81: "q",       # GLFW_KEY_Q
-    82: "r",       # GLFW_KEY_R
-    83: "s",       # GLFW_KEY_S
-    87: "w",       # GLFW_KEY_W
-    88: "x",       # GLFW_KEY_X
-    90: "z",       # GLFW_KEY_Z
+    32: "space",        # GLFW_KEY_SPACE  — start / stop
+    265: "up",          # GLFW_KEY_UP     — vx +
+    264: "down",        # GLFW_KEY_DOWN   — vx -
+    263: "left",        # GLFW_KEY_LEFT   — vy +
+    262: "right",       # GLFW_KEY_RIGHT  — vy -
+    44: "comma",        # GLFW_KEY_COMMA  — yaw +
+    46: "period",       # GLFW_KEY_PERIOD — yaw -
+    47: "slash",        # GLFW_KEY_SLASH  — zero velocity
+    259: "backspace",   # GLFW_KEY_BACKSPACE — e-stop
+    257: "enter",       # GLFW_KEY_ENTER  — clear e-stop
+    45: "minus",        # GLFW_KEY_MINUS  — prev policy
+    61: "equal",        # GLFW_KEY_EQUAL  — next policy
+    261: "delete",       # GLFW_KEY_DELETE (Fn+Backspace on Mac) — reset
 }
 
 
@@ -63,17 +66,22 @@ GLFW_KEY_MAP = {
 def run_with_viewer(sim_robot: SimRobot, controller: Controller) -> None:
     """Run simulation with interactive MuJoCo viewer.
 
-    The viewer runs in the main thread.  The control loop runs in a
-    background thread (started by controller.start()).  MuJoCo's
-    launch_passive handles its own thread-safety for rendering.
+    Threading model:
+        Main thread   — viewer.sync() + drain key queue (this function)
+        Control thread — get_state / send_command / mj_step (controller)
+        Viewer thread  — GLFW rendering + event loop (MuJoCo internal)
 
-    Key callback fires on key PRESS only (not repeat or release).
+    The key callback fires on MuJoCo's viewer thread.  To avoid
+    cross-thread deadlocks with sim_robot.lock, the callback only
+    enqueues key names; the main loop drains the queue *outside*
+    the lock before calling viewer.sync().
     """
+    key_queue: queue.SimpleQueue = queue.SimpleQueue()
 
     def key_callback(keycode: int) -> None:
         key = GLFW_KEY_MAP.get(keycode)
         if key:
-            controller.handle_key(key)
+            key_queue.put(key)
 
     with mujoco.viewer.launch_passive(
         sim_robot.mj_model,
@@ -83,7 +91,12 @@ def run_with_viewer(sim_robot: SimRobot, controller: Controller) -> None:
         controller.start()
         try:
             while viewer.is_running():
-                viewer.sync()
+                # Drain key events (no lock held — safe to call handle_key).
+                while not key_queue.empty():
+                    controller.handle_key(key_queue.get_nowait())
+
+                with sim_robot.lock:
+                    viewer.sync()
                 time.sleep(1.0 / 60.0)  # ~60 FPS viewer update
         except KeyboardInterrupt:
             pass
@@ -215,17 +228,32 @@ def main(argv: Optional[list] = None) -> None:
     else:
         robot = RealRobot(config)
 
-    # ---- Joint mapper ----
+    # ---- Policy format & joint ordering ----
     robot_joints = G1_29DOF_JOINTS if "29" in variant else G1_23DOF_JOINTS
+    policy_format = config.policy.format or detect_policy_format(args.policy)
+
+    observed_joints = config.policy.observed_joints
+    controlled_joints = config.policy.controlled_joints
+
+    # BeyondMimic: extract joint ordering from ONNX metadata so that the
+    # JointMapper correctly reorders between robot-native and policy order.
+    if policy_format == "beyondmimic" and controlled_joints is None:
+        metadata = BeyondMimicPolicy.load_metadata(args.policy)
+        if "joint_names" in metadata:
+            policy_joints = [
+                j.strip().replace("_joint", "")
+                for j in metadata["joint_names"].split(",")
+            ]
+            controlled_joints = policy_joints
+            observed_joints = policy_joints
+
     joint_mapper = JointMapper(
         robot_joints=robot_joints,
-        observed_joints=config.policy.observed_joints,
-        controlled_joints=config.policy.controlled_joints,
+        observed_joints=observed_joints,
+        controlled_joints=controlled_joints,
     )
 
     # ---- Policy ----
-    policy_format = config.policy.format or detect_policy_format(args.policy)
-
     if policy_format == "isaaclab":
         use_estimator = config.policy.use_estimator
         if args.no_est:
@@ -246,6 +274,22 @@ def main(argv: Optional[list] = None) -> None:
         )
 
     policy.load(args.policy)
+
+    # Match simulation parameters to the training environment.
+    if isinstance(policy, BeyondMimicPolicy) and hasattr(robot, 'set_home_positions'):
+        # 1. Set initial robot pose to policy's default joint positions.
+        default_native = joint_mapper.action_to_robot(policy.default_joint_pos)
+        robot.set_home_positions(default_native)
+
+        # 2. Set per-joint armature to match training sim.
+        #    Training uses: armature = stiffness / (natural_freq)^2
+        #    where natural_freq = 10 * 2π rad/s (from g1.py reference).
+        if policy.stiffness is not None:
+            import numpy as _np
+            _natural_freq = 10.0 * 2.0 * _np.pi
+            armature_policy = policy.stiffness / (_natural_freq ** 2)
+            armature_native = joint_mapper.action_to_robot(armature_policy)
+            robot.set_armature(armature_native)
 
     # Validate obs_dim match (IsaacLab only).
     if obs_builder is not None:

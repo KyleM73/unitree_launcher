@@ -1246,7 +1246,7 @@ class Controller:
         """Main control loop running at policy_frequency."""
 ```
 
-**Note on `handle_key()`:** This method provides a unified keyboard input interface shared between both plans. In the Docker plan, Viser keyboard events are translated to key strings and passed to `handle_key()`. In the Metal plan, GLFW keycodes are translated to the same key strings. The Controller handles velocity command updates (WASD), E-stop (E/C), start/stop (Space), reset (R), etc. This ensures the same keyboard behavior regardless of UI frontend.
+**Note on `handle_key()`:** This method provides a unified keyboard input interface shared between both plans. In the Docker plan, Viser keyboard events are translated to key strings and passed to `handle_key()`. In the Metal plan, GLFW keycodes are translated to the same key strings via a `GLFW_KEY_MAP`. The Controller handles velocity command updates (arrow keys), E-stop (Backspace/Enter), start/stop (Space), reset (Delete), policy cycling (=/−), etc. Key names are chosen to avoid conflicts with MuJoCo's built-in viewer shortcuts (which use most letter keys). This ensures the same keyboard behavior regardless of UI frontend.
 
 **Control loop pseudocode:**
 ```python
@@ -1472,7 +1472,7 @@ class ControlPanelUI:
 
 **Keyboard shortcuts (from SPEC section 6.4):**
 - Investigate Viser's keyboard event support. If Viser doesn't support global keyboard shortcuts natively, document this limitation and implement via the GUI only. The engineer should check `viser.SceneApi` for keyboard event callbacks.
-- If keyboard shortcuts are supported, translate Viser keyboard events to key name strings and call `controller.handle_key(key_name)`. This is the same interface used by the Metal plan's GLFW `key_callback`. Key names: `"space"`, `"r"`, `"e"`, `"c"`, `"m"`, `"1"`, `"2"`, `"3"`, `"w"`, `"s"`, `"a"`, `"d"`, `"q"`, `"z"`, `"x"`.
+- If keyboard shortcuts are supported, translate Viser keyboard events to key name strings and call `controller.handle_key(key_name)`. This is the same interface used by the Metal plan's GLFW `key_callback`. Key names: `"space"`, `"up"`, `"down"`, `"left"`, `"right"`, `"comma"`, `"period"`, `"slash"`, `"backspace"`, `"enter"`, `"delete"`, `"equal"`, `"minus"`. These avoid conflicts with MuJoCo's built-in letter-key shortcuts.
 - The `handle_key()` method on Controller handles all keyboard actions (velocity commands, E-stop, start/stop, reset, etc.) so the UI layer only needs to translate platform-specific key events to string names.
 
 **Acceptance criteria:**

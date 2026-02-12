@@ -154,17 +154,19 @@ class TestQuatToRotationMatrix:
 class TestQuatTo6D:
 
     def test_identity_6d(self):
-        """Identity quaternion -> first 2 columns of I3."""
+        """Identity quaternion -> first 2 columns of I3 in row-major order."""
         result = quat_to_6d(np.array([1, 0, 0, 0], dtype=float))
-        expected = np.array([1, 0, 0, 0, 1, 0], dtype=float)
+        # R[:,:2].flatten() for I3 = [1,0, 0,1, 0,0]
+        expected = np.array([1, 0, 0, 1, 0, 0], dtype=float)
         np.testing.assert_allclose(result, expected, atol=1e-12)
 
     def test_90_yaw_6d(self):
-        """90° yaw -> columns [0,1,0] and [-1,0,0]."""
+        """90° yaw -> first 2 columns [[0,-1],[1,0],[0,0]] row-major."""
         angle = np.pi / 2
         q = np.array([np.cos(angle/2), 0, 0, np.sin(angle/2)])
         result = quat_to_6d(q)
-        expected = np.array([0, 1, 0, -1, 0, 0], dtype=float)
+        # R_z(90°) = [[0,-1,0],[1,0,0],[0,0,1]], R[:,:2].flatten() = [0,-1, 1,0, 0,0]
+        expected = np.array([0, -1, 1, 0, 0, 0], dtype=float)
         np.testing.assert_allclose(result, expected, atol=1e-12)
 
     def test_shape(self):
@@ -483,16 +485,17 @@ class TestBeyondMimicObservation:
         np.testing.assert_allclose(obs[61:67], expected, atol=1e-12)
 
     def test_build_observation_6d_rotation_known_values(self):
-        """Verify 6D rotation for known quaternions."""
-        # Identity
+        """Verify 6D rotation for known quaternions (row-major of first 2 cols)."""
+        # Identity: R[:,:2].flatten() = [1,0, 0,1, 0,0]
         result = quat_to_6d(np.array([1, 0, 0, 0], dtype=float))
-        np.testing.assert_allclose(result, [1, 0, 0, 0, 1, 0], atol=1e-12)
+        np.testing.assert_allclose(result, [1, 0, 0, 1, 0, 0], atol=1e-12)
 
-        # 90° yaw: R_z(90°) columns: [0,1,0], [-1,0,0], [0,0,1]
+        # 90° yaw: R_z(90°) = [[0,-1,0],[1,0,0],[0,0,1]]
+        # R[:,:2].flatten() = [0,-1, 1,0, 0,0]
         angle = np.pi / 2
         q = np.array([np.cos(angle/2), 0, 0, np.sin(angle/2)])
         result = quat_to_6d(q)
-        np.testing.assert_allclose(result, [0, 1, 0, -1, 0, 0], atol=1e-12)
+        np.testing.assert_allclose(result, [0, -1, 1, 0, 0, 0], atol=1e-12)
 
     def test_build_observation_body_relative_position_known(self):
         """Known anchor and body: anchor at origin identity, body at [2,3,4]."""

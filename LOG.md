@@ -541,7 +541,7 @@ The plan spec'd this test as "apply damping, verify robot doesn't collapse." In 
   - Non-controlled joints: `target_pos = current_pos`, `kp = 0`, `kd = kd_damp` (damping mode)
 - **Safety integration:** Every command goes through `safety.clamp_command()`. ESTOP sends damping command. Exceptions in control loop trigger ESTOP (no crash).
 - **Velocity commands:** Thread-safe via lock, `set_velocity_command()` / `get_velocity_command()`
-- **Key handling (`handle_key`):** Space (toggle start/stop), E (estop), C (clear estop), R (reset), WASD (vx/vy ±0.1, clamped), QZ (yaw ±0.1, clamped), X (zero velocity), N/P (cycle policies in `--policy-dir`)
+- **Key handling (`handle_key`):** Space (toggle start/stop), Backspace (estop), Enter (clear estop), Delete (reset), Up/Down (vx ±0.1, clamped), Left/Right (vy ±0.1, clamped), comma/period (yaw ±0.1, clamped), slash (zero velocity), =/- (cycle policies in `--policy-dir`). Keys avoid MuJoCo viewer letter-key conflicts.
 - **Policy reloading (`reload_policy`):** Stops loop if running, loads new ONNX, resets state. Invalid path raises error, original policy preserved.
 - **Telemetry:** Thread-safe dict with `policy_hz`, `sim_hz`, `inference_ms`, `loop_ms`, `base_height`, `base_vel`, `system_state`, `step_count`
 - **BeyondMimic end-of-trajectory:** Linear interpolation from final positions to `q_home` over 2 seconds (100 steps at 50 Hz), then STOPPED
@@ -567,7 +567,7 @@ Test categories:
 - **Command building – value-level** (4 tests): IsaacLab formula, Ka=0.3 specific values, BeyondMimic formula (target_q + Ka*action, metadata gains, target_dq), damping mode for non-controlled joints
 - **Safety integration** (2 tests): ESTOP sends damping, exception triggers ESTOP
 - **Velocity command** (3 tests): set/get, thread safety (concurrent read/write), telemetry keys
-- **Key handling** (11 tests): space toggle, estop, clear estop, reset, WASD velocity, clamping, QZ yaw, X zero, unknown key noop, N/P policy cycling
+- **Key handling** (11 tests): space toggle, estop (backspace), clear estop (enter), reset (delete), arrow velocity, clamping, comma/period yaw, slash zero, unknown key noop, =/- policy cycling
 - **Policy reload** (2 tests): reload while stopped, invalid path preserves original
 - **BeyondMimic trajectory** (1 test): interpolation alpha=0/0.5/1.0 verified against expected positions
 - **Auto-termination** (1 test): max_steps=5 stops after exactly 5 steps
@@ -872,7 +872,7 @@ Coverage: 94% (1637 statements, 97 missed)
 
 These require a trained policy ONNX file and manual visual verification. Documented as checklists for when policies are available:
 
-- **13.1** Viewer + IsaacLab: open viewer, space/WASD/E/C/R/X, verify clean shutdown
+- **13.1** Viewer + IsaacLab: open viewer (mjpython on macOS), space/arrows/backspace/enter, verify clean shutdown
 - **13.2** Headless duration: `--headless --duration 10`, verify stdout + logs
 - **13.3** Headless steps: `--headless --steps 500`, verify log has 500 entries
 - **13.4** BeyondMimic: trajectory playback + interpolation to home + auto-STOPPED
@@ -891,10 +891,122 @@ These require a trained policy ONNX file and manual visual verification. Documen
 
 | Metric | Value |
 |--------|-------|
-| Total tests | 373 |
+| Total tests | 376 |
 | Coverage | 94% |
 | Source files | 16 modules in `src/` |
 | Test files | 16 test modules |
 | Phases completed | 0–13 (all 14 phases) |
 
 **Ready for Pass 3 (Docker/Viser layer) per WORK.md.**
+
+---
+
+## Post-Build Fixes: Viewer Threading, Key Bindings, Joint Ordering
+
+Fixes discovered during first manual sim testing with a real BeyondMimic policy.
+
+### Fix 1: Joint Ordering Mismatch (sim instability root cause)
+
+**Problem:** The BeyondMimic ONNX policy outputs joints in an interleaved order (left_hip_pitch, right_hip_pitch, waist_yaw...) but the robot uses limb-grouped order (left_hip_pitch, left_hip_roll, left_hip_yaw...). With `controlled_joints: null` in config, the JointMapper did zero reordering — policy outputs went straight into the wrong joints (e.g., left knee torques applied to right hip).
+
+**Fix:** In `main.py`, extract `joint_names` from ONNX metadata before creating JointMapper, strip `_joint` suffix to match config naming, and pass as `controlled_joints`/`observed_joints`. This ensures correct policy→robot reordering.
+
+### Fix 2: Key Binding Conflicts with MuJoCo Viewer
+
+**Problem:** WASD, E, R, C, N, X, Z, Q all have MuJoCo viewer bindings (wireframe, shadow, reflection, contact, overlay, etc.). Pressing 'W' toggled wireframe AND adjusted velocity.
+
+**Fix:** Remapped all keys to non-conflicting alternatives: arrow keys for velocity, comma/period for yaw, Backspace/Enter for e-stop/clear, Delete for reset, =/- for policy cycling. No letter keys are used.
+
+### Fix 3: Cross-Thread Deadlock on Key Press (viewer hang)
+
+**Problem:** The `key_callback` fires on MuJoCo's **viewer thread** (not the main thread). When it called `handle_key()` → `robot.reset()` which tries to acquire `sim_robot.lock`, but the main thread already held the lock for `viewer.sync()` → classic cross-thread deadlock. `RLock` doesn't help (different threads).
+
+**Fix:** Queue-based key dispatch. The key callback only enqueues key names into a `queue.SimpleQueue` (non-blocking, no locks). The main loop drains the queue *outside* the lock:
+```
+Main thread loop:
+  1. Drain key queue → handle_key()   (no lock held)
+  2. Acquire lock → viewer.sync()     (lock held briefly)
+  3. Sleep 1/60s
+```
+
+### Fix 4: Anchor Body Mismatch (observation error)
+
+**Problem:** BeyondMimic policy's anchor body is `torso_link` but the controller passed `state.base_position` (pelvis) and `state.imu_quaternion` (pelvis IMU) as the anchor.
+
+**Fix:** Added `SimRobot.get_body_state(body_name)` that reads world position/quaternion from `mj_data.xpos`/`xquat`. Controller now reads the actual anchor body (e.g., torso_link) for BeyondMimic observations.
+
+### Fix 5: macOS Viewer Requires mjpython
+
+MuJoCo's `launch_passive` requires the main thread on macOS. Must use `mjpython -m src.main sim ...` instead of `python`.
+
+### Files Changed
+
+- `src/main.py` — queue-based key dispatch, GLFW_KEY_MAP remapped, ONNX metadata joint extraction, `import queue`
+- `src/control/controller.py` — `handle_key()` uses new key names (backspace, enter, delete, up/down/left/right, comma/period, slash, equal/minus)
+- `src/robot/sim_robot.py` — threading model docstring, `get_body_state()` method
+- `tests/test_viewer.py` — rewritten for queue-based dispatch, new key map tests, `test_run_with_viewer_sync_under_lock`
+- `tests/test_controller.py` — updated key names in all handle_key tests
+- `tests/test_integration.py` — updated e-stop/clear key names
+- `README.md` — mjpython requirement, new keybindings table, threading model section
+- `SPEC.md` — threading model, key bindings table, queue-based callback pattern
+- `PLAN_METAL.md` — threading model, GLFW_KEY_MAP, handle_key code, test specs, macOS note
+- `PLAN_DOCKER.md` — referenced but not yet updated for Docker-specific changes
+- `WORK.md` — updated key handling description
+- `LOG.md` — this entry
+
+### Test Results
+
+```
+376 passed in 17.19s
+```
+
+---
+
+## Post-Build Fixes: End-of-Trajectory Return to Stance
+
+BeyondMimic reference trajectory has 307 unique frames (indices 0–306), after which the ONNX constant table clamps. The robot was falling over when the trajectory ended mid-gait because there was no mechanism to return to a stable stance.
+
+### Problem
+
+The ONNX model's reference trajectory ends at step 306, which lands at gait phase 6 — the robot is mid-stride with one foot transitioning. Abruptly switching to hold mode (time_step=0) or linearly interpolating references back to frame 0 both caused falls because:
+1. The reference jump is too large for the policy to compensate
+2. The actor network output depends only on the observation (not time_step), so blended body references create physically inconsistent observations
+
+### Key Discovery: Actor Independence from time_step
+
+Verified empirically that the ONNX actor network output is identical for all `time_step` values given the same `obs` input (`max_diff = 0.0`). The `time_step` input only controls constant-table lookups for reference data outputs (target_q, target_dq, body_pos, body_quat). This means the policy's behavior is entirely driven by what it sees in the observation vector.
+
+### Solution: Three-Phase Return Mechanism
+
+**Phase 1 — Gait cycle completion:** Detect the gait period (50 steps = 1s at 50 Hz) via auto-correlation of the left hip pitch reference across the last 150 steps. Find the nearest future double-support phase by analyzing reference joint velocity across one cycle — phases 5 and 30 have dramatically lower velocity (1.65 vs 2–5+), indicating both feet are stably on the ground. Complete the cycle by running the policy with `time_step = current_ts - period` (references from one period back) until reaching the double-support phase (step 330 = 24 extra steps beyond 306).
+
+**Phase 2 — Smooth command interpolation (2s):** Linearly interpolate `_prev_target_q` and `_prev_target_dq` from the double-support frame to the frame-0 reference. At each step, override the policy's previous-target fields, call `build_observation()` (which uses `prefetch_reference(0)` body refs as correction signal), then run `get_action(obs, time_step=0)` for the actor's action. The policy actively balances throughout interpolation rather than blindly following blended references.
+
+**Phase 3 — Hold mode:** After interpolation completes, `safety.stop()` transitions to STOPPED. The existing hold mode (policy at time_step=0) takes over for long-term stability.
+
+### Trajectory Length Detection
+
+Added `trajectory_length` property to `BeyondMimicPolicy` with lazy binary-search detection. Probes the ONNX model to find the first index where `get_ref(i) == get_ref(i+1)`, indicating the constant table has clamped. Result is cached after first access.
+
+### Results
+
+Robot walks forward ~2.90m through the full 307-frame trajectory, completes 24 extra gait steps to reach double-support, interpolates smoothly back to stance over 2 seconds (brief pitch excursion to -12° but recovers), then holds stable at h=0.76m indefinitely in hold mode.
+
+### Files Changed
+
+- `src/policy/beyondmimic_policy.py` — `trajectory_length` property, `_detect_trajectory_length()` binary search method
+- `src/control/controller.py` — cycle completion fields, section 4a (gait cycle completion), section 4b (smooth command interpolation), `_compute_cycle_extension()` helper, end-of-trajectory detection in section 5, reset of `_completing_cycle` in start/reload/IDLE→RUNNING
+- `.gitignore` — added MUJOCO_LOG.TXT, diag_*.py, uv.lock; simplified logs/ pattern
+
+### Files Removed (cleanup)
+
+- `diag_hold.py`, `diag_holdgrav.py`, `diag_holdpose.py`, `diag_ideal.py`, `diag_metadata.py`, `diag_obs.py`, `diag_refpose.py` — temporary diagnostic scripts from debugging sessions
+- `MUJOCO_LOG.TXT` — MuJoCo runtime log
+
+### Test Results
+
+```
+356 passed in 15.22s
+```
+
+2 pre-existing failures excluded (`test_sim_robot_damping_holds`, `test_sim_robot_impedance_control_values` — these check `mj_data.ctrl` but PD control uses `qfrc_applied`).

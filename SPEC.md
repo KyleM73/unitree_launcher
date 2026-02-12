@@ -51,7 +51,7 @@ Build a unified deployment stack for the Unitree G1 humanoid robot that enables:
 - [ ] CycloneDDS works on macOS loopback (lo0)
 - [ ] Headless mode runs on Linux servers without display
 - [ ] `--duration` and `--steps` flags auto-terminate headless evals
-- [ ] WASD keyboard controls adjust velocity commands in viewer
+- [ ] Arrow key / comma-period keyboard controls adjust velocity commands in viewer
 - [ ] Policy switching via keyboard shortcut (N/P for next/prev in `--policy-dir`)
 
 ### 1.3 Non-Goals (Out of Scope for Initial Version)
@@ -372,7 +372,7 @@ Mode 1 uses actuator-based names (ANKLE_A/B, WAIST_A/B) which map to the physica
 │  │  (Native Window) │  │  (50 Hz)     │◄─┤                   │  │
 │  │                  │  │              │  │ ┌───────────────┐ │  │
 │  │  - 3D Render     │  │  - ONNX Load │  │ │  SimRobot     │ │  │
-│  │  - Keyboard WASD │  │  - Obs Build │  │ │  (MuJoCo+DDS) │ │  │
+│  │  - Keyboard      │  │  - Obs Build │  │ │  (MuJoCo+DDS) │ │  │
 │  │  - Mouse Orbit   │  │  - Action    │  │ ├───────────────┤ │  │
 │  │                  │  │              │  │ │  RealRobot    │ │  │
 │  │  (or --headless  │  │              │  │ │  (DDS only)   │ │  │
@@ -577,15 +577,15 @@ The system uses multiple threads to ensure the control loop cannot be blocked by
 | MuJoCo Viewer | ~60 Hz (vsync) | GLFW render loop, keyboard input | Yes (main thread) |
 | DDS (internal) | Varies | Pub/sub callbacks | Handled by SDK |
 
-**[Metal] Viewer Thread Safety:** The MuJoCo viewer runs on the main thread (required by GLFW/macOS). `mujoco.viewer.launch_passive()` returns a handle. The `key_callback` fires on the main thread and must acquire the shared state lock before modifying velocity commands, E-stop flag, or system state. The control thread must hold the lock only briefly when reading shared state to avoid blocking the viewer.
+**[Metal] Viewer Thread Safety:** The MuJoCo viewer runs via `launch_passive()`, which creates an internal viewer thread for GLFW rendering. Three threads cooperate: the main thread (drains key queue + `viewer.sync()`), the control thread (policy inference + `mj_step()`), and the viewer thread (GLFW event loop + rendering). A `threading.Lock` on `SimRobot` protects `mjData` — held only during `mj_step()` and `viewer.sync()`. The `key_callback` fires on the **viewer thread** and must **never** acquire any locks; instead it enqueues key names into a `queue.SimpleQueue`. The main loop drains the queue *outside* the lock to avoid cross-thread deadlocks. On macOS, `mjpython` is required to launch the viewer on the main thread.
 
 **Critical Design Constraint**: The control thread must **never** be blocked by visualization, logging, or UI operations. On the real robot, a missed control cycle could cause instability or falls.
 
 **Synchronization:**
-- Use `threading.Lock` for shared state (both plans)
+- Use `threading.Lock` for `mjData` access (protects `mj_step` and `viewer.sync`)
 - E-stop flag should be atomic or lock-free for immediate response
 - State reads in control thread should be non-blocking copies
-- **[Metal]** `key_callback` acquires the lock briefly to update commands/flags
+- **[Metal]** `key_callback` enqueues to `queue.SimpleQueue` (never acquires locks)
 
 **E-Stop Handling:**
 The E-stop flag is checked at the **start** of every control cycle. When set:
@@ -1351,30 +1351,33 @@ If text overlay is not feasible with `launch_passive`, fall back to stdout-only 
 
 ### 6.4 Keyboard Shortcuts (Shared)
 
-Both plans use the same keyboard shortcuts. **[Docker]** uses Viser keyboard events; **[Metal]** uses GLFW `key_callback` with press-only detection (no repeat).
+Both plans use the same keyboard shortcuts. **[Docker]** uses Viser keyboard events; **[Metal]** uses GLFW `key_callback` with press-only detection (no repeat). **[Metal]** keys are chosen to avoid conflicts with MuJoCo's built-in viewer shortcuts (which bind most letter keys for rendering toggles like wireframe, shadow, contact, etc.).
 
 | Key | GLFW Code | Action |
 |-----|-----------|--------|
 | `Space` | 32 | Toggle start/stop |
-| `R` | 82 | Reset simulation |
-| `E` | 69 | E-stop (latching) |
-| `C` | 67 | Clear E-stop |
-| `M` | 77 | Toggle mesh/collision |
-| `1` | 49 | Follow camera |
-| `2` | 50 | Fixed camera |
-| `3` | 51 | Orbit camera |
-| `W` | 87 | Increase Vx by +0.1 (clamp to 1.0) |
-| `S` | 83 | Decrease Vx by -0.1 (clamp to -1.0) |
-| `A` | 65 | Increase Vy by +0.1 (clamp to 0.5) |
-| `D` | 68 | Decrease Vy by -0.1 (clamp to -0.5) |
-| `Q` | 81 | Increase yaw by +0.1 (clamp to 1.0) |
-| `Z` | 90 | Decrease yaw by -0.1 (clamp to -1.0) |
-| `X` | 88 | Zero all velocity commands |
+| `Backspace` | 259 | E-stop (latching) |
+| `Enter` | 257 | Clear E-stop |
+| `Delete` | 261 | Reset simulation (Fn+Backspace on Mac) |
+| `Up` | 265 | Increase Vx by +0.1 (clamp to 1.0) |
+| `Down` | 264 | Decrease Vx by -0.1 (clamp to -1.0) |
+| `Left` | 263 | Increase Vy by +0.1 (clamp to 0.5) |
+| `Right` | 262 | Decrease Vy by -0.1 (clamp to -0.5) |
+| `,` | 44 | Increase yaw by +0.1 (clamp to 1.0) |
+| `.` | 46 | Decrease yaw by -0.1 (clamp to -1.0) |
+| `/` | 47 | Zero all velocity commands |
+| `=` | 61 | Next policy in `--policy-dir` |
+| `-` | 45 | Previous policy in `--policy-dir` |
 
-**[Metal] GLFW Key Callback Signature:**
+**[Metal] GLFW Key Callback Threading:**
+The `key_callback` fires on MuJoCo's viewer thread. To avoid cross-thread deadlocks with `sim_robot.lock`, the callback only enqueues key names into a `queue.SimpleQueue`. The main loop drains the queue *outside* the lock:
 ```python
-def handle_key(keycode: int) -> None:
-    """Called by mujoco.viewer on key press (GLFW keycode, press only)."""
+key_queue = queue.SimpleQueue()
+
+def key_callback(keycode: int) -> None:
+    key = GLFW_KEY_MAP.get(keycode)
+    if key:
+        key_queue.put(key)  # Non-blocking, no locks
 ```
 
 **[Docker] Implementation Note:**
@@ -2212,7 +2215,7 @@ control:
 |------|-------------|
 | Headless sim | `--headless --duration 5` runs and exits cleanly |
 | Headless steps | `--headless --steps 100` runs correct number of steps |
-| WASD velocity | Velocity commands update correctly from keyboard input (manual test with viewer) |
+| Arrow-key velocity | Velocity commands update correctly from keyboard input (manual test with viewer) |
 | DDS loopback macOS | CycloneDDS communicates over `lo0` on macOS |
 
 ### 12.3 Manual Tests (Checklist)
@@ -2244,7 +2247,7 @@ control:
 - [ ] `uv venv && uv pip install -e ".[dev]"` succeeds on macOS ARM64
 - [ ] `scripts/validate_macos.py` passes all checks
 - [ ] MuJoCo viewer opens and renders robot
-- [ ] WASD keys adjust velocity commands
+- [ ] Arrow / comma-period keys adjust velocity commands
 - [ ] Camera view switching works (1/2/3 keys)
 - [ ] `--headless --duration 10` runs and exits
 - [ ] `--headless --steps 500` runs correct number of steps

@@ -167,7 +167,7 @@ class TestBuildCommand:
         np.testing.assert_array_almost_equal(cmd.joint_positions[ctrl_idx], expected_pos)
 
     def test_build_command_beyondmimic_values(self):
-        """Verify: target_pos = target_q + Ka * action, dq_target = target_dq."""
+        """Verify BM: target = default_q + Ka * action, dq_target = 0."""
         from src.policy.beyondmimic_policy import BeyondMimicPolicy
 
         config = _make_config()
@@ -176,8 +176,9 @@ class TestBuildCommand:
 
         bm_policy = MagicMock(spec=BeyondMimicPolicy)
         bm_policy.__class__ = BeyondMimicPolicy
-        bm_policy.target_q = np.full(29, 0.2)
-        bm_policy.target_dq = np.full(29, 0.5)
+        bm_policy.default_joint_pos = np.full(29, 0.2)
+        bm_policy.target_q = np.full(29, 0.9)  # NOT used for PD targets
+        bm_policy.target_dq = np.full(29, 0.5)  # NOT used for PD targets
         bm_policy.stiffness = np.full(29, 80.0)
         bm_policy.damping = np.full(29, 8.0)
         bm_policy.action_scale = np.full(29, 0.3)
@@ -198,11 +199,11 @@ class TestBuildCommand:
 
         ctrl_idx = ctrl.joint_mapper.controlled_indices
 
-        # target_pos = target_q + Ka * action = 0.2 + 0.3 * 1.0 = 0.5
+        # Training control law: target = default_q + Ka * action = 0.2 + 0.3 * 1.0 = 0.5
         np.testing.assert_array_almost_equal(cmd.joint_positions[ctrl_idx], np.full(29, 0.5))
 
-        # dq_target = target_dq = 0.5
-        np.testing.assert_array_almost_equal(cmd.joint_velocities[ctrl_idx], np.full(29, 0.5))
+        # dq_target = 0 (pure damping)
+        np.testing.assert_array_almost_equal(cmd.joint_velocities[ctrl_idx], np.zeros(29))
 
         # kp, kd from metadata
         np.testing.assert_array_almost_equal(cmd.kp[ctrl_idx], np.full(29, 80.0))
@@ -351,81 +352,83 @@ class TestKeyHandling:
         assert ctrl.safety.state == SystemState.RUNNING
         assert ctrl.is_running is True
 
-        # RUNNING -> STOPPED
+        # RUNNING -> STOPPED (loop keeps running in hold-pose mode)
         ctrl.handle_key("space")
-        time.sleep(0.1)  # let thread stop
+        time.sleep(0.1)
         assert ctrl.safety.state == SystemState.STOPPED
+        # Control loop stays alive (hold-pose mode); explicitly stop it.
+        ctrl.stop()
         assert ctrl.is_running is False
 
     def test_handle_key_estop(self):
         ctrl = _make_controller()
         ctrl.safety.start()
-        ctrl.handle_key("e")
+        ctrl.handle_key("backspace")
         assert ctrl.safety.state == SystemState.ESTOP
 
     def test_handle_key_clear_estop(self):
         ctrl = _make_controller()
         ctrl.safety.start()
         ctrl.safety.estop()
-        ctrl.handle_key("c")
+        ctrl.handle_key("enter")
         assert ctrl.safety.state == SystemState.STOPPED
 
     def test_handle_key_reset(self):
         ctrl = _make_controller()
-        ctrl.handle_key("r")
+        ctrl.handle_key("delete")
         ctrl.robot.reset.assert_called_once()
 
-    def test_handle_key_velocity_wasd(self):
+    def test_handle_key_velocity_arrows(self):
         ctrl = _make_controller()
-        ctrl.handle_key("w")
+        ctrl.handle_key("up")
         vc = ctrl.get_velocity_command()
         assert abs(vc[0] - 0.1) < 1e-9
 
-        ctrl.handle_key("s")
+        ctrl.handle_key("down")
         vc = ctrl.get_velocity_command()
         assert abs(vc[0]) < 1e-9
 
-        ctrl.handle_key("a")
+        ctrl.handle_key("left")
         vc = ctrl.get_velocity_command()
         assert abs(vc[1] - 0.1) < 1e-9
 
-        ctrl.handle_key("d")
+        ctrl.handle_key("right")
         vc = ctrl.get_velocity_command()
         assert abs(vc[1]) < 1e-9
 
     def test_handle_key_velocity_clamps(self):
-        """After 20 W presses, vx is clamped to 1.0."""
+        """After 20 Up presses, vx is clamped to 1.0."""
         ctrl = _make_controller()
         for _ in range(20):
-            ctrl.handle_key("w")
+            ctrl.handle_key("up")
         vc = ctrl.get_velocity_command()
         assert abs(vc[0] - 1.0) < 1e-9
 
         for _ in range(20):
-            ctrl.handle_key("s")
+            ctrl.handle_key("down")
         vc = ctrl.get_velocity_command()
         assert abs(vc[0] - (-1.0)) < 1e-9
 
-    def test_handle_key_qz_yaw(self):
+    def test_handle_key_comma_period_yaw(self):
         ctrl = _make_controller()
-        ctrl.handle_key("q")
+        ctrl.handle_key("comma")
         vc = ctrl.get_velocity_command()
         assert abs(vc[2] - 0.1) < 1e-9
 
-        ctrl.handle_key("z")
+        ctrl.handle_key("period")
         vc = ctrl.get_velocity_command()
         assert abs(vc[2]) < 1e-9
 
         # Clamp test
         for _ in range(20):
-            ctrl.handle_key("q")
+            ctrl.handle_key("comma")
         vc = ctrl.get_velocity_command()
         assert abs(vc[2] - 1.0) < 1e-9
 
-    def test_handle_key_x_zeros_velocity(self):
+    def test_handle_key_slash_zeros_velocity(self):
         ctrl = _make_controller()
         ctrl.set_velocity_command(0.5, 0.3, -0.2)
-        ctrl.handle_key("x")
+        ctrl.handle_key("slash")
         vc = ctrl.get_velocity_command()
         np.testing.assert_array_equal(vc, np.zeros(3))
 
@@ -467,12 +470,12 @@ class TestKeyHandling:
             policy_dir=str(tmp_path),
         )
 
-        ctrl.handle_key("n")
+        ctrl.handle_key("equal")
         # Should have loaded b_policy (index wraps to 1)
         assert ctrl._policy_index == 1
 
     def test_handle_key_prev_policy(self, tmp_path):
-        """'p' loads previous policy from policy_dir."""
+        """'-' loads previous policy from policy_dir."""
         from tests.conftest import create_isaaclab_onnx
 
         mapper = JointMapper(G1_29DOF_JOINTS)
@@ -500,7 +503,7 @@ class TestKeyHandling:
             policy_dir=str(tmp_path),
         )
 
-        ctrl.handle_key("p")
+        ctrl.handle_key("minus")
         # Should wrap to last policy (index -1 % 2 = 1)
         assert ctrl._policy_index == 1
 

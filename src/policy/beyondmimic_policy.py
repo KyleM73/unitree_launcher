@@ -1,12 +1,15 @@
 """BeyondMimic policy backend.
 
 Loads a BeyondMimic-exported ONNX model (with embedded metadata) and runs
-inference to produce joint position offsets.  Unlike IsaacLab, BeyondMimic:
+inference.  Unlike IsaacLab, BeyondMimic:
 
 - Receives a ``time_step`` input indexing into the reference trajectory.
-- Outputs ``target_q`` / ``target_dq`` reference joint states.
-- Uses a velocity-error control law:
-      tau = Kp * (target_q + Ka * action - q) - Kd * (qdot - target_dq)
+- Outputs reference ``joint_pos`` / ``joint_vel`` and body poses from
+  constant-table lookups (observation-independent) — these feed the
+  ``command`` and ``motion_anchor_*`` observation terms.
+- The actor network outputs ``actions`` which drive the robot through the
+  same training control law as IsaacLab:
+      tau = Kp * (default_q + Ka * action - q) - Kd * dq
 - Builds its own observation vector (metadata-driven structure).
 """
 from __future__ import annotations
@@ -61,6 +64,9 @@ class BeyondMimicPolicy(PolicyInterface):
         self._anchor_body_name: str = ""
         self._body_names: List[str] = []
         self._anchor_body_idx: int = 0
+
+        # Trajectory length (lazy detection)
+        self._trajectory_length: Optional[int] = None
 
         # ONNX output name mapping (handles naming differences)
         self._output_names: List[str] = []
@@ -131,15 +137,57 @@ class BeyondMimicPolicy(PolicyInterface):
         self.reset()
 
     def reset(self) -> None:
-        """Clear cached actions, targets, and body reference outputs."""
+        """Clear cached actions, targets, and body reference outputs.
+
+        Initialises ``_prev_target_q`` to ``default_joint_pos`` so that
+        the first ``command`` observation term is reasonable (matching
+        the training environment's initial command at reset).
+        """
         n = self._mapper.n_controlled
-        self._target_q = np.zeros(n)
+        self._target_q = self._default_joint_pos.copy()
         self._target_dq = np.zeros(n)
-        self._prev_target_q = np.zeros(n)
+        self._prev_target_q = self._default_joint_pos.copy()
         self._prev_target_dq = np.zeros(n)
         self._prev_action = np.zeros(n)
         self._prev_body_pos_w = None
         self._prev_body_quat_w = None
+
+    def prefetch_reference(self, time_step: int) -> None:
+        """Pre-fetch reference trajectory outputs for the given time_step.
+
+        In training, the command observation at step N contains the reference
+        for time_step N (because ``_update_command`` increments ``time_steps``
+        before observations are computed).  In deployment, without pre-fetch,
+        the command observation would lag by one step.
+
+        This method runs ONNX with a zero observation to extract reference
+        trajectory data (joint_pos, joint_vel, body_pos_w, body_quat_w) for
+        the given time_step.  The action output is discarded.
+
+        Only the reference caches (``_prev_target_q``, ``_prev_target_dq``,
+        ``_prev_body_pos_w``, ``_prev_body_quat_w``) are updated.
+        ``_prev_action`` is NOT touched so the ``actions`` observation term
+        retains the correct previous-step action.
+        """
+        if self._session is None:
+            return
+
+        dummy_obs = np.zeros((1, self._obs_dim), dtype=np.float32)
+        ts_input = np.array([[time_step]], dtype=np.float32)
+
+        results = self._session.run(
+            self._output_names,
+            {"obs": dummy_obs, "time_step": ts_input},
+        )
+
+        # Update reference trajectory caches only
+        self._prev_target_q = results[self._target_q_idx].flatten().astype(np.float64)
+        self._prev_target_dq = results[self._target_dq_idx].flatten().astype(np.float64)
+
+        if self._body_pos_w_idx is not None:
+            self._prev_body_pos_w = results[self._body_pos_w_idx].astype(np.float64)
+        if self._body_quat_w_idx is not None:
+            self._prev_body_quat_w = results[self._body_quat_w_idx].astype(np.float64)
 
     def get_action(self, observation: np.ndarray, **kwargs) -> np.ndarray:
         """Run ONNX inference with observation and time_step.
@@ -246,6 +294,53 @@ class BeyondMimicPolicy(PolicyInterface):
     def default_joint_pos(self) -> np.ndarray:
         return self._default_joint_pos
 
+    @property
+    def trajectory_length(self) -> int:
+        """Number of unique reference trajectory frames (lazy-detected).
+
+        The ONNX model's constant-table lookup clamps at the last valid
+        index, producing identical outputs for all ``time_step`` values
+        beyond the trajectory.  This property detects that boundary via
+        binary search (≈14 ONNX calls, runs once and is cached).
+        """
+        if self._trajectory_length is None:
+            self._trajectory_length = self._detect_trajectory_length()
+        return self._trajectory_length
+
+    def _detect_trajectory_length(self) -> int:
+        """Detect trajectory length by binary search for where reference freezes."""
+        if self._session is None:
+            return 0
+
+        obs = np.zeros((1, self._obs_dim), dtype=np.float32)
+        tq_name = self._output_names[self._target_q_idx]
+
+        def get_ref(ts: int) -> np.ndarray:
+            return self._session.run(
+                [tq_name],
+                {"obs": obs, "time_step": np.array([[ts]], dtype=np.float32)},
+            )[0].flatten()
+
+        # Find upper bound where reference is frozen
+        upper = 64
+        while upper < 100000:
+            if np.allclose(get_ref(upper), get_ref(upper + 1), atol=1e-7):
+                break
+            upper *= 2
+        else:
+            return upper  # Never froze — treat as very long trajectory
+
+        # Binary search: find first index where ref[i] == ref[i+1]
+        lo, hi = 0, upper
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if np.allclose(get_ref(mid), get_ref(mid + 1), atol=1e-7):
+                hi = mid
+            else:
+                lo = mid + 1
+
+        return lo + 1  # Number of unique frames (indices 0 through lo)
+
     # ------------------------------------------------------------------
     # Observation building
     # ------------------------------------------------------------------
@@ -289,7 +384,9 @@ class BeyondMimicPolicy(PolicyInterface):
         elif term == "motion_anchor_ori_b":
             return self._compute_motion_anchor_ori_b(anchor_quat_w)
         elif term == "base_lin_vel":
-            return robot_state.base_velocity.copy()
+            # Transform world-frame velocity to body frame: v_body = R^T @ v_world
+            R = quat_to_rotation_matrix(robot_state.imu_quaternion)
+            return R.T @ robot_state.base_velocity
         elif term == "base_ang_vel":
             return robot_state.imu_angular_velocity.copy()
         elif term == "joint_pos":
@@ -435,11 +532,12 @@ def quat_to_rotation_matrix(q: np.ndarray) -> np.ndarray:
 def quat_to_6d(quat_wxyz: np.ndarray) -> np.ndarray:
     """Convert wxyz quaternion to 6D rotation (first 2 columns of rotation matrix).
 
-    Convention: ``[col0[0], col0[1], col0[2], col1[0], col1[1], col1[2]]``.
+    Convention matches Isaac Lab's ``matrix_from_quat(...)[..., :2].reshape(-1)``
+    and MTC's row-major extraction: ``[R00, R01, R10, R11, R20, R21]``.
     Returns shape ``(6,)``.
     """
     R = quat_to_rotation_matrix(quat_wxyz)
-    return np.concatenate([R[:, 0], R[:, 1]])
+    return R[:, :2].flatten()
 
 
 def quat_inverse(q: np.ndarray) -> np.ndarray:

@@ -354,17 +354,48 @@ JOINT_LIMITS_23DOF: Dict[str, Tuple[float, float]] = {
 }
 
 # ---------------------------------------------------------------------------
+# Standby PD gains for holding the home pose (from BeyondMimic deployment).
+# These are much higher than the walking policy gains to hold against gravity.
+# Source: https://github.com/HybridRobotics/motion_tracking_controller
+# ---------------------------------------------------------------------------
+STANDBY_KP_29DOF: Dict[str, float] = {
+    "left_hip_pitch": 350.0, "left_hip_roll": 200.0, "left_hip_yaw": 200.0,
+    "left_knee": 300.0, "left_ankle_pitch": 300.0, "left_ankle_roll": 150.0,
+    "right_hip_pitch": 350.0, "right_hip_roll": 200.0, "right_hip_yaw": 200.0,
+    "right_knee": 300.0, "right_ankle_pitch": 300.0, "right_ankle_roll": 150.0,
+    "waist_yaw": 200.0, "waist_roll": 200.0, "waist_pitch": 200.0,
+    "left_shoulder_pitch": 40.0, "left_shoulder_roll": 40.0,
+    "left_shoulder_yaw": 40.0, "left_elbow": 40.0,
+    "left_wrist_roll": 40.0, "left_wrist_pitch": 40.0, "left_wrist_yaw": 40.0,
+    "right_shoulder_pitch": 40.0, "right_shoulder_roll": 40.0,
+    "right_shoulder_yaw": 40.0, "right_elbow": 40.0,
+    "right_wrist_roll": 40.0, "right_wrist_pitch": 40.0, "right_wrist_yaw": 40.0,
+}
+STANDBY_KD_29DOF: Dict[str, float] = {
+    "left_hip_pitch": 15.0, "left_hip_roll": 15.0, "left_hip_yaw": 15.0,
+    "left_knee": 20.0, "left_ankle_pitch": 15.0, "left_ankle_roll": 15.0,
+    "right_hip_pitch": 15.0, "right_hip_roll": 15.0, "right_hip_yaw": 15.0,
+    "right_knee": 20.0, "right_ankle_pitch": 15.0, "right_ankle_roll": 15.0,
+    "waist_yaw": 10.0, "waist_roll": 10.0, "waist_pitch": 10.0,
+    "left_shoulder_pitch": 3.0, "left_shoulder_roll": 3.0,
+    "left_shoulder_yaw": 3.0, "left_elbow": 3.0,
+    "left_wrist_roll": 3.0, "left_wrist_pitch": 3.0, "left_wrist_yaw": 3.0,
+    "right_shoulder_pitch": 3.0, "right_shoulder_roll": 3.0,
+    "right_shoulder_yaw": 3.0, "right_elbow": 3.0,
+    "right_wrist_roll": 3.0, "right_wrist_pitch": 3.0, "right_wrist_yaw": 3.0,
+}
+
 # Torque limits: config-name -> max torque in Nm (SPEC 2.2)
 # ---------------------------------------------------------------------------
 TORQUE_LIMITS_29DOF: Dict[str, float] = {
     "left_hip_pitch": 88.0,
-    "left_hip_roll": 88.0,
+    "left_hip_roll": 139.0,
     "left_hip_yaw": 88.0,
     "left_knee": 139.0,
     "left_ankle_pitch": 50.0,
     "left_ankle_roll": 50.0,
     "right_hip_pitch": 88.0,
-    "right_hip_roll": 88.0,
+    "right_hip_roll": 139.0,
     "right_hip_yaw": 88.0,
     "right_knee": 139.0,
     "right_ankle_pitch": 50.0,
@@ -390,13 +421,13 @@ TORQUE_LIMITS_29DOF: Dict[str, float] = {
 
 TORQUE_LIMITS_23DOF: Dict[str, float] = {
     "left_hip_pitch": 88.0,
-    "left_hip_roll": 88.0,
+    "left_hip_roll": 139.0,
     "left_hip_yaw": 88.0,
     "left_knee": 139.0,
     "left_ankle_pitch": 50.0,
     "left_ankle_roll": 50.0,
     "right_hip_pitch": 88.0,
-    "right_hip_roll": 88.0,
+    "right_hip_roll": 139.0,
     "right_hip_yaw": 88.0,
     "right_knee": 139.0,
     "right_ankle_pitch": 50.0,

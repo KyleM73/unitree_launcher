@@ -76,7 +76,7 @@ Three files exist in both plans but have different implementations. Design these
 
 | Concern | Metal (PLAN_METAL) | Docker (PLAN_DOCKER) |
 |---------|--------------------|--------------------|
-| User input | `handle_key()` with GLFW key codes (Space, WASD, QZ, E, R, N, P, C, X) | `handle_key()` called from Viser keyboard events; policy selection via UI dropdown |
+| User input | `handle_key()` via queue-based dispatch (Space, arrows, comma/period, Backspace, Enter, Delete, =/-). Keys avoid MuJoCo viewer conflicts. | `handle_key()` called from Viser keyboard events; policy selection via UI dropdown |
 | Status output | Periodic stdout print at 1 Hz (for headless monitoring) | Viser telemetry panel |
 | Policy cycling | N/P keys navigate policy directory | UI dropdown in `src/viz/ui.py` |
 | Sim stepping when stopped | Calls `robot.step()` even when STOPPED (keeps sim alive for viewer) | Skips `robot.step()` when not RUNNING |
