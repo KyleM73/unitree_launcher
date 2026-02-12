@@ -415,6 +415,73 @@ TORQUE_LIMITS_23DOF: Dict[str, float] = {
 }
 
 # ---------------------------------------------------------------------------
+# Velocity limits: config-name -> max velocity in rad/s
+# Source: unitree_rl_lab ImplicitActuatorCfg velocity_limit_sim values
+#   N7520-14.3 (hip_pitch, hip_yaw, waist_yaw): 32 rad/s
+#   N7520-22.5 (hip_roll, knee): 20 rad/s
+#   N5020-16   (shoulder, elbow, wrist_roll, ankle, waist_roll/pitch): 37 rad/s
+#   N5020-16-parallel (ankle, 23-DOF only): 30 rad/s
+#   W4010-25   (wrist_pitch, wrist_yaw, 29-DOF only): 22 rad/s
+# ---------------------------------------------------------------------------
+VELOCITY_LIMITS_29DOF: Dict[str, float] = {
+    "left_hip_pitch": 32.0,
+    "left_hip_roll": 20.0,
+    "left_hip_yaw": 32.0,
+    "left_knee": 20.0,
+    "left_ankle_pitch": 37.0,
+    "left_ankle_roll": 37.0,
+    "right_hip_pitch": 32.0,
+    "right_hip_roll": 20.0,
+    "right_hip_yaw": 32.0,
+    "right_knee": 20.0,
+    "right_ankle_pitch": 37.0,
+    "right_ankle_roll": 37.0,
+    "waist_yaw": 32.0,
+    "waist_roll": 37.0,
+    "waist_pitch": 37.0,
+    "left_shoulder_pitch": 37.0,
+    "left_shoulder_roll": 37.0,
+    "left_shoulder_yaw": 37.0,
+    "left_elbow": 37.0,
+    "left_wrist_roll": 37.0,
+    "left_wrist_pitch": 22.0,
+    "left_wrist_yaw": 22.0,
+    "right_shoulder_pitch": 37.0,
+    "right_shoulder_roll": 37.0,
+    "right_shoulder_yaw": 37.0,
+    "right_elbow": 37.0,
+    "right_wrist_roll": 37.0,
+    "right_wrist_pitch": 22.0,
+    "right_wrist_yaw": 22.0,
+}
+
+VELOCITY_LIMITS_23DOF: Dict[str, float] = {
+    "left_hip_pitch": 32.0,
+    "left_hip_roll": 20.0,
+    "left_hip_yaw": 32.0,
+    "left_knee": 20.0,
+    "left_ankle_pitch": 30.0,
+    "left_ankle_roll": 30.0,
+    "right_hip_pitch": 32.0,
+    "right_hip_roll": 20.0,
+    "right_hip_yaw": 32.0,
+    "right_knee": 20.0,
+    "right_ankle_pitch": 30.0,
+    "right_ankle_roll": 30.0,
+    "torso": 32.0,
+    "left_shoulder_pitch": 37.0,
+    "left_shoulder_roll": 37.0,
+    "left_shoulder_yaw": 37.0,
+    "left_elbow_pitch": 37.0,
+    "left_elbow_roll": 37.0,
+    "right_shoulder_pitch": 37.0,
+    "right_shoulder_roll": 37.0,
+    "right_shoulder_yaw": 37.0,
+    "right_elbow_pitch": 37.0,
+    "right_elbow_roll": 37.0,
+}
+
+# ---------------------------------------------------------------------------
 # DDS/IDL name <-> config name mappings (SPEC section 2.2, 2.3)
 # ---------------------------------------------------------------------------
 _DDS_TO_CONFIG_29DOF: Dict[str, str] = {

@@ -300,3 +300,55 @@ Per WORK.md safety requirements, the following value-level checks are in place:
 ### Pending for Future Phases
 
 - Scene XML files (`scene_29dof.xml`, `scene_23dof.xml`) — Phase 7
+
+---
+
+## Pass 1, Step 6: Phase 5 — Safety System [Shared]
+
+**Date:** 2026-02-11
+**Status:** COMPLETE
+
+### Task 5.1: `src/control/safety.py`
+
+`SafetyController` class implemented with:
+- `SystemState` enum: IDLE, RUNNING, STOPPED, ESTOP
+- State transitions: IDLE→RUNNING (start), RUNNING→STOPPED (stop), RUNNING/STOPPED→ESTOP (estop), ESTOP→STOPPED (clear_estop)
+- `get_damping_command()`: target_pos = current_pos, kp=0, kd=kd_damp, zero velocities/torques
+- `check_orientation()`: projects gravity into body frame, safe if Z component < -0.8 (~35 deg from vertical)
+- `clamp_command()`: enforces per-joint position, velocity, and torque limits when enabled in SafetyConfig
+- Thread safety: all state transitions protected by `threading.Lock`
+
+### Velocity Limits Added to `src/config.py`
+
+Added `VELOCITY_LIMITS_29DOF` and `VELOCITY_LIMITS_23DOF` dictionaries sourced from the official Unitree RL Lab (`unitree_rl_lab`) ImplicitActuatorCfg `velocity_limit_sim` values:
+
+| Motor Model | Joints | Velocity (rad/s) |
+|---|---|---|
+| N7520-14.3 | hip_pitch, hip_yaw, waist_yaw | 32 |
+| N7520-22.5 | hip_roll, knee | 20 |
+| N5020-16 | shoulder, elbow, wrist_roll, ankle (29-DOF), waist_roll/pitch | 37 |
+| N5020-16-parallel | ankle (23-DOF only) | 30 |
+| W4010-25 | wrist_pitch, wrist_yaw (29-DOF only) | 22 |
+
+The MuJoCo XML model files do not contain velocity limits — only position ranges and force ranges. The velocity limits were found in the [unitree_rl_lab](https://github.com/unitreerobotics/unitree_rl_lab) IsaacLab configuration.
+
+### Tests
+
+34 tests in `tests/test_safety.py` — **all passing**.
+151 total tests (Phase 1–5) — **all passing**.
+
+```
+tests/test_safety.py — 34 passed in 0.05s
+Full suite — 151 passed in 2.13s
+```
+
+Test categories:
+- **State machine** (14 tests): all transitions, invalid transitions, idempotency, latching
+- **Damping command** (7 tests): shape, kp=0, kd=kd_damp, position=current, zero vel/torque, no aliasing
+- **Orientation check** (5 tests): upright, safe tilt, unsafe tilt, inverted, boundary angle
+- **Thread safety** (1 test): 10 concurrent threads calling estop()/start() with barrier synchronization
+- **Clamp command** (7 tests): per-joint position/velocity/torque clamping, disabled passthrough, input immutability, gain preservation, within-limits passthrough
+
+### Pending for Future Phases
+
+- Scene XML files (`scene_29dof.xml`, `scene_23dof.xml`) — Phase 7
