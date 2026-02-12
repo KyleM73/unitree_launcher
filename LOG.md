@@ -246,3 +246,57 @@ Full suite — 68 passed in 2.03s
 ### Pending for Future Phases
 
 - Scene XML files (`scene_29dof.xml`, `scene_23dof.xml`) — Phase 7
+
+---
+
+## Pass 1, Step 5: Phase 4 — Joint Mapping and Observation Building [Shared]
+
+**Date:** 2026-02-11
+**Status:** COMPLETE
+
+### Task 4.1: `src/policy/joint_mapper.py`
+
+`JointMapper` class implemented with:
+- Default resolution: both None → all native, controlled-only → observed=controlled, observed-only → controlled=all
+- Index arrays: `observed_indices`, `controlled_indices`, `non_controlled_indices`
+- Methods: `robot_to_observation()`, `robot_to_action()`, `action_to_robot(default_value)`
+- Exposes `observed_joints`/`controlled_joints` name lists (needed by ObservationBuilder for q_home lookup)
+- Validation: unknown joints, duplicates, empty controlled all raise `ValueError`
+
+### Task 4.2: `src/policy/observations.py`
+
+`ObservationBuilder` class implemented with:
+- Observation vector in IsaacLab PolicyCfg order: `[base_lin_vel?, base_ang_vel, projected_gravity, velocity_commands, joint_pos, joint_vel, actions]`
+- `observation_dim` = `2*n_observed + n_controlled + (12 if use_estimator else 9)`
+- `compute_projected_gravity(q_wxyz)`: `R^T @ [0,0,-1]` where R is body→world rotation from quaternion
+- `compute_body_velocity_in_body_frame(v_world, q_wxyz)`: `R^T @ v_world`
+- Joint positions are relative to home: `q - q_home` (q_home built from config in observation order)
+- `use_estimator=False` omits `base_lin_vel` entirely (not zeroed), reducing obs_dim by 3
+- Helper `_quat_to_rotation_matrix()` module-level for wxyz → 3x3 rotation matrix
+
+### Issues Encountered & Fixes
+
+1. **90° roll gravity test had wrong expected sign** — `R_x(90°)^T @ [0,0,-1]` = `[0, -1, 0]`, not `[0, 1, 0]`. Fixed test expected value. Implementation was correct.
+
+### Tests
+
+21 tests in `tests/test_joint_mapper.py`, 28 tests in `tests/test_observations.py` — **all passing**.
+117 total tests (Phase 1–4) — **all passing**.
+
+```
+tests/test_joint_mapper.py — 21 passed
+tests/test_observations.py — 28 passed
+Full suite — 117 passed in 2.09s
+```
+
+### Value-Level Tests (Safety-Critical)
+
+Per WORK.md safety requirements, the following value-level checks are in place:
+- `test_isaaclab_reordering_known_state`: state `[0.0, 0.1, ..., 2.8]` through IsaacLab reordering verified against `ISAACLAB_TO_NATIVE_INDICES * 0.1`
+- `test_projected_gravity_upright/inverted/tilted/90_roll`: hand-computed expected vectors verified
+- `test_body_velocity_transform_rotated/180_yaw`: hand-computed rotation results verified
+- `test_build_joint_positions_are_relative`: verified `q - q_home` subtraction (not raw positions)
+
+### Pending for Future Phases
+
+- Scene XML files (`scene_29dof.xml`, `scene_23dof.xml`) — Phase 7
