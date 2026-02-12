@@ -352,3 +352,95 @@ Test categories:
 ### Pending for Future Phases
 
 - Scene XML files (`scene_29dof.xml`, `scene_23dof.xml`) — Phase 7
+
+---
+
+## Pass 1, Step 7: Phase 6 — Policy Interfaces [Shared]
+
+**Date:** 2026-02-11
+**Status:** COMPLETE
+
+### Task 6.1: Test ONNX Model Fixtures
+
+Already completed in Phase 1 (`conftest.py`). `create_isaaclab_onnx()` and `create_beyondmimic_onnx()` helpers confirmed working.
+
+### Task 6.2: `detect_policy_format()` (in `src/policy/base.py`)
+
+Auto-detection based on ONNX input names: if model has `time_step` input → `"beyondmimic"`, else `"isaaclab"`. Handles corrupt/missing files with `ValueError`.
+
+### Task 6.3: `src/policy/isaaclab_policy.py`
+
+`IsaacLabPolicy` class:
+- Takes `JointMapper` and `obs_dim` (from `ObservationBuilder`)
+- `load()`: creates ONNX `InferenceSession`, validates obs_dim and action_dim match expectations
+- `get_action()`: runs inference, returns `(n_controlled,)` float64 array
+- `last_action` property returns a copy (not internal reference)
+- Handles both `"action"` and `"actions"` output names (uses first output dynamically)
+
+### Task 6.4: `src/policy/beyondmimic_policy.py`
+
+`BeyondMimicPolicy` class:
+- Loads ONNX with metadata extraction (comma-separated string format, NOT `eval()`)
+- `get_action(obs, time_step=...)`: runs inference, caches `target_q`, `target_dq`, body reference outputs
+- `build_observation()`: builds observation from `RobotState` + anchor body state + cached previous outputs
+- When `use_onnx_metadata=True`, loads `stiffness`, `damping`, `action_scale` from metadata
+- Metadata parsing uses `_parse_csv()` and `_parse_float_csv()` for comma-separated values
+
+**Observation structure (from real BeyondMimic model metadata):**
+```
+[command(58), motion_anchor_pos_b(3), motion_anchor_ori_b(6),
+ base_lin_vel(3), base_ang_vel(3), joint_pos(29), joint_vel(29), actions(29)]
+= 160 total
+```
+- `command` = concat(prev_target_q, prev_target_dq)
+- `motion_anchor_pos_b` = previous body reference position in robot body-relative frame
+- `motion_anchor_ori_b` = previous body reference orientation as 6D rotation
+- `joint_pos` = current positions relative to `default_joint_pos` from metadata
+
+**Geometry helpers (module-level, tested independently):**
+- `quat_to_rotation_matrix()`, `quat_to_6d()`, `quat_inverse()`, `quat_multiply()`
+- `compute_body_relative_position()`, `compute_body_relative_orientation()`
+- 6D rotation convention: column-major `[col0, col1]` (not row-major flatten)
+
+### Real Policy Models Inspected
+
+Both user-provided ONNX models in `assets/policies/` were inspected:
+
+| Model | obs_dim | action_dim | Outputs | Notes |
+|-------|---------|------------|---------|-------|
+| `isaaclab_29dof.onnx` | 123 | 37 | `actions` | 37 joints (12+2×37+37=123), no metadata |
+| `beyondmimic_29dof.onnx` | 160 | 29 | `actions`, `joint_pos`, `joint_vel`, `body_pos_w`[14,3], `body_quat_w`[14,4], `body_lin_vel_w`[14,3], `body_ang_vel_w`[14,3] | 14 tracked bodies, full metadata |
+
+**Note:** The IsaacLab model (`isaaclab_29dof.onnx`) has 37 action dims, not 29. Investigation of the IsaacLab task config (`flat_env_cfg.py` → `rough_env_cfg.py` → `G1_MINIMAL_CFG`) revealed the `arms` actuator group in `G1_CFG` includes 7 finger joint patterns (`.*_zero_joint` through `.*_six_joint`) × 2 sides = 14 finger joints, bringing the total from 23 upper-body + 13 lower-body = 37 DOFs. These finger joints don't exist in our MuJoCo 29-DOF model. **User is retraining the IsaacLab policy with finger joints excluded.** This file will be replaced — the current `isaaclab_29dof.onnx` is NOT usable with the 29-DOF config.
+
+### Issues Encountered & Fixes
+
+1. **6D rotation flatten order** — `R[:, :2].flatten()` gives row-major [R00,R01,R10,R11,...] but the standard 6D convention uses column-major [col0, col1]. **Fix:** Use `np.concatenate([R[:, 0], R[:, 1]])`.
+
+2. **`last_action` aliasing** — Property returned internal `_last_action` array directly, allowing external mutation. **Fix:** Return `.copy()`.
+
+3. **ONNX output name convention** — Real models use `"actions"` (plural) and `"joint_pos"`/`"joint_vel"` instead of spec's `"action"`, `"target_q"`, `"target_dq"`. **Fix:** IsaacLabPolicy uses first output dynamically. BeyondMimicPolicy has `_find_output_index()` that tries multiple candidate names.
+
+### Tests
+
+22 tests in `tests/test_isaaclab_policy.py`, 39 tests in `tests/test_beyondmimic_policy.py` — **all passing**.
+212 total tests (Phase 1–6) — **all passing**.
+
+```
+tests/test_isaaclab_policy.py — 22 passed
+tests/test_beyondmimic_policy.py — 39 passed
+Full suite — 212 passed in 2.08s
+```
+
+Test categories:
+- **Format detection** (4 tests): IsaacLab, BeyondMimic, corrupt, missing
+- **IsaacLab load** (6 tests): valid, invalid path, dim mismatch, action dim mismatch, corrupt, reload
+- **IsaacLab inference** (8 tests): shape, dtype, deterministic, no-load error, reset, dim match, last_action update, copy safety
+- **Geometry helpers** (17 tests): rotation matrix (identity, 90° yaw, 180° pitch), 6D rotation (identity, 90° yaw, shape), quaternion inverse, quaternion multiply, body-relative position (4 cases), body-relative orientation (4 cases)
+- **BeyondMimic load** (7 tests): valid, metadata extraction, gain override, disable override, missing field, malformed parse, invalid path
+- **BeyondMimic inference** (7 tests): time_step, target storage, shape, missing time_step, no-load, reset clears, deterministic
+- **BeyondMimic observation** (12 tests): shape, command zeros, base velocities, joint_pos relative, actions follow inference, anchor pos/ori initial values, 6D known values, body-relative position/orientation
+
+### Pending for Future Phases
+
+- Scene XML files (`scene_29dof.xml`, `scene_23dof.xml`) — Phase 7
