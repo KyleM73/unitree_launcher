@@ -77,9 +77,9 @@ class SafetyController:
             return self._state
 
     def start(self) -> bool:
-        """IDLE -> RUNNING. Returns False if transition invalid."""
+        """IDLE/STOPPED -> RUNNING. Returns False if transition invalid."""
         with self._lock:
-            if self._state == SystemState.IDLE:
+            if self._state in (SystemState.IDLE, SystemState.STOPPED):
                 self._state = SystemState.RUNNING
                 return True
             return False

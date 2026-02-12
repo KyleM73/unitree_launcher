@@ -95,13 +95,12 @@ class TestStateTransitions:
         safety.estop()
         assert safety.state == SystemState.IDLE
 
-    def test_stopped_to_idle_transition(self, safety):
-        """start() from STOPPED should return False (not a valid transition).
-        Going back to IDLE from STOPPED is not supported per state machine spec."""
+    def test_stopped_to_running_transition(self, safety):
+        """start() from STOPPED transitions to RUNNING (resume after stop)."""
         safety.start()
         safety.stop()
-        assert safety.start() is False
-        assert safety.state == SystemState.STOPPED
+        assert safety.start() is True
+        assert safety.state == SystemState.RUNNING
 
     def test_stop_from_idle_noop(self, safety):
         """stop() from IDLE returns False (invalid transition)."""

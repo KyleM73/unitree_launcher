@@ -185,7 +185,7 @@ class Controller:
         Called from the main thread. Thread-safe.
         """
         if key == "space":
-            if self.safety.state == SystemState.IDLE:
+            if self.safety.state in (SystemState.IDLE, SystemState.STOPPED):
                 self.safety.start()
                 self.start()
             elif self.safety.state == SystemState.RUNNING:
@@ -394,7 +394,20 @@ class Controller:
 
                 # 10. Log
                 if self._logger is not None:
-                    self._logger.log_step(state, cmd, action, step_count)
+                    loop_time = time.perf_counter() - loop_start
+                    self._logger.log_step(
+                        timestamp=time.time(),
+                        robot_state=state,
+                        observation=obs,
+                        action=action,
+                        command=cmd,
+                        system_state=self.safety.state,
+                        velocity_command=self.get_velocity_command(),
+                        timing={
+                            "inference_ms": inference_time * 1000.0,
+                            "loop_ms": loop_time * 1000.0,
+                        },
+                    )
 
                 # 11. Update telemetry
                 self._update_telemetry(state, inference_time, loop_start, step_count)

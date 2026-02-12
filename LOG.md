@@ -808,3 +808,93 @@ Test categories:
 ### Pending for Future Phases
 
 - Phase 13: Integration tests, manual end-to-end validation
+
+---
+
+## Pass 2, Step 14: Phase 13 — Integration Testing [Metal-specific]
+
+**Date:** 2026-02-11
+**Status:** COMPLETE
+
+### Task 13.6: Automated Headless Integration Tests
+
+Created `tests/test_integration.py` with 6 fully automated end-to-end tests:
+
+1. **`test_headless_sim_isaaclab_100_steps`** — Full pipeline (Config → SimRobot → IsaacLabPolicy → Controller) runs 100 steps, verifies no crash and correct step count.
+2. **`test_headless_sim_isaaclab_with_logger`** — Full pipeline with DataLogger enabled, verifies HDF5 log file created with correct data.
+3. **`test_headless_sim_estop_recovery`** — RUNNING → ESTOP → (clear) → STOPPED → (space) → RUNNING → STOPPED. Verifies all state transitions.
+4. **`test_headless_sim_policy_reload`** — Start, stop, reload second ONNX, resume. Verifies policy hot-swap works.
+5. **`test_headless_sim_23dof_smoke`** — 10 steps with 23-DOF model, verifies no crash.
+6. **`test_headless_performance_50hz`** — 200 steps, verifies policy_hz > 30 Hz (marked `@pytest.mark.slow`).
+
+### Bugs Found and Fixed During Integration
+
+**Bug 1: Controller `log_step()` call signature mismatch**
+
+The controller called `self._logger.log_step(state, cmd, action, step_count)` but the logger expects `log_step(timestamp, robot_state, observation, action, command, system_state, velocity_command, timing)`. This would crash any run with logging enabled. **Fix:** Updated the controller to pass all 8 required arguments with correct types.
+
+**Why it wasn't caught earlier:** Phase 8 controller tests used `MagicMock()` for the logger, which accepts any arguments silently. Phase 10 logger tests tested `log_step()` directly with correct args. Neither tested the two together. This is exactly the class of bug integration tests are designed to catch.
+
+**Bug 2: No STOPPED → RUNNING state transition**
+
+The safety state machine only had `IDLE → RUNNING`, not `STOPPED → RUNNING`. Combined with `handle_key("space")` only checking IDLE state, pressing space from STOPPED did nothing — making E-stop recovery and stop/resume flows impossible. **Fix:**
+- `SafetyController.start()` now accepts both IDLE and STOPPED states
+- `Controller.handle_key("space")` now triggers from both IDLE and STOPPED states
+- Updated `test_safety.py::test_stopped_to_running_transition` to verify the new behavior
+
+### Task 13.7: Comprehensive Test Run with Coverage
+
+```
+373 passed in 17.75s
+Coverage: 94% (1637 statements, 97 missed)
+```
+
+| Module | Stmts | Cover | Notes |
+|--------|-------|-------|-------|
+| safety.py | 79 | 100% | |
+| observations.py | 39 | 100% | |
+| base.py (policy) | 26 | 100% | |
+| base.py (robot) | 48 | 100% | |
+| config.py | 139 | 99% | |
+| sim_robot.py | 136 | 98% | |
+| isaaclab_policy.py | 49 | 98% | |
+| joint_mapper.py | 66 | 97% | |
+| compat.py | 56 | 95% | |
+| beyondmimic_policy.py | 235 | 94% | |
+| main.py | 122 | 93% | |
+| real_robot.py | 99 | 93% | |
+| replay.py | 128 | 91% | |
+| logger.py | 145 | 90% | |
+| controller.py | 270 | 89% | |
+| **TOTAL** | **1637** | **94%** | Target was >80% |
+
+### Tasks 13.1–13.5: Manual Test Checklists
+
+These require a trained policy ONNX file and manual visual verification. Documented as checklists for when policies are available:
+
+- **13.1** Viewer + IsaacLab: open viewer, space/WASD/E/C/R/X, verify clean shutdown
+- **13.2** Headless duration: `--headless --duration 10`, verify stdout + logs
+- **13.3** Headless steps: `--headless --steps 500`, verify log has 500 entries
+- **13.4** BeyondMimic: trajectory playback + interpolation to home + auto-STOPPED
+- **13.5** 23-DOF smoke: `--robot g1_23dof --config configs/g1_23dof.yaml`
+
+### Pending
+
+- Manual end-to-end tests (13.1–13.5) — awaiting trained policy ONNX files
+- **Metal build is now complete.** All automated tests pass, 94% coverage.
+
+---
+
+## Metal Build Summary
+
+**Pass 1 (Shared Core) + Pass 2 (Metal-Specific) COMPLETE.**
+
+| Metric | Value |
+|--------|-------|
+| Total tests | 373 |
+| Coverage | 94% |
+| Source files | 16 modules in `src/` |
+| Test files | 16 test modules |
+| Phases completed | 0–13 (all 14 phases) |
+
+**Ready for Pass 3 (Docker/Viser layer) per WORK.md.**
