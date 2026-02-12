@@ -443,4 +443,83 @@ Test categories:
 
 ### Pending for Future Phases
 
-- Scene XML files (`scene_29dof.xml`, `scene_23dof.xml`) — Phase 7
+- ~~Scene XML files (`scene_29dof.xml`, `scene_23dof.xml`) — Phase 7~~ DONE
+
+---
+
+## Pass 1, Step 8: Phase 7 — MuJoCo Simulation and DDS Bridge [Shared]
+
+**Date:** 2026-02-11
+**Status:** COMPLETE
+
+### Task 7.1: Scene XML Files
+
+Created `assets/robots/g1/scene_29dof.xml` and `assets/robots/g1/scene_23dof.xml`:
+- Copied from reference implementation format
+- Include respective robot model via `<include file="g1_Xdof.xml"/>`
+- Ground plane with checker texture, directional lighting, skybox
+- Both models load successfully and have correct actuator counts
+
+**Note on 23-DOF model:** The MuJoCo g1_23dof.xml model still has 29 actuators and 36 qpos (same as 29-DOF). The "23-DOF" distinction is a firmware/software mode — the physical model is identical. The 23-DOF config simply controls a subset of 23 joints while the remaining 6 (waist_roll, waist_pitch, wrist_pitch×2, wrist_yaw×2) receive passive damping.
+
+### Task 7.2: `src/robot/sim_robot.py`
+
+`SimRobot` class implemented with:
+- **Joint mapping:** `_cfg_to_mj` array maps config joint indices to MuJoCo actuator indices. For 29-DOF this is identity; for 23-DOF it maps 23 config joints to their corresponding MuJoCo actuators.
+- **Physics timestep:** Set from `1.0 / config.control.sim_frequency` (0.005s at 200 Hz)
+- **Substeps:** `sim_frequency // policy_frequency` (4 at 200/50 Hz), advancing 0.02s per `step()`
+- **Sensor mapping:** Dynamically indexes `sensordata` using `_cfg_to_mj` for positions, velocities, torques. IMU and frame sensors at fixed offsets after motor sensors.
+- **Impedance control:** `send_command()` applies `tau_ff + kp*(q_des - q) + kd*(dq_des - dq)` per controlled joint, plus `-kd_damp * dq` for non-controlled joints in 23-DOF mode
+- **Thread safety:** `threading.Lock` protects `mj_data` during `step()` and DDS publishing
+- **DDS bridge:** Lazy init in `connect()`. Uses `RecurrentThread` to publish `LowState_` (unitree_hg) at physics timestep rate. Populates 29 motor states + IMU data.
+- **Reset:** Restores initial qpos/qvel, or maps custom `RobotState` joint positions to MuJoCo qpos via precomputed address arrays
+- **Metal viewer properties:** Exposes `mj_model`, `mj_data`, `lock` for `mujoco.viewer.launch_passive()` integration
+
+### Sensor Layout (29 actuators)
+
+```
+sensordata[0:29]     — joint positions (jointpos)
+sensordata[29:58]    — joint velocities (jointvel)
+sensordata[58:87]    — joint torques (jointactuatorfrc)
+sensordata[87:91]    — IMU quaternion wxyz (framequat)
+sensordata[91:94]    — IMU gyroscope (gyro)
+sensordata[94:97]    — IMU accelerometer (accelerometer)
+sensordata[97:100]   — frame position (framepos)
+sensordata[100:103]  — frame linear velocity (framelinvel)
+sensordata[103:113]  — secondary IMU (framequat+gyro+acc)
+```
+
+### Tests
+
+20 tests in `tests/test_sim_robot.py` — **all passing**.
+232 total tests (Phase 1–7) — **all passing**.
+
+```
+tests/test_sim_robot.py — 20 passed in 1.48s
+Full suite — 232 passed in 2.90s
+```
+
+Test categories:
+- **Init/properties** (4 tests): init, n_dof=29, mj_model exposure, lock exposure
+- **State reading** (3 tests): get_state shape, sensor mapping correctness, returns copies
+- **Simulation** (4 tests): step, substep count (4×0.005=0.02s), gravity, base position
+- **Commands** (3 tests): send_command shape, damping ctrl values, impedance control values (value-level)
+- **Reset** (2 tests): default reset, custom state reset
+- **IMU** (1 test): upright quaternion ≈ identity after reset
+- **DDS** (2 tests): connect/disconnect (mocked), publish mock verifies motor state population
+- **23-DOF** (1 test): n_dof=23, shapes (23,), step works
+
+### Value-Level Tests (Safety-Critical)
+
+Per WORK.md safety requirements:
+- `test_sim_robot_impedance_control_values`: Sets known kp, kd, q_des, dq_des, tau_ff. Verifies `ctrl[mj_i] = tau_ff + kp*(q_des - q_actual) + kd*(dq_des - dq_actual)` for all 29 joints against hand-computed values.
+- `test_sim_robot_sensor_mapping_correctness`: Verifies `get_state()` arrays exactly match raw `sensordata` slices at the expected offsets.
+- `test_sim_robot_damping_holds`: Verifies damping ctrl values match `-kd * dq_actual` formula.
+
+### Deviation from Plan: `test_sim_robot_damping_holds`
+
+The plan spec'd this test as "apply damping, verify robot doesn't collapse." In practice, `RobotCommand.damping()` has `kp=0` (velocity damping only, no position tracking), so the robot still falls under gravity — damping slows joint velocities but can't support weight. The test was changed to verify the **ctrl values** match the damping formula (`-kd * dq_actual`) instead of checking a physical outcome. This is more robust and directly tests the code rather than relying on hard-to-threshold multi-body dynamics.
+
+### Pending for Future Phases
+
+- None (all Phase 7 deliverables complete)
