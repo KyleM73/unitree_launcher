@@ -523,3 +523,64 @@ The plan spec'd this test as "apply damping, verify robot doesn't collapse." In 
 ### Pending for Future Phases
 
 - None (all Phase 7 deliverables complete)
+
+---
+
+## Pass 1, Step 9: Phase 8 — Control Loop [Shared Core]
+
+**Date:** 2026-02-11
+**Status:** COMPLETE
+
+### Task 8.1: `src/control/controller.py`
+
+`Controller` class implemented with:
+- **Control loop thread:** Background thread running at `policy_frequency` (50 Hz default) with `_sleep_until_next_tick()` timing
+- **Command building (`_build_command`):**
+  - IsaacLab: `target_pos = q_home + Ka * action`, `kp/kd` from config, `dq_target = 0`, `tau = 0`
+  - BeyondMimic: `target_pos = target_q + Ka * action`, `dq_target = target_dq`, gains from ONNX metadata (or config fallback)
+  - Non-controlled joints: `target_pos = current_pos`, `kp = 0`, `kd = kd_damp` (damping mode)
+- **Safety integration:** Every command goes through `safety.clamp_command()`. ESTOP sends damping command. Exceptions in control loop trigger ESTOP (no crash).
+- **Velocity commands:** Thread-safe via lock, `set_velocity_command()` / `get_velocity_command()`
+- **Key handling (`handle_key`):** Space (toggle start/stop), E (estop), C (clear estop), R (reset), WASD (vx/vy ±0.1, clamped), QZ (yaw ±0.1, clamped), X (zero velocity), N/P (cycle policies in `--policy-dir`)
+- **Policy reloading (`reload_policy`):** Stops loop if running, loads new ONNX, resets state. Invalid path raises error, original policy preserved.
+- **Telemetry:** Thread-safe dict with `policy_hz`, `sim_hz`, `inference_ms`, `loop_ms`, `base_height`, `base_vel`, `system_state`, `step_count`
+- **BeyondMimic end-of-trajectory:** Linear interpolation from final positions to `q_home` over 2 seconds (100 steps at 50 Hz), then STOPPED
+- **Auto-termination:** `max_steps` and `max_duration` for headless evaluation
+- **1 Hz stdout status:** `[controller] state=RUNNING step=150 policy_hz=49.8 vel_cmd=[0.3, 0.0, 0.0]`
+
+### Gain Handling
+
+Scalar gains in config (e.g., `kp: 100.0`) are expanded to per-joint arrays via `_expand_gain()`. List gains pass through directly. This works for both IsaacLab (config gains) and BeyondMimic (metadata gains override config).
+
+### Tests
+
+30 tests in `tests/test_controller.py` — **all passing**.
+262 total tests (Phase 1–8) — **all passing**.
+
+```
+tests/test_controller.py — 30 passed in 2.92s
+Full suite — 262 passed in 5.87s
+```
+
+Test categories:
+- **Init** (3 tests): constructor, gain expansion, q_home array
+- **Command building – value-level** (4 tests): IsaacLab formula, Ka=0.3 specific values, BeyondMimic formula (target_q + Ka*action, metadata gains, target_dq), damping mode for non-controlled joints
+- **Safety integration** (2 tests): ESTOP sends damping, exception triggers ESTOP
+- **Velocity command** (3 tests): set/get, thread safety (concurrent read/write), telemetry keys
+- **Key handling** (11 tests): space toggle, estop, clear estop, reset, WASD velocity, clamping, QZ yaw, X zero, unknown key noop, N/P policy cycling
+- **Policy reload** (2 tests): reload while stopped, invalid path preserves original
+- **BeyondMimic trajectory** (1 test): interpolation alpha=0/0.5/1.0 verified against expected positions
+- **Auto-termination** (1 test): max_steps=5 stops after exactly 5 steps
+- **Lifecycle** (3 tests): start/stop, STOPPED still calls robot.step(), commands go through safety.clamp_command()
+
+### Value-Level Tests (Safety-Critical)
+
+Per WORK.md safety requirements:
+- `test_build_command_isaaclab_values`: With action=1.0, Ka=0.5, verified `target_pos = q_home + 0.5 * 1.0`, kp=100, kd=10, dq=0, tau=0
+- `test_build_command_isaaclab_specific_values`: With Ka=0.3, action=1.0, verified `target_pos = q_home + 0.3`
+- `test_build_command_beyondmimic_values`: With target_q=0.2, Ka=0.3, action=1.0, target_dq=0.5, verified `target_pos = 0.2 + 0.3 * 1.0 = 0.5`, `dq_target = 0.5`, kp=80 (metadata), kd=8 (metadata)
+- `test_build_command_damping_non_controlled`: Verified target_pos=current_pos, kp=0, kd=5.0, dq=0, tau=0
+
+### Pending for Future Phases
+
+- None (all Phase 8 deliverables complete)
