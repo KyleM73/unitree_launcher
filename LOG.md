@@ -648,3 +648,48 @@ Test categories:
 ### Pending for Future Phases
 
 - None (all Phase 10 deliverables complete)
+
+---
+
+## Pass 1, Step 11: Phase 11 — Real Robot Interface [Shared]
+
+**Date:** 2026-02-11
+**Status:** COMPLETE
+
+### Task 11.1: `src/robot/real_robot.py`
+
+`RealRobot` class implemented with:
+- **DDS initialization:** `ChannelFactoryInitialize(domain_id=0, interface)` — real robot uses domain_id=0 (not the sim default of 1)
+- **IDL types:** Uses `unitree_hg` LowCmd_/LowState_ (required for G1, 35 motor slots)
+- **Command publishing:** `send_command()` populates `motor_cmd[i]` with mode=0x01 (PMSM servo), q, dq, tau, kp, kd per controlled joint. Computes CRC32 via SDK's `CRC().Crc(msg)` before publishing.
+- **State subscription:** Callback-based subscriber on `rt/lowstate`. Stores latest `RobotState` in thread-safe buffer (Lock + copy). Maps motor_state[i].q/dq/tau_est and IMU data. `base_position`/`base_velocity` are NaN (not available from DDS).
+- **Watchdog:** Checks time since last state message in `get_state()`. If >100ms stale, triggers E-stop via safety controller.
+- **Connect timeout:** Waits up to 5s for first state message. Raises `TimeoutError` if robot is unresponsive.
+- **Safety integration:** `set_safety()` accepts a SafetyController reference for watchdog E-stop. Orientation check logged on connect.
+- **step():** No-op (physics runs on real hardware)
+- **reset():** Logs warning (cannot reset physical robot)
+
+### DDS Motor Index Mapping
+
+Per SPEC §2.2: config joint order IS the DDS motor order. Motor index `i` in `LowCmd_`/`LowState_` corresponds to `G1_29DOF_JOINTS[i]` (or `G1_23DOF_JOINTS[i]` for 23-DOF). The 35-slot IDL array has slots 29-34 unused for 29-DOF mode.
+
+### Tests
+
+20 tests in `tests/test_real_robot.py` — **all passing**.
+309 total tests (Phase 1–8 + 10 + 11) — **all passing**.
+
+```
+tests/test_real_robot.py — 20 passed in 0.18s
+Full suite — 309 passed in 6.34s
+```
+
+Test categories:
+- **Lifecycle** (6 tests): init without DDS, step no-op, reset warns, reset with state warns, n_dof=29, n_dof=23
+- **Command construction** (4 tests): motor mode 0x01, field mapping (q/dq/tau/kp/kd verified per joint), CRC computed and set, no-op without connect
+- **State subscription** (5 tests): known LowState_ maps to correct RobotState, thread safety (concurrent callback + get_state), NaN base pos/vel, zero state before connect, returns independent copies
+- **Watchdog** (3 tests): stale state triggers E-stop, fresh state no false trigger, connect timeout (TimeoutError)
+- **Configuration** (2 tests): domain_id=0 verified, topic names rt/lowstate and rt/lowcmd verified
+
+### Pending for Future Phases
+
+- None (all shared modules now complete — Pass 1 finished)
