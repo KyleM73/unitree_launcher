@@ -584,3 +584,67 @@ Per WORK.md safety requirements:
 ### Pending for Future Phases
 
 - None (all Phase 8 deliverables complete)
+
+---
+
+## Pass 1, Step 10: Phase 10 — Logging System [Shared]
+
+**Date:** 2026-02-11
+**Status:** COMPLETE
+
+### Task 10.1: `src/logging/logger.py`
+
+`DataLogger` class implemented with:
+- **Dual format support:** HDF5 (gzip-compressed, chunked, resizable datasets) and NPZ (`np.savez_compressed`)
+- **Buffered writes:** Accumulates 100 steps in memory before flushing to disk
+- **18 dataset keys:** timestamps, joint_pos, joint_vel, joint_torques, imu_quat, imu_gyro, imu_accel, base_pos, base_vel, observations, actions, cmd_pos, cmd_kp, cmd_kd, system_state, vel_cmd, inference_ms, loop_ms
+- **Events:** `log_event()` stores discrete events (start, stop, estop) with timestamps to `events.json`
+- **Metadata:** Full config snapshot written to `metadata.yaml` at start
+- **Thread safety:** Lock-protected buffer access for concurrent control loop logging
+- **Summary:** `stop()` prints step count, duration, event count, format
+- **`_state_to_int()`:** Converts `SystemState` enum to int for storage (IDLE=0, RUNNING=1, STOPPED=2, ESTOP=3)
+
+### Task 10.2: `src/logging/replay.py` and `scripts/replay_log.py`
+
+`LogReplay` class implemented with:
+- **Auto-detect format:** Checks for `data.hdf5` first, then `data.npz`
+- **`get_state_at(step)`:** Reconstructs `RobotState` from logged arrays at given step index
+- **`get_observation_at(step)`/`get_action_at(step)`:** Return observation/action vectors (copies, not views)
+- **`to_csv(output_path)`:** Exports all data to CSV with named columns (joint_pos_0..N, imu_qw/qx/qy/qz, etc.)
+- **`summary()`:** Human-readable summary: step count, duration, DOFs, inference/loop timing stats
+- **Properties:** `metadata`, `duration`, `n_steps`, `format`
+- **Bounds checking:** IndexError for out-of-range step indices
+
+`scripts/replay_log.py`:
+- Standalone CLI script with `--format csv|summary` and `--output` options
+- Uses `sys.path.insert` so it works without package install
+
+### Tests
+
+27 tests in `tests/test_logger.py` — **all passing**.
+289 total tests (Phase 1–8 + 10) — **all passing**.
+
+```
+tests/test_logger.py — 27 passed in 7.26s
+Full suite — 289 passed in 5.98s
+```
+
+Test categories:
+- **Directory creation** (2 tests): basic and nested directory creation
+- **Metadata** (2 tests): metadata.yaml written with correct content, config snapshot
+- **HDF5** (3 tests): 18 dataset shapes verified for 100 steps, gzip compression confirmed, roundtrip values at step 10
+- **NPZ** (2 tests): dataset shapes verified for 100 steps, roundtrip values
+- **Events** (2 tests): multiple events with timestamps, single event log_event()
+- **Misc** (3 tests): stop prints summary, empty run handles gracefully, nonblocking performance (<10ms/step)
+- **State mapping** (1 test): SystemState enum to int conversion
+- **Replay load** (2 tests): successful load, missing data raises FileNotFoundError
+- **Replay metadata** (1 test): metadata accessible after load
+- **Replay state** (2 tests): get_state_at values verified, bounds checking (IndexError)
+- **Replay observation/action** (2 tests): get_observation_at and get_action_at shapes and values
+- **Replay CSV** (1 test): correct row count (header + data), column names
+- **Replay summary** (1 test): contains run name, step count, DOFs, format
+- **Auto-detect** (3 tests): HDF5 format detection, NPZ format detection, NPZ roundtrip
+
+### Pending for Future Phases
+
+- None (all Phase 10 deliverables complete)
