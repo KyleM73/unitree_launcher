@@ -756,3 +756,15 @@ def merge_configs(base: Config, override: Config) -> Config:
             if override_val is not None:
                 setattr(base_section, f.name, override_val)
     return result
+
+
+def apply_cli_overrides(config: Config, args) -> None:
+    """Apply CLI argument overrides to a loaded Config (in-place).
+
+    Supported overrides:
+        --robot   -> config.robot.variant
+    """
+    robot_variant = getattr(args, "robot", None)
+    if robot_variant is not None:
+        config.robot.variant = robot_variant
+        _validate_config(config)

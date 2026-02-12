@@ -743,3 +743,68 @@ Test categories:
 ### Pending for Future Phases
 
 - Phase 12: Full CLI with argparse, entry points, shell scripts (`src/main.py` will be extended)
+
+---
+
+## Pass 2, Step 13: Phase 12 — CLI Entry Point [Metal-specific]
+
+**Date:** 2026-02-11
+**Status:** COMPLETE
+
+### Task 12.1: `src/main.py` — `main()` CLI Entry Point
+
+Extended `src/main.py` (from Phase 9) with full CLI:
+
+- `build_parser()` — exposed for testing, returns argparse parser
+- `_add_common_args()` — shared args between `sim` and `real` sub-commands
+- `main(argv=None)` — full wiring: config loading, CLI overrides, robot/policy/safety/logger creation, connect, run, cleanup
+
+**Sub-commands:**
+- `sim` — simulation mode with `--headless`, `--duration`, `--steps`
+- `real` — real robot mode with `--interface` (required)
+
+**Common arguments:** `--config`, `--policy` (required), `--policy-dir`, `--robot`, `--domain-id`, `--log-dir`, `--no-log`, `--no-est`
+
+**Component wiring logic:**
+- Robot variant → joint list selection (29-DOF or 23-DOF)
+- Policy format auto-detection via `detect_policy_format()` when `config.policy.format` is None
+- IsaacLab path: ObservationBuilder → IsaacLabPolicy (obs_dim from builder)
+- BeyondMimic path: BeyondMimicPolicy (obs_dim=160, metadata from ONNX)
+- `--no-est` overrides `config.policy.use_estimator` to False
+- Domain ID defaults: sim=1, real=0 (explicit `--domain-id` overrides both)
+- `--no-log` skips logger creation entirely
+- `finally` block ensures `robot.disconnect()` and `logger.stop()` on any exit
+
+### Task 12.1b: `apply_cli_overrides()` in `src/config.py`
+
+Added `apply_cli_overrides(config, args)` — applies `--robot` variant override with validation.
+
+### Task 12.2: Shell Scripts
+
+Created 3 shell scripts (all executable):
+- `scripts/run_sim.sh` — `python -m src.main sim --config configs/default.yaml "$@"`
+- `scripts/run_real.sh` — `python -m src.main real --config configs/default.yaml "$@"`
+- `scripts/run_eval.sh` — `python -m src.main sim --headless --config configs/default.yaml "$@"`
+
+### Tests
+
+33 tests in `tests/test_main.py` — **all passing**.
+367 total tests (Phase 1–8 + 9 + 10 + 11 + 12) — **all passing**.
+
+```
+tests/test_main.py — 33 passed in 0.25s
+Full suite — 367 passed in 7.37s
+```
+
+Test categories:
+- **Sim argument parsing** (5 tests): basic, headless+duration+steps, defaults, missing policy, missing mode
+- **Real argument parsing** (2 tests): basic with interface, missing interface
+- **Flag parsing** (6 tests): --no-est, --no-log, --domain-id, --robot, --policy-dir, defaults
+- **apply_cli_overrides** (3 tests): robot override, no-override preserves default, invalid variant raises
+- **Config integration** (4 tests): sim domain_id=1, real domain_id=0, explicit override, interface setting
+- **Component wiring** (6 tests): variant→joints resolution, format auto-detection, --no-est override, use_estimator from config, default true
+- **main() integration** (7 tests): sim headless wiring (mocked), sim viewer wiring (mocked), real mode wiring (domain_id=0, interface), logger lifecycle, --no-log skips logger, policy not found, --policy-dir forwarded to Controller
+
+### Pending for Future Phases
+
+- Phase 13: Integration tests, manual end-to-end validation
