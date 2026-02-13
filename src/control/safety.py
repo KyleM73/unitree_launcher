@@ -12,12 +12,10 @@ import numpy as np
 
 from src.config import (
     Config,
-    ControlConfig,
     G1_23DOF_JOINTS,
     G1_29DOF_JOINTS,
     JOINT_LIMITS_23DOF,
     JOINT_LIMITS_29DOF,
-    SafetyConfig,
     TORQUE_LIMITS_23DOF,
     TORQUE_LIMITS_29DOF,
     VELOCITY_LIMITS_23DOF,
@@ -31,6 +29,12 @@ class SystemState(Enum):
     RUNNING = "running"
     STOPPED = "stopped"
     ESTOP = "estop"
+
+
+class ControlMode(Enum):
+    HOLD = "hold"            # Static PD at home pose (gantry / pre-default-policy)
+    DEFAULT = "default"      # Default policy running (IL velocity tracking, zero vel = stance)
+    ACTIVE_POLICY = "active" # Running the --policy (BM, another IL, etc.)
 
 
 class SafetyController:

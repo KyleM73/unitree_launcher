@@ -385,6 +385,42 @@ STANDBY_KD_29DOF: Dict[str, float] = {
     "right_wrist_roll": 3.0, "right_wrist_pitch": 3.0, "right_wrist_yaw": 3.0,
 }
 
+# ---------------------------------------------------------------------------
+# IsaacLab G1 Cylinder training gains (per-joint stiffness/damping).
+# Source: G1_CYLINDER_CFG from IsaacLab g1_cylinder.py
+#   stiffness = armature * (10 * 2π)²
+#   damping   = 2 * 2.0 * armature * (10 * 2π)
+# Motor types: 7520_14 (hip_pitch/yaw, waist_yaw), 7520_22 (hip_roll, knee),
+#   5020 (ankle, shoulder, elbow, wrist_roll), 4010 (wrist_pitch/yaw),
+#   2×5020 (ankle, waist_roll/pitch)
+# ---------------------------------------------------------------------------
+ISAACLAB_KP_29DOF: Dict[str, float] = {
+    "left_hip_pitch": 40.18, "left_hip_roll": 99.10, "left_hip_yaw": 40.18,
+    "left_knee": 99.10, "left_ankle_pitch": 28.50, "left_ankle_roll": 28.50,
+    "right_hip_pitch": 40.18, "right_hip_roll": 99.10, "right_hip_yaw": 40.18,
+    "right_knee": 99.10, "right_ankle_pitch": 28.50, "right_ankle_roll": 28.50,
+    "waist_yaw": 40.18, "waist_roll": 28.50, "waist_pitch": 28.50,
+    "left_shoulder_pitch": 14.25, "left_shoulder_roll": 14.25,
+    "left_shoulder_yaw": 14.25, "left_elbow": 14.25,
+    "left_wrist_roll": 14.25, "left_wrist_pitch": 16.78, "left_wrist_yaw": 16.78,
+    "right_shoulder_pitch": 14.25, "right_shoulder_roll": 14.25,
+    "right_shoulder_yaw": 14.25, "right_elbow": 14.25,
+    "right_wrist_roll": 14.25, "right_wrist_pitch": 16.78, "right_wrist_yaw": 16.78,
+}
+ISAACLAB_KD_29DOF: Dict[str, float] = {
+    "left_hip_pitch": 2.558, "left_hip_roll": 6.309, "left_hip_yaw": 2.558,
+    "left_knee": 6.309, "left_ankle_pitch": 1.814, "left_ankle_roll": 1.814,
+    "right_hip_pitch": 2.558, "right_hip_roll": 6.309, "right_hip_yaw": 2.558,
+    "right_knee": 6.309, "right_ankle_pitch": 1.814, "right_ankle_roll": 1.814,
+    "waist_yaw": 2.558, "waist_roll": 1.814, "waist_pitch": 1.814,
+    "left_shoulder_pitch": 0.907, "left_shoulder_roll": 0.907,
+    "left_shoulder_yaw": 0.907, "left_elbow": 0.907,
+    "left_wrist_roll": 0.907, "left_wrist_pitch": 1.068, "left_wrist_yaw": 1.068,
+    "right_shoulder_pitch": 0.907, "right_shoulder_roll": 0.907,
+    "right_shoulder_yaw": 0.907, "right_elbow": 0.907,
+    "right_wrist_roll": 0.907, "right_wrist_pitch": 1.068, "right_wrist_yaw": 1.068,
+}
+
 # Torque limits: config-name -> max torque in Nm (SPEC 2.2)
 # ---------------------------------------------------------------------------
 TORQUE_LIMITS_29DOF: Dict[str, float] = {
@@ -632,6 +668,8 @@ class RobotConfig:
 
 @dataclass
 class PolicyConfig:
+    default_policy: Optional[str] = None  # stance/velocity tracking policy path
+    default_ka: Union[float, List[float]] = 0.3  # action scale for default policy
     format: Optional[str] = None  # "isaaclab", "beyondmimic", or None (auto-detect)
     observed_joints: Optional[List[str]] = None
     controlled_joints: Optional[List[str]] = None

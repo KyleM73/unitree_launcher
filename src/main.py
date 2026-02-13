@@ -1,9 +1,9 @@
-"""Unitree G1 Deployment Stack — Main Entry Point (Metal / native macOS).
+"""Unitree G1 Deployment Stack -- Main Entry Point (Metal / native macOS).
 
 Provides:
-    run_with_viewer() — interactive MuJoCo passive viewer with GLFW key callbacks
-    run_headless()    — headless simulation for server/batch evaluation
-    main()            — CLI entry point with argparse
+    run_with_viewer() -- interactive MuJoCo passive viewer with GLFW key callbacks
+    run_headless()    -- headless simulation for server/batch evaluation
+    main()            -- CLI entry point with argparse
 """
 from __future__ import annotations
 
@@ -21,14 +21,14 @@ from typing import Optional
 import mujoco.viewer
 
 from src.config import (
-    Config,
     G1_29DOF_JOINTS,
     G1_23DOF_JOINTS,
+    ISAACLAB_G1_29DOF_JOINTS,
     apply_cli_overrides,
     load_config,
 )
 from src.control.controller import Controller
-from src.control.safety import SafetyController
+from src.control.safety import SafetyController, SystemState
 from src.logging.logger import DataLogger
 from src.policy.base import PolicyInterface, detect_policy_format
 from src.policy.beyondmimic_policy import BeyondMimicPolicy
@@ -43,33 +43,33 @@ from src.robot.sim_robot import SimRobot
 # d=geom, e=frame, r=reflect, c=contact, n=overlay, x=connect, z=perturb).
 # See: https://www.glfw.org/docs/latest/group__keys.html
 GLFW_KEY_MAP = {
-    32: "space",        # GLFW_KEY_SPACE  — start / stop
-    265: "up",          # GLFW_KEY_UP     — vx +
-    264: "down",        # GLFW_KEY_DOWN   — vx -
-    263: "left",        # GLFW_KEY_LEFT   — vy +
-    262: "right",       # GLFW_KEY_RIGHT  — vy -
-    44: "comma",        # GLFW_KEY_COMMA  — yaw +
-    46: "period",       # GLFW_KEY_PERIOD — yaw -
-    47: "slash",        # GLFW_KEY_SLASH  — zero velocity
-    259: "backspace",   # GLFW_KEY_BACKSPACE — e-stop
-    257: "enter",       # GLFW_KEY_ENTER  — clear e-stop
-    45: "minus",        # GLFW_KEY_MINUS  — prev policy
-    61: "equal",        # GLFW_KEY_EQUAL  — next policy
-    261: "delete",       # GLFW_KEY_DELETE (Fn+Backspace on Mac) — reset
+    32: "space",        # GLFW_KEY_SPACE  -- start / stop
+    265: "up",          # GLFW_KEY_UP     -- vx +
+    264: "down",        # GLFW_KEY_DOWN   -- vx -
+    263: "left",        # GLFW_KEY_LEFT   -- vy +
+    262: "right",       # GLFW_KEY_RIGHT  -- vy -
+    44: "comma",        # GLFW_KEY_COMMA  -- yaw +
+    46: "period",       # GLFW_KEY_PERIOD -- yaw -
+    47: "slash",        # GLFW_KEY_SLASH  -- zero velocity
+    259: "backspace",   # GLFW_KEY_BACKSPACE -- e-stop
+    257: "enter",       # GLFW_KEY_ENTER  -- clear e-stop
+    45: "minus",        # GLFW_KEY_MINUS  -- prev policy
+    61: "equal",        # GLFW_KEY_EQUAL  -- next policy
+    261: "delete",       # GLFW_KEY_DELETE (Fn+Backspace on Mac) -- reset
 }
 
 
 # ============================================================================
-# Viewer / Headless Runners (from Phase 9)
+# Viewer / Headless Runners
 # ============================================================================
 
 def run_with_viewer(sim_robot: SimRobot, controller: Controller) -> None:
     """Run simulation with interactive MuJoCo viewer.
 
     Threading model:
-        Main thread   — viewer.sync() + drain key queue (this function)
-        Control thread — get_state / send_command / mj_step (controller)
-        Viewer thread  — GLFW rendering + event loop (MuJoCo internal)
+        Main thread   -- viewer.sync() + drain key queue (this function)
+        Control thread -- get_state / send_command / mj_step (controller)
+        Viewer thread  -- GLFW rendering + event loop (MuJoCo internal)
 
     The key callback fires on MuJoCo's viewer thread.  To avoid
     cross-thread deadlocks with sim_robot.lock, the callback only
@@ -91,7 +91,7 @@ def run_with_viewer(sim_robot: SimRobot, controller: Controller) -> None:
         controller.start()
         try:
             while viewer.is_running():
-                # Drain key events (no lock held — safe to call handle_key).
+                # Drain key events (no lock held -- safe to call handle_key).
                 while not key_queue.empty():
                     controller.handle_key(key_queue.get_nowait())
 
@@ -116,7 +116,7 @@ def run_headless(
         1. Ctrl+C (KeyboardInterrupt)
         2. *duration* seconds elapsed
         3. *max_steps* policy steps completed
-        4. BeyondMimic trajectory ends (controller auto-stops)
+        4. BeyondMimic trajectory ends (controller auto-stops -> STOPPED)
 
     Args:
         duration: Auto-terminate after this many seconds (None = no limit).
@@ -139,7 +139,12 @@ def run_headless(
                 break
 
             if not controller.is_running:
-                print("[headless] Controller stopped (trajectory end or error).")
+                print("[headless] Controller stopped (max_steps/duration or error).")
+                break
+
+            # BM trajectory auto-completes: safety transitions to STOPPED
+            if controller.safety.state == SystemState.STOPPED:
+                print("[headless] Active policy completed. Returning to stance.")
                 break
 
     except KeyboardInterrupt:
@@ -149,7 +154,7 @@ def run_headless(
 
 
 # ============================================================================
-# CLI (Phase 12)
+# CLI
 # ============================================================================
 
 def _add_common_args(parser: argparse.ArgumentParser) -> None:
@@ -158,6 +163,8 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
                         help="Path to YAML configuration file")
     parser.add_argument("--policy", required=True,
                         help="Path to ONNX policy file")
+    parser.add_argument("--default-policy", default=None,
+                        help="Override default stance/velocity-tracking policy")
     parser.add_argument("--policy-dir", default=None,
                         help="Directory of ONNX files for N/P key cycling")
     parser.add_argument("--robot", default=None,
@@ -228,8 +235,80 @@ def main(argv: Optional[list] = None) -> None:
     else:
         robot = RealRobot(config)
 
-    # ---- Policy format & joint ordering ----
     robot_joints = G1_29DOF_JOINTS if "29" in variant else G1_23DOF_JOINTS
+
+    # ---- Default policy (IL velocity tracking for stance) ----
+    default_policy_path = args.default_policy or config.policy.default_policy
+    default_policy = None
+    default_obs_builder = None
+    default_joint_mapper = None
+
+    if default_policy_path and Path(default_policy_path).exists():
+        try:
+            import onnxruntime as _ort
+            _sess = _ort.InferenceSession(
+                default_policy_path, providers=["CPUExecutionProvider"]
+            )
+            model_obs_dim = _sess.get_inputs()[0].shape[1]
+            n_actions = _sess.get_outputs()[0].shape[1]
+            del _sess
+
+            use_estimator = config.policy.use_estimator
+            if args.no_est:
+                use_estimator = False
+
+            # Derive the joint subset from ONNX output size.  IsaacLab
+            # locomotion policies use the first N joints of the canonical
+            # IsaacLab ordering (typically 23 = 29 minus 6 wrist joints).
+            il_joints = [
+                j.replace("_joint", "")
+                for j in ISAACLAB_G1_29DOF_JOINTS[:n_actions]
+            ]
+            default_joint_mapper = JointMapper(
+                robot_joints=robot_joints,
+                observed_joints=il_joints,
+                controlled_joints=il_joints,
+            )
+
+            # Pick the estimator setting that matches the model's obs_dim.
+            matched = False
+            for use_est in [use_estimator, not use_estimator]:
+                default_obs_builder = ObservationBuilder(
+                    default_joint_mapper, config, use_estimator=use_est
+                )
+                if default_obs_builder.observation_dim == model_obs_dim:
+                    matched = True
+                    break
+
+            if not matched:
+                raise ValueError(
+                    f"Cannot match default policy obs_dim={model_obs_dim} "
+                    f"(n_actions={n_actions}) with ObservationBuilder"
+                )
+
+            default_policy = IsaacLabPolicy(
+                default_joint_mapper, model_obs_dim
+            )
+            default_policy.load(default_policy_path)
+            print(
+                f"[main] Default policy loaded: {default_policy_path} "
+                f"(obs_dim={model_obs_dim})"
+            )
+        except Exception as exc:
+            print(
+                f"[main] WARNING: Could not load default policy: {exc}. "
+                f"Using static hold mode."
+            )
+            default_policy = None
+            default_obs_builder = None
+            default_joint_mapper = None
+    elif default_policy_path:
+        print(
+            f"[main] WARNING: Default policy not found: {default_policy_path}. "
+            f"Using static hold mode."
+        )
+
+    # ---- Active policy format & joint ordering ----
     policy_format = config.policy.format or detect_policy_format(args.policy)
 
     observed_joints = config.policy.observed_joints
@@ -247,55 +326,55 @@ def main(argv: Optional[list] = None) -> None:
             controlled_joints = policy_joints
             observed_joints = policy_joints
 
-    joint_mapper = JointMapper(
+    active_joint_mapper = JointMapper(
         robot_joints=robot_joints,
         observed_joints=observed_joints,
         controlled_joints=controlled_joints,
     )
 
-    # ---- Policy ----
+    # ---- Active policy ----
     if policy_format == "isaaclab":
         use_estimator = config.policy.use_estimator
         if args.no_est:
             use_estimator = False
-        obs_builder = ObservationBuilder(
-            joint_mapper, config, use_estimator=use_estimator
+        active_obs_builder = ObservationBuilder(
+            active_joint_mapper, config, use_estimator=use_estimator
         )
-        policy: PolicyInterface = IsaacLabPolicy(
-            joint_mapper, obs_builder.observation_dim
+        active_policy: PolicyInterface = IsaacLabPolicy(
+            active_joint_mapper, active_obs_builder.observation_dim
         )
     else:
         # BeyondMimic builds its own observations internally.
-        obs_builder = None
-        policy = BeyondMimicPolicy(
-            joint_mapper,
+        active_obs_builder = None
+        active_policy = BeyondMimicPolicy(
+            active_joint_mapper,
             obs_dim=160,  # standard BeyondMimic observation size
             use_onnx_metadata=config.policy.use_onnx_metadata,
         )
 
-    policy.load(args.policy)
+    active_policy.load(args.policy)
 
     # Match simulation parameters to the training environment.
-    if isinstance(policy, BeyondMimicPolicy) and hasattr(robot, 'set_home_positions'):
+    if isinstance(active_policy, BeyondMimicPolicy) and hasattr(robot, 'set_home_positions'):
         # 1. Set initial robot pose to policy's default joint positions.
-        default_native = joint_mapper.action_to_robot(policy.default_joint_pos)
+        default_native = active_joint_mapper.action_to_robot(
+            active_policy.default_joint_pos
+        )
         robot.set_home_positions(default_native)
 
         # 2. Set per-joint armature to match training sim.
-        #    Training uses: armature = stiffness / (natural_freq)^2
-        #    where natural_freq = 10 * 2π rad/s (from g1.py reference).
-        if policy.stiffness is not None:
+        if active_policy.stiffness is not None:
             import numpy as _np
             _natural_freq = 10.0 * 2.0 * _np.pi
-            armature_policy = policy.stiffness / (_natural_freq ** 2)
-            armature_native = joint_mapper.action_to_robot(armature_policy)
+            armature_policy = active_policy.stiffness / (_natural_freq ** 2)
+            armature_native = active_joint_mapper.action_to_robot(armature_policy)
             robot.set_armature(armature_native)
 
     # Validate obs_dim match (IsaacLab only).
-    if obs_builder is not None:
-        assert policy.observation_dim == obs_builder.observation_dim, (
-            f"Policy obs_dim={policy.observation_dim} != "
-            f"builder obs_dim={obs_builder.observation_dim}"
+    if active_obs_builder is not None:
+        assert active_policy.observation_dim == active_obs_builder.observation_dim, (
+            f"Policy obs_dim={active_policy.observation_dim} != "
+            f"builder obs_dim={active_obs_builder.observation_dim}"
         )
 
     # ---- Safety ----
@@ -311,13 +390,16 @@ def main(argv: Optional[list] = None) -> None:
     # ---- Controller ----
     controller = Controller(
         robot=robot,
-        policy=policy,
+        policy=active_policy,
         safety=safety,
-        joint_mapper=joint_mapper,
-        obs_builder=obs_builder,
+        joint_mapper=active_joint_mapper,
+        obs_builder=active_obs_builder,
         config=config,
         logger=logger,
         policy_dir=args.policy_dir,
+        default_policy=default_policy,
+        default_obs_builder=default_obs_builder,
+        default_joint_mapper=default_joint_mapper,
     )
 
     # ---- Connect & run ----

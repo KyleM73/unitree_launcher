@@ -581,12 +581,12 @@ class TestPolicyReload:
 
 
 # ============================================================================
-# BeyondMimic trajectory
+# BeyondMimic trajectory end -> auto-return to default/hold
 # ============================================================================
 
 class TestBeyondMimicTrajectory:
-    def test_beyondmimic_end_of_trajectory(self):
-        """When interpolation is triggered, verify interpolation to q_home."""
+    def test_beyondmimic_trajectory_end_triggers_stop(self):
+        """When BM trajectory ends, safety transitions to STOPPED."""
         config = _make_config()
         mapper = JointMapper(G1_29DOF_JOINTS)
         safety = SafetyController(config, n_dof=29)
@@ -595,11 +595,18 @@ class TestBeyondMimicTrajectory:
         from src.policy.beyondmimic_policy import BeyondMimicPolicy
         bm_policy = MagicMock(spec=BeyondMimicPolicy)
         bm_policy.__class__ = BeyondMimicPolicy
+        bm_policy.default_joint_pos = np.full(29, 0.2)
         bm_policy.target_q = np.full(29, 0.3)
         bm_policy.target_dq = np.zeros(29)
         bm_policy.stiffness = None
         bm_policy.damping = None
         bm_policy.action_scale = None
+        bm_policy.anchor_body_name = ""
+        bm_policy.trajectory_length = 5  # Very short trajectory
+        bm_policy.get_action.return_value = np.zeros(29)
+        bm_policy.build_observation.return_value = np.zeros(160)
+        bm_policy.observation_dim = 160
+        bm_policy.action_dim = 29
 
         ctrl = Controller(
             robot=robot,
@@ -610,34 +617,18 @@ class TestBeyondMimicTrajectory:
             config=config,
         )
 
-        # Manually trigger interpolation
-        ctrl._interpolating = True
-        ctrl._interp_start_pos = np.full(29, 0.3)
-        ctrl._interp_step = 0
+        # Start the controller and policy
+        ctrl.start()
+        safety.start()
 
-        state = robot.get_state()
+        # Wait for trajectory to complete (5 steps at 50Hz = 0.1s, plus margin)
+        import time
+        time.sleep(1.0)
 
-        # Step 0: alpha=0, should be start_pos
-        cmd0 = ctrl._build_interpolation_command(state)
-        ctrl_idx = mapper.controlled_indices
-        np.testing.assert_array_almost_equal(
-            cmd0.joint_positions[ctrl_idx], np.full(29, 0.3)
-        )
+        # After trajectory ends, safety should be STOPPED
+        assert safety.state == SystemState.STOPPED
 
-        # Middle step: alpha=0.5
-        ctrl._interp_step = ctrl._interp_total_steps // 2
-        cmd_mid = ctrl._build_interpolation_command(state)
-        expected_mid = 0.5 * np.full(29, 0.3) + 0.5 * ctrl._q_home
-        np.testing.assert_array_almost_equal(
-            cmd_mid.joint_positions[ctrl_idx], expected_mid, decimal=5
-        )
-
-        # Final step: alpha=1.0
-        ctrl._interp_step = ctrl._interp_total_steps
-        cmd_end = ctrl._build_interpolation_command(state)
-        np.testing.assert_array_almost_equal(
-            cmd_end.joint_positions[ctrl_idx], ctrl._q_home
-        )
+        ctrl.stop()
 
 
 # ============================================================================

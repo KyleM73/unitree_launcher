@@ -832,6 +832,11 @@ if format == "beyondmimic":
 
 ```yaml
 policy:
+  # Default stance policy (IsaacLab velocity tracking, zero vel = balanced stance).
+  # Loaded automatically at boot; runs in IDLE/STOPPED states.
+  default_policy: "assets/policies/stance_29dof.onnx"
+  default_ka: 0.3  # Action scale for default policy (scalar or per-joint list)
+
   # Policy format: "isaaclab" or "beyondmimic" (auto-detected if omitted)
   format: null  # Auto-detect from ONNX structure
 
@@ -843,6 +848,10 @@ policy:
   # but can be overridden if needed
   use_onnx_metadata: true  # Use embedded joint names, gains, etc.
 ```
+
+The default policy uses per-joint IsaacLab training gains (`ISAACLAB_KP_29DOF` /
+`ISAACLAB_KD_29DOF` in `config.py`) derived from the G1 Cylinder actuator model,
+not the flat `kp`/`kd` from the `control:` section.
 
 ### 4.6 Joint Remapping, Observation, and Subset Control
 
@@ -1424,7 +1433,11 @@ Where:
 
 ### 7.3 State Machine
 
+**SystemState** governs safety transitions. **ControlMode** governs what
+runs in the control loop.
+
 ```
+SystemState:
         ┌─────────┐
         │  IDLE   │◄──────────────────┐
         └────┬────┘                   │
@@ -1438,6 +1451,23 @@ Where:
         ┌─────────┐                   │
         │ STOPPED │───────────────────┘
         └─────────┘
+
+ControlMode (layered on SystemState):
+  HOLD           Static PD at home pose (fallback when no default policy)
+  DEFAULT        Default policy with zero velocity (balanced stance)
+  ACTIVE_POLICY  Running the --policy (BM, IL, etc.)
+
+State × Mode behavior:
+  IDLE/STOPPED + DEFAULT  → default policy runs with zero velocity
+  IDLE/STOPPED + HOLD     → static PD at home (standby gains)
+  RUNNING + ACTIVE_POLICY → --policy executes
+  ESTOP                   → damping mode (unchanged)
+
+Transitions:
+  Boot → DEFAULT auto-starts (zero vel = stance)
+  Space → RUNNING + ACTIVE_POLICY
+  BM trajectory end → STOPPED + DEFAULT (auto-return to stance)
+  Space again → STOPPED + DEFAULT
 ```
 
 ### 7.4 Applicability
@@ -1748,7 +1778,8 @@ python -m src.main sim --policy policies/walk.onnx --headless --steps 1000
 | Argument | Type | Default | Description |
 |----------|------|---------|-------------|
 | `--config` | path | `configs/default.yaml` | Configuration file |
-| `--policy` | path | required | ONNX policy file |
+| `--policy` | path | required | ONNX policy file (the active policy) |
+| `--default-policy` | path | from config | Override default stance/velocity-tracking policy |
 | `--robot` | str | `g1_29dof` | Robot variant (`g1_29dof`, `g1_23dof`) |
 | `--interface` | str | `auto` (sim) | Network interface (real robot: `eth0`/`en0`) |
 | `--domain-id` | int | 1 (sim), 0 (real) | DDS domain ID |
@@ -1783,6 +1814,11 @@ robot:
   idl_mode: 0                # 0 = semantic names, 1 = actuator names
 
 policy:
+  # Default stance policy: IsaacLab velocity tracking ONNX (zero vel = balanced stance).
+  # Runs in IDLE/STOPPED states. Uses ISAACLAB_KP/KD_29DOF training gains.
+  default_policy: "assets/policies/stance_29dof.onnx"
+  default_ka: 0.3  # Action scale for default policy
+
   # Whether the policy expects base_lin_vel in observations.
   # Set to false when no state estimator is available (omits base_lin_vel, reduces obs_dim by 3).
   # Can be overridden by --no-est CLI flag.
@@ -1796,17 +1832,6 @@ policy:
   # Joints controlled by the policy (receiving actions), in policy-expected ORDER.
   # If omitted or null, all joints are controlled in robot-native order.
   controlled_joints: null
-
-  # Example: Full observe, legs control (common for locomotion)
-  # observed_joints: [all 29 joints in IsaacLab order]
-  # controlled_joints: [12 leg joints only]
-
-  # Example: Isolated arm control (arm doesn't need leg info)
-  # observed_joints: null  # defaults to controlled_joints
-  # controlled_joints:
-  #   - R_SHOULDER_PITCH
-  #   - R_SHOULDER_ROLL
-  #   - ... (7 arm joints)
 
 control:
   policy_frequency: 50       # Hz

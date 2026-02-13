@@ -3,6 +3,8 @@ robot:
   idl_mode: 0
 
 policy:
+  default_policy: "assets/policies/stance_29dof.onnx"
+  default_ka: 0.3
   observed_joints: null
   controlled_joints: null
   use_onnx_metadata: true

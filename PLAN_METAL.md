@@ -1113,6 +1113,11 @@ class SystemState(Enum):
     STOPPED = "stopped"
     ESTOP = "estop"
 
+class ControlMode(Enum):
+    HOLD = "hold"            # Static PD at home pose (fallback)
+    DEFAULT = "default"      # Default policy running (IL velocity tracking, zero vel = stance)
+    ACTIVE_POLICY = "active" # Running the --policy (BM, another IL, etc.)
+
 class SafetyController:
     def __init__(self, config: ControlConfig, n_dof: int): ...
 
@@ -1475,11 +1480,18 @@ class Controller:
     def __init__(self, robot: RobotInterface, policy: PolicyInterface,
                  safety: SafetyController, joint_mapper: JointMapper,
                  obs_builder: Optional[ObservationBuilder], config: Config,
-                 logger: Optional['DataLogger'] = None):
+                 logger: Optional['DataLogger'] = None,
+                 policy_dir: Optional[str] = None,
+                 max_steps: int = 0, max_duration: float = 0.0,
+                 default_policy: Optional[PolicyInterface] = None,
+                 default_obs_builder: Optional[ObservationBuilder] = None,
+                 default_joint_mapper: Optional[JointMapper] = None):
         """
-        Args:
-            obs_builder: None for BeyondMimic (policy builds its own observations)
-            logger: Optional data logger. If None, no logging occurs.
+        Dual-policy mode: default_policy (IsaacLab stance) runs in
+        IDLE/STOPPED; policy (the active --policy) runs in RUNNING.
+        If default_policy is None, IDLE/STOPPED uses static PD hold.
+        Default policy uses ISAACLAB_KP/KD_29DOF training gains and
+        config.policy.default_ka action scale.
         """
         ...
 
@@ -1560,7 +1572,7 @@ class Controller:
 | Yaw rate | [-1.0, 1.0] rad/s | 0.1 | , / . |
 | Zero all | — | — | / |
 
-**Control loop pseudocode:**
+**Control loop pseudocode (dual-policy mode):**
 
 ```python
 def _control_loop(self):
@@ -1569,7 +1581,7 @@ def _control_loop(self):
     while self._running:
         loop_start = time.perf_counter()
 
-        # 1. Check E-stop
+        # 1. E-stop: damping mode
         if self.safety.state == SystemState.ESTOP:
             state = self.robot.get_state()
             cmd = self.safety.get_damping_command(state)
@@ -1578,53 +1590,44 @@ def _control_loop(self):
             self._sleep_until_next_tick(loop_start)
             continue
 
-        # 2. Skip if not RUNNING
+        # 2. IDLE/STOPPED: run default policy (stance) or static hold
         if self.safety.state != SystemState.RUNNING:
-            self.robot.step()  # Keep sim advancing even when stopped
+            state = self.robot.get_state()
+            if self._default_policy:
+                obs = self._default_obs_builder.build(state, self._default_last_action, np.zeros(3))
+                action = self._default_policy.get_action(obs)
+                cmd = self._build_default_command(state, action)
+            else:
+                cmd = self._build_hold_command(state)
+            self.robot.send_command(cmd)
+            self.robot.step()
             self._sleep_until_next_tick(loop_start)
             continue
 
-        # 3. Get robot state
+        # 3. Detect IDLE/STOPPED -> RUNNING transition
+        if not self._policy_active:
+            self._policy_active = True
+            self._control_mode = ControlMode.ACTIVE_POLICY
+            self.policy.reset()
+            # ... reset counters, prefetch BM reference data
+
+        # 4. Get robot state
         state = self.robot.get_state()
 
-        # 4. Build observation and run policy inference
-        inference_start = time.perf_counter()
+        # 5. Build observation and run policy inference
         if self.obs_builder is not None:
-            # IsaacLab: external observation builder
             obs = self.obs_builder.build(state, last_action, self._velocity_command)
             action = self.policy.get_action(obs)
         else:
-            # BeyondMimic: policy builds its own observations internally
-            action = self.policy.get_action(state, time_step=self._time_step)
-        inference_time = time.perf_counter() - inference_start
+            # BeyondMimic: build obs, run ONNX, post-increment time_step
+            obs = bm.build_observation(state, anchor_pos, anchor_quat)
+            action = bm.get_action(obs, time_step=self._time_step)
+            self._time_step += 1
+            if self._time_step >= bm.trajectory_length:
+                self.safety.stop()  # -> STOPPED + DEFAULT (stance)
 
-        # 5. Build command (PD control law)
-        cmd = self._build_command(state, action)
-
-        # 6. Send command
-        self.robot.send_command(cmd)
-
-        # 7. Step simulation (no-op for real robot)
-        self.robot.step()
-
-        # 8. Store for next iteration
-        last_action = action.copy()
-        step_count += 1
-
-        # 9. Log (if logger provided)
-        if self._logger is not None:
-            self._logger.log_step(...)
-
-        # 10. Update telemetry
-        self._update_telemetry(state, inference_time, loop_start, step_count)
-
-        # 11. Check auto-termination (headless evals)
-        if self._max_steps and step_count >= self._max_steps:
-            self.stop()
-            break
-
-        # 12. Sleep to maintain frequency
-        self._sleep_until_next_tick(loop_start)
+        # 6-12. Build command, send, step, log, telemetry, auto-terminate
+        ...
 ```
 
 **Command building (`_build_command`):**
@@ -1657,10 +1660,10 @@ tau[i] = 0
 ```
 
 **BeyondMimic end-of-trajectory handling:**
-When `time_step` exceeds trajectory length:
-1. Capture final joint positions
-2. Linearly interpolate from final positions to `q_home` over 2 seconds (100 steps at 50 Hz)
-3. Enter STOPPED state after interpolation completes
+When `time_step >= trajectory_length`: call `safety.stop()` which transitions
+to STOPPED state. The default policy (IsaacLab stance) auto-resumes with zero
+velocity, providing active balancing. No interpolation needed — the transition
+is smooth because both policies share similar home poses.
 
 **Stdout output:** The controller should print periodic status lines to stdout at 1 Hz:
 ```
@@ -2130,9 +2133,11 @@ from src.logging.logger import DataLogger
 
 def add_common_args(parser):
     parser.add_argument("--config", default="configs/default.yaml")
-    parser.add_argument("--policy", required=True, help="ONNX policy file")
-    parser.add_argument("--policy-dir", default="policies/",
-                       help="Directory of ONNX files (future: runtime switching)")
+    parser.add_argument("--policy", required=True, help="ONNX active policy file")
+    parser.add_argument("--default-policy", default=None,
+                       help="Override default stance/velocity-tracking policy")
+    parser.add_argument("--policy-dir", default=None,
+                       help="Directory of ONNX files for -/= key cycling")
     parser.add_argument("--robot", default=None, help="Robot variant override")
     parser.add_argument("--domain-id", type=int, default=None)
     parser.add_argument("--log-dir", default="logs/")
