@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from src.config import (
+from unitree_launcher.config import (
     G1_29DOF_JOINTS,
     G1_23DOF_JOINTS,
     G1_29DOF_MUJOCO_JOINTS,
@@ -32,7 +32,7 @@ from src.config import (
     merge_configs,
     resolve_joint_name,
 )
-from src.robot.base import RobotCommand, RobotState
+from unitree_launcher.robot.base import RobotCommand, RobotState
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -47,6 +47,10 @@ class TestJointCounts:
 
     def test_23dof_joint_count(self):
         assert len(G1_23DOF_JOINTS) == 23
+
+    def test_29dof_names_no_joint_suffix(self):
+        for name in G1_29DOF_JOINTS:
+            assert not name.endswith("_joint"), f"{name} has unexpected _joint suffix"
 
 
 class TestHomePositionKeys:
@@ -104,6 +108,10 @@ class TestIsaacLabMapping:
 
     def test_isaaclab_joint_names_length(self):
         assert len(ISAACLAB_G1_29DOF_JOINTS) == 29
+
+    def test_isaaclab_names_have_joint_suffix(self):
+        for name in ISAACLAB_G1_29DOF_JOINTS:
+            assert name.endswith("_joint"), f"{name} missing _joint suffix"
 
 
 class TestMujocoJointNames:

@@ -12,9 +12,9 @@ from unittest.mock import MagicMock, patch, call
 import numpy as np
 import pytest
 
-from src.config import Config, load_config
-from src.robot.base import RobotCommand, RobotState
-from src.robot.real_robot import (
+from unitree_launcher.config import Config, load_config
+from unitree_launcher.robot.base import RobotCommand, RobotState
+from unitree_launcher.robot.real_robot import (
     RealRobot,
     _MOTOR_MODE_SERVO,
     _NUM_MOTOR_IDL_HG,
@@ -65,6 +65,8 @@ class MockLowState:
         self.imu_state = MockIMUState()
         self.tick = 0
         self.crc = 0
+        self.mode_machine = 0
+        self.mode_pr = 0
 
 
 class MockLowCmd:
@@ -380,8 +382,8 @@ class TestRealRobotWatchdog:
         mock_channel_sub = MagicMock()
         mock_crc = MagicMock()
 
-        with patch("src.robot.real_robot.patch_unitree_threading"), \
-             patch("src.robot.real_robot.resolve_network_interface", return_value="lo0"), \
+        with patch("unitree_launcher.robot.real_robot.patch_unitree_threading"), \
+             patch("unitree_launcher.robot.real_robot.resolve_network_interface", return_value="lo0"), \
              patch.dict("sys.modules", {
                  "unitree_sdk2py.core.channel": MagicMock(
                      ChannelFactoryInitialize=MagicMock(),
@@ -397,7 +399,7 @@ class TestRealRobotWatchdog:
                  ),
              }):
             # Monkey-patch _CONNECT_TIMEOUT_S to make test fast
-            import src.robot.real_robot as rr_mod
+            import unitree_launcher.robot.real_robot as rr_mod
             original_timeout = rr_mod._CONNECT_TIMEOUT_S
             rr_mod._CONNECT_TIMEOUT_S = 0.1  # 100ms for test speed
 
@@ -422,8 +424,8 @@ class TestRealRobotConfig:
         mock_channel_sub = MagicMock()
         mock_crc = MagicMock()
 
-        with patch("src.robot.real_robot.patch_unitree_threading"), \
-             patch("src.robot.real_robot.resolve_network_interface", return_value="eth0"), \
+        with patch("unitree_launcher.robot.real_robot.patch_unitree_threading"), \
+             patch("unitree_launcher.robot.real_robot.resolve_network_interface", return_value="eth0"), \
              patch.dict("sys.modules", {
                  "unitree_sdk2py.core.channel": MagicMock(
                      ChannelFactoryInitialize=mock_init,
@@ -458,8 +460,8 @@ class TestRealRobotConfig:
         mock_pub_cls = MagicMock()
         mock_sub_cls = MagicMock()
 
-        with patch("src.robot.real_robot.patch_unitree_threading"), \
-             patch("src.robot.real_robot.resolve_network_interface", return_value="lo0"), \
+        with patch("unitree_launcher.robot.real_robot.patch_unitree_threading"), \
+             patch("unitree_launcher.robot.real_robot.resolve_network_interface", return_value="lo0"), \
              patch.dict("sys.modules", {
                  "unitree_sdk2py.core.channel": MagicMock(
                      ChannelFactoryInitialize=MagicMock(),
@@ -483,3 +485,208 @@ class TestRealRobotConfig:
 
             sub_call_args = mock_sub_cls.call_args
             assert sub_call_args[0][0] == "rt/lowstate"
+
+
+# ---------------------------------------------------------------------------
+# Protocol fields (mode_machine, mode_pr, non-controlled slots)
+# ---------------------------------------------------------------------------
+
+class TestRealRobotProtocol:
+    def test_mode_machine_echoed(self, robot_with_cmd):
+        """mode_machine from LowState is echoed in every LowCmd."""
+        # Simulate receiving a state with mode_machine=5
+        msg = MockLowState()
+        msg.mode_machine = 5
+        robot_with_cmd._on_low_state(msg)
+
+        # Send a command
+        n = robot_with_cmd.n_dof
+        cmd = RobotCommand.damping(n)
+        robot_with_cmd.send_command(cmd)
+
+        assert robot_with_cmd._low_cmd_msg.mode_machine == 5
+
+    def test_mode_machine_updates(self, robot_with_cmd):
+        """mode_machine tracks the latest LowState value."""
+        for mm in [0, 3, 5, 7]:
+            msg = MockLowState()
+            msg.mode_machine = mm
+            robot_with_cmd._on_low_state(msg)
+
+            cmd = RobotCommand.damping(robot_with_cmd.n_dof)
+            robot_with_cmd.send_command(cmd)
+            assert robot_with_cmd._low_cmd_msg.mode_machine == mm
+
+    def test_mode_pr_zero(self, robot_with_cmd):
+        """mode_pr is always set to 0 in every LowCmd."""
+        n = robot_with_cmd.n_dof
+        cmd = RobotCommand.damping(n)
+
+        # Set mode_pr to something else to verify it gets overwritten
+        robot_with_cmd._low_cmd_msg.mode_pr = 99
+        robot_with_cmd.send_command(cmd)
+
+        assert robot_with_cmd._low_cmd_msg.mode_pr == 0
+
+    def test_non_controlled_slots_disabled(self, robot_with_cmd):
+        """Motor slots 29-34 get mode=0 and zeroed fields after send_command."""
+        n = robot_with_cmd.n_dof  # 29
+        cmd = RobotCommand(
+            joint_positions=np.ones(n),
+            joint_velocities=np.ones(n),
+            joint_torques=np.ones(n),
+            kp=np.full(n, 100.0),
+            kd=np.full(n, 10.0),
+        )
+        robot_with_cmd.send_command(cmd)
+
+        msg = robot_with_cmd._low_cmd_msg
+        for i in range(n, 35):
+            assert msg.motor_cmd[i].mode == 0, f"Slot {i} mode should be 0"
+            assert msg.motor_cmd[i].q == 0.0, f"Slot {i} q should be 0"
+            assert msg.motor_cmd[i].dq == 0.0, f"Slot {i} dq should be 0"
+            assert msg.motor_cmd[i].tau == 0.0, f"Slot {i} tau should be 0"
+            assert msg.motor_cmd[i].kp == 0.0, f"Slot {i} kp should be 0"
+            assert msg.motor_cmd[i].kd == 0.0, f"Slot {i} kd should be 0"
+
+    def test_controlled_slots_servo_mode(self, robot_with_cmd):
+        """Controlled slots 0-28 have mode=0x01 (PMSM servo)."""
+        n = robot_with_cmd.n_dof
+        cmd = RobotCommand.damping(n)
+        robot_with_cmd.send_command(cmd)
+
+        msg = robot_with_cmd._low_cmd_msg
+        for i in range(n):
+            assert msg.motor_cmd[i].mode == _MOTOR_MODE_SERVO
+
+
+# ---------------------------------------------------------------------------
+# 500 Hz publish thread
+# ---------------------------------------------------------------------------
+
+class TestRealRobotPublishThread:
+    def test_publish_noop_before_first_send(self, robot_with_cmd):
+        """_publish_cmd is a no-op before any send_command call."""
+        assert not robot_with_cmd._cmd_ready
+
+        # Call _publish_cmd directly — should not call Write
+        robot_with_cmd._publish_cmd()
+        robot_with_cmd._cmd_pub.Write.assert_not_called()
+
+    def test_publish_after_send(self, robot_with_cmd):
+        """_publish_cmd re-publishes after send_command sets _cmd_ready."""
+        n = robot_with_cmd.n_dof
+        cmd = RobotCommand.damping(n)
+        robot_with_cmd.send_command(cmd)
+
+        # send_command calls Write once
+        assert robot_with_cmd._cmd_pub.Write.call_count == 1
+
+        # _publish_cmd should call Write again
+        robot_with_cmd._publish_cmd()
+        assert robot_with_cmd._cmd_pub.Write.call_count == 2
+
+    def test_publish_cmd_uses_lock(self, robot_with_cmd):
+        """_publish_cmd acquires _cmd_lock to protect the message."""
+        n = robot_with_cmd.n_dof
+        cmd = RobotCommand.damping(n)
+        robot_with_cmd.send_command(cmd)
+
+        # If lock is already held, _publish_cmd should block.
+        # We test by acquiring the lock and verifying _publish_cmd doesn't
+        # call Write (since it can't acquire the lock in a non-blocking test).
+        lock_acquired = threading.Event()
+        publish_done = threading.Event()
+
+        def hold_lock():
+            with robot_with_cmd._cmd_lock:
+                lock_acquired.set()
+                # Hold lock for a bit
+                publish_done.wait(timeout=1.0)
+
+        t = threading.Thread(target=hold_lock)
+        t.start()
+        lock_acquired.wait()
+
+        # Reset call count
+        robot_with_cmd._cmd_pub.Write.reset_mock()
+
+        # _publish_cmd in a thread — should block on _cmd_lock
+        result = [None]
+        def try_publish():
+            robot_with_cmd._publish_cmd()
+            result[0] = "done"
+
+        t2 = threading.Thread(target=try_publish)
+        t2.start()
+        # Give it a moment — it should be blocked
+        t2.join(timeout=0.05)
+
+        # Release the lock
+        publish_done.set()
+        t.join()
+        t2.join(timeout=1.0)
+
+        # Now it should have completed
+        assert result[0] == "done"
+
+    def test_disconnect_stops_publish_thread(self, robot_with_cmd):
+        """disconnect() shuts down the publish thread."""
+        from unitree_launcher.compat import RecurrentThread
+
+        mock_thread = MagicMock(spec=RecurrentThread)
+        robot_with_cmd._publish_thread = mock_thread
+
+        robot_with_cmd.disconnect()
+
+        mock_thread.Shutdown.assert_called_once()
+        assert robot_with_cmd._publish_thread is None
+
+
+# ---------------------------------------------------------------------------
+# Graceful shutdown
+# ---------------------------------------------------------------------------
+
+class TestRealRobotGracefulShutdown:
+    def test_graceful_shutdown_sends_damping(self, robot_with_cmd):
+        """graceful_shutdown sends a damping command before disconnecting."""
+        # Keep a reference to the mock publisher before disconnect nulls it
+        pub_mock = robot_with_cmd._cmd_pub
+        robot_with_cmd.graceful_shutdown(damping_duration=0.05)
+
+        # Verify at least one Write call was made (damping command)
+        assert pub_mock.Write.call_count >= 1
+
+        # Verify robot is disconnected
+        assert not robot_with_cmd._connected
+
+    def test_graceful_shutdown_damping_fields(self, robot_with_cmd):
+        """Damping command has kp=0 and non-zero kd."""
+        robot_with_cmd.graceful_shutdown(damping_duration=0.05)
+
+        msg = robot_with_cmd._low_cmd_msg
+        for i in range(robot_with_cmd.n_dof):
+            assert msg.motor_cmd[i].kp == 0.0, f"Joint {i} kp should be 0"
+            assert msg.motor_cmd[i].kd > 0.0, f"Joint {i} kd should be > 0"
+
+    def test_graceful_shutdown_idempotent(self, robot_with_cmd):
+        """Calling graceful_shutdown twice doesn't error."""
+        robot_with_cmd.graceful_shutdown(damping_duration=0.05)
+        # Second call should be a no-op (already disconnected)
+        robot_with_cmd.graceful_shutdown(damping_duration=0.05)
+        assert not robot_with_cmd._connected
+
+    def test_graceful_shutdown_clears_cmd_ready(self, robot_with_cmd):
+        """After graceful_shutdown, _cmd_ready is False."""
+        n = robot_with_cmd.n_dof
+        cmd = RobotCommand.damping(n)
+        robot_with_cmd.send_command(cmd)
+        assert robot_with_cmd._cmd_ready
+
+        robot_with_cmd.graceful_shutdown(damping_duration=0.05)
+        assert not robot_with_cmd._cmd_ready
+
+    def test_graceful_shutdown_when_not_connected(self, robot_29dof):
+        """graceful_shutdown on unconnected robot is a no-op."""
+        assert not robot_29dof._connected
+        robot_29dof.graceful_shutdown()  # Should not raise

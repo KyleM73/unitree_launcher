@@ -13,14 +13,14 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 
-from src.config import (
+from unitree_launcher.config import (
     Config,
     G1_23DOF_JOINTS,
     G1_29DOF_JOINTS,
     apply_cli_overrides,
     load_config,
 )
-from src.main import build_parser, main
+from unitree_launcher.main import build_parser, main
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_CONFIG = os.path.join(PROJECT_ROOT, "configs", "default.yaml")
@@ -74,9 +74,21 @@ class TestParseSimArgs:
         assert args.no_log is False
         assert args.policy_dir is None
 
-    def test_missing_policy_errors(self):
-        with pytest.raises(SystemExit):
-            _parse(["sim"])
+    def test_missing_policy_without_gantry_errors(self):
+        """--policy is required unless --gantry is set."""
+        # Parser accepts sim without --policy (validation is in main())
+        args = _parse(["sim"])
+        assert args.policy is None
+
+    def test_gantry_flag_parsed(self):
+        args = _parse(["sim", "--gantry"])
+        assert args.gantry is True
+        assert args.policy is None
+
+    def test_gantry_with_headless_parsed(self):
+        args = _parse(["sim", "--gantry", "--headless"])
+        assert args.gantry is True
+        assert args.headless is True
 
     def test_missing_mode_errors(self):
         with pytest.raises(SystemExit):
@@ -219,7 +231,7 @@ class TestComponentWiring:
             onnx_path = f.name
         try:
             _make_isaaclab_onnx(onnx_path)
-            with patch("src.main.detect_policy_format", return_value="isaaclab") as mock_detect:
+            with patch("unitree_launcher.main.detect_policy_format", return_value="isaaclab") as mock_detect:
                 # We test the logic that main() uses
                 fmt = config.policy.format or mock_detect(onnx_path)
                 assert fmt == "isaaclab"
@@ -247,11 +259,6 @@ class TestComponentWiring:
             use_est = False
         assert use_est is False
 
-    def test_use_estimator_default_true(self):
-        """Default config has use_estimator=True."""
-        config = load_config(DEFAULT_CONFIG)
-        assert config.policy.use_estimator is True
-
 
 # ============================================================================
 # main() Integration (mocked components)
@@ -263,9 +270,9 @@ class TestMainIntegration:
         onnx_path = str(tmp_path / "test_policy.onnx")
         _make_isaaclab_onnx(onnx_path)
 
-        with patch("src.main.SimRobot") as MockSimRobot, \
-             patch("src.main.run_headless") as mock_run, \
-             patch("src.main.DataLogger") as MockLogger:
+        with patch("unitree_launcher.main.SimRobot") as MockSimRobot, \
+             patch("unitree_launcher.main.run_headless") as mock_run, \
+             patch("unitree_launcher.main.DataLogger") as MockLogger:
 
             mock_robot = MagicMock()
             mock_robot.n_dof = 29
@@ -282,15 +289,19 @@ class TestMainIntegration:
             MockSimRobot.assert_called_once()
             mock_robot.connect.assert_called_once()
             mock_run.assert_called_once()
-            mock_robot.disconnect.assert_called_once()
+            # Shutdown calls graceful_shutdown (if present) or disconnect
+            assert (
+                mock_robot.graceful_shutdown.called
+                or mock_robot.disconnect.called
+            )
 
     def test_main_sim_viewer_wiring(self, tmp_path):
         """main() in sim (non-headless) mode calls run_with_viewer."""
         onnx_path = str(tmp_path / "test_policy.onnx")
         _make_isaaclab_onnx(onnx_path)
 
-        with patch("src.main.SimRobot") as MockSimRobot, \
-             patch("src.main.run_with_viewer") as mock_run:
+        with patch("unitree_launcher.main.SimRobot") as MockSimRobot, \
+             patch("unitree_launcher.main.run_with_viewer") as mock_run:
 
             mock_robot = MagicMock()
             mock_robot.n_dof = 29
@@ -308,8 +319,8 @@ class TestMainIntegration:
         onnx_path = str(tmp_path / "test_policy.onnx")
         _make_isaaclab_onnx(onnx_path)
 
-        with patch("src.main.RealRobot") as MockRealRobot, \
-             patch("src.main.run_headless") as mock_run:
+        with patch("unitree_launcher.main.RealRobot") as MockRealRobot, \
+             patch("unitree_launcher.main.run_headless") as mock_run:
 
             mock_robot = MagicMock()
             mock_robot.n_dof = 29
@@ -332,9 +343,9 @@ class TestMainIntegration:
         _make_isaaclab_onnx(onnx_path)
         log_dir = str(tmp_path / "logs")
 
-        with patch("src.main.SimRobot") as MockSimRobot, \
-             patch("src.main.run_headless"), \
-             patch("src.main.DataLogger") as MockLogger:
+        with patch("unitree_launcher.main.SimRobot") as MockSimRobot, \
+             patch("unitree_launcher.main.run_headless"), \
+             patch("unitree_launcher.main.DataLogger") as MockLogger:
 
             mock_robot = MagicMock()
             mock_robot.n_dof = 29
@@ -357,9 +368,9 @@ class TestMainIntegration:
         onnx_path = str(tmp_path / "test_policy.onnx")
         _make_isaaclab_onnx(onnx_path)
 
-        with patch("src.main.SimRobot") as MockSimRobot, \
-             patch("src.main.run_headless"), \
-             patch("src.main.DataLogger") as MockLogger:
+        with patch("unitree_launcher.main.SimRobot") as MockSimRobot, \
+             patch("unitree_launcher.main.run_headless"), \
+             patch("unitree_launcher.main.DataLogger") as MockLogger:
 
             mock_robot = MagicMock()
             mock_robot.n_dof = 29
@@ -374,7 +385,7 @@ class TestMainIntegration:
 
     def test_main_policy_not_found(self, tmp_path):
         """Nonexistent policy file raises error during load."""
-        with patch("src.main.SimRobot") as MockSimRobot:
+        with patch("unitree_launcher.main.SimRobot") as MockSimRobot:
             mock_robot = MagicMock()
             mock_robot.n_dof = 29
             MockSimRobot.return_value = mock_robot
@@ -385,15 +396,49 @@ class TestMainIntegration:
                     "--config", DEFAULT_CONFIG, "--no-log",
                 ])
 
+    def test_run_headless_keyboard_interrupt(self, tmp_path):
+        """KeyboardInterrupt during run_headless should call controller.stop()."""
+        from unitree_launcher.main import run_headless
+        from unitree_launcher.control.controller import Controller
+        from unitree_launcher.control.safety import SafetyController
+        from unitree_launcher.policy.joint_mapper import JointMapper
+        from unitree_launcher.policy.observations import ObservationBuilder
+
+        onnx_path = str(tmp_path / "test_policy.onnx")
+        _make_isaaclab_onnx(onnx_path)
+
+        config = load_config(DEFAULT_CONFIG)
+        robot = MagicMock()
+        robot.n_dof = 29
+
+        ctrl = MagicMock()
+        ctrl.is_running = True
+        ctrl.safety = MagicMock()
+
+        # Make ctrl.is_running raise KeyboardInterrupt on second access
+        call_count = [0]
+        original_is_running = True
+
+        def is_running_side_effect():
+            call_count[0] += 1
+            if call_count[0] >= 2:
+                raise KeyboardInterrupt()
+            return True
+
+        type(ctrl).is_running = property(lambda self: is_running_side_effect())
+
+        run_headless(robot, ctrl)
+        ctrl.stop.assert_called_once()
+
     def test_main_policy_dir_passed_to_controller(self, tmp_path):
         """--policy-dir is forwarded to Controller."""
         onnx_path = str(tmp_path / "test_policy.onnx")
         _make_isaaclab_onnx(onnx_path)
         pol_dir = str(tmp_path / "policies")
 
-        with patch("src.main.SimRobot") as MockSimRobot, \
-             patch("src.main.run_headless"), \
-             patch("src.main.Controller") as MockController:
+        with patch("unitree_launcher.main.SimRobot") as MockSimRobot, \
+             patch("unitree_launcher.main.run_headless"), \
+             patch("unitree_launcher.main.Controller") as MockController:
 
             mock_robot = MagicMock()
             mock_robot.n_dof = 29

@@ -20,9 +20,9 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import onnxruntime as ort
 
-from src.policy.base import PolicyInterface
-from src.policy.joint_mapper import JointMapper
-from src.robot.base import RobotState
+from unitree_launcher.policy.base import PolicyInterface
+from unitree_launcher.policy.joint_mapper import JointMapper
+from unitree_launcher.robot.base import RobotState
 
 
 class BeyondMimicPolicy(PolicyInterface):

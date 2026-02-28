@@ -239,13 +239,13 @@ Q_HOME_29DOF: Dict[str, float] = {
     "left_hip_roll": 0.0,
     "left_hip_yaw": 0.0,
     "left_knee": 0.669,
-    "left_ankle_pitch": -0.33,
+    "left_ankle_pitch": -0.363,
     "left_ankle_roll": 0.0,
     "right_hip_pitch": -0.312,
     "right_hip_roll": 0.0,
     "right_hip_yaw": 0.0,
     "right_knee": 0.669,
-    "right_ankle_pitch": -0.33,
+    "right_ankle_pitch": -0.363,
     "right_ankle_roll": 0.0,
     "waist_yaw": 0.0,
     "waist_roll": 0.0,
@@ -271,13 +271,13 @@ Q_HOME_23DOF: Dict[str, float] = {
     "left_hip_roll": 0.0,
     "left_hip_yaw": 0.0,
     "left_knee": 0.669,
-    "left_ankle_pitch": -0.33,
+    "left_ankle_pitch": -0.363,
     "left_ankle_roll": 0.0,
     "right_hip_pitch": -0.312,
     "right_hip_roll": 0.0,
     "right_hip_yaw": 0.0,
     "right_knee": 0.669,
-    "right_ankle_pitch": -0.33,
+    "right_ankle_pitch": -0.363,
     "right_ankle_roll": 0.0,
     "torso": 0.0,
     "left_shoulder_pitch": 0.2,
@@ -354,9 +354,10 @@ JOINT_LIMITS_23DOF: Dict[str, Tuple[float, float]] = {
 }
 
 # ---------------------------------------------------------------------------
-# Standby PD gains for holding the home pose (from BeyondMimic deployment).
+# Standby PD gains for holding the home pose (StandbyController).
+# Source: config/g1/controllers.yaml in motion_tracking_controller (MTC).
 # These are much higher than the walking policy gains to hold against gravity.
-# Source: https://github.com/HybridRobotics/motion_tracking_controller
+# https://github.com/HybridRobotics/motion_tracking_controller
 # ---------------------------------------------------------------------------
 STANDBY_KP_29DOF: Dict[str, float] = {
     "left_hip_pitch": 350.0, "left_hip_roll": 200.0, "left_hip_yaw": 200.0,
@@ -372,11 +373,11 @@ STANDBY_KP_29DOF: Dict[str, float] = {
     "right_wrist_roll": 40.0, "right_wrist_pitch": 40.0, "right_wrist_yaw": 40.0,
 }
 STANDBY_KD_29DOF: Dict[str, float] = {
-    "left_hip_pitch": 15.0, "left_hip_roll": 15.0, "left_hip_yaw": 15.0,
-    "left_knee": 20.0, "left_ankle_pitch": 15.0, "left_ankle_roll": 15.0,
-    "right_hip_pitch": 15.0, "right_hip_roll": 15.0, "right_hip_yaw": 15.0,
-    "right_knee": 20.0, "right_ankle_pitch": 15.0, "right_ankle_roll": 15.0,
-    "waist_yaw": 10.0, "waist_roll": 10.0, "waist_pitch": 10.0,
+    "left_hip_pitch": 5.0, "left_hip_roll": 5.0, "left_hip_yaw": 5.0,
+    "left_knee": 10.0, "left_ankle_pitch": 5.0, "left_ankle_roll": 5.0,
+    "right_hip_pitch": 5.0, "right_hip_roll": 5.0, "right_hip_yaw": 5.0,
+    "right_knee": 10.0, "right_ankle_pitch": 5.0, "right_ankle_roll": 5.0,
+    "waist_yaw": 5.0, "waist_roll": 5.0, "waist_pitch": 5.0,
     "left_shoulder_pitch": 3.0, "left_shoulder_roll": 3.0,
     "left_shoulder_yaw": 3.0, "left_elbow": 3.0,
     "left_wrist_roll": 3.0, "left_wrist_pitch": 3.0, "left_wrist_yaw": 3.0,
@@ -386,13 +387,15 @@ STANDBY_KD_29DOF: Dict[str, float] = {
 }
 
 # ---------------------------------------------------------------------------
-# IsaacLab G1 Cylinder training gains (per-joint stiffness/damping).
-# Source: G1_CYLINDER_CFG from IsaacLab g1_cylinder.py
+# IsaacLab / mjlab training gains (per-joint stiffness/damping).
+# Source: whole_body_tracking/robots/g1.py (motor armature → gains formula):
 #   stiffness = armature * (10 * 2π)²
 #   damping   = 2 * 2.0 * armature * (10 * 2π)
+# These are the BuiltinPositionActuator kp/kv values used in mjlab and the
+# BeyondMimic / whole-body tracking RL policies during training.
 # Motor types: 7520_14 (hip_pitch/yaw, waist_yaw), 7520_22 (hip_roll, knee),
-#   5020 (ankle, shoulder, elbow, wrist_roll), 4010 (wrist_pitch/yaw),
-#   2×5020 (ankle, waist_roll/pitch)
+#   2×5020 (ankle, waist_roll/pitch), 5020 (shoulder, elbow, wrist_roll),
+#   4010 (wrist_pitch/yaw)
 # ---------------------------------------------------------------------------
 ISAACLAB_KP_29DOF: Dict[str, float] = {
     "left_hip_pitch": 40.18, "left_hip_roll": 99.10, "left_hip_yaw": 40.18,
@@ -419,6 +422,62 @@ ISAACLAB_KD_29DOF: Dict[str, float] = {
     "right_shoulder_pitch": 0.907, "right_shoulder_roll": 0.907,
     "right_shoulder_yaw": 0.907, "right_elbow": 0.907,
     "right_wrist_roll": 0.907, "right_wrist_pitch": 1.068, "right_wrist_yaw": 1.068,
+}
+
+# ---------------------------------------------------------------------------
+# Unitree official deploy gains (from unitree_rl_lab).
+# Source: deploy/robots/g1_29dof/config/config.yaml (FixStand) and
+#   deploy/robots/g1_29dof/config/policy/velocity/v0/params/deploy.yaml
+# https://github.com/unitreerobotics/unitree_rl_lab
+#
+# Key difference from IsaacLab training gains: arm kd=10 (vs 0.9) and
+# leg kp=100-150 (vs 28-99).  These are the gains Unitree uses for
+# hardware deployment at 1000 Hz FSM rate.
+# ---------------------------------------------------------------------------
+UNITREE_KP_29DOF: Dict[str, float] = {
+    "left_hip_pitch": 100.0, "left_hip_roll": 100.0, "left_hip_yaw": 100.0,
+    "left_knee": 150.0, "left_ankle_pitch": 40.0, "left_ankle_roll": 40.0,
+    "right_hip_pitch": 100.0, "right_hip_roll": 100.0, "right_hip_yaw": 100.0,
+    "right_knee": 150.0, "right_ankle_pitch": 40.0, "right_ankle_roll": 40.0,
+    "waist_yaw": 200.0, "waist_roll": 200.0, "waist_pitch": 200.0,
+    "left_shoulder_pitch": 40.0, "left_shoulder_roll": 40.0,
+    "left_shoulder_yaw": 40.0, "left_elbow": 40.0,
+    "left_wrist_roll": 40.0, "left_wrist_pitch": 40.0, "left_wrist_yaw": 40.0,
+    "right_shoulder_pitch": 40.0, "right_shoulder_roll": 40.0,
+    "right_shoulder_yaw": 40.0, "right_elbow": 40.0,
+    "right_wrist_roll": 40.0, "right_wrist_pitch": 40.0, "right_wrist_yaw": 40.0,
+}
+UNITREE_KD_29DOF: Dict[str, float] = {
+    "left_hip_pitch": 2.0, "left_hip_roll": 2.0, "left_hip_yaw": 2.0,
+    "left_knee": 4.0, "left_ankle_pitch": 2.0, "left_ankle_roll": 2.0,
+    "right_hip_pitch": 2.0, "right_hip_roll": 2.0, "right_hip_yaw": 2.0,
+    "right_knee": 4.0, "right_ankle_pitch": 2.0, "right_ankle_roll": 2.0,
+    "waist_yaw": 5.0, "waist_roll": 5.0, "waist_pitch": 5.0,
+    "left_shoulder_pitch": 10.0, "left_shoulder_roll": 10.0,
+    "left_shoulder_yaw": 10.0, "left_elbow": 10.0,
+    "left_wrist_roll": 10.0, "left_wrist_pitch": 10.0, "left_wrist_yaw": 10.0,
+    "right_shoulder_pitch": 10.0, "right_shoulder_roll": 10.0,
+    "right_shoulder_yaw": 10.0, "right_elbow": 10.0,
+    "right_wrist_roll": 10.0, "right_wrist_pitch": 10.0, "right_wrist_yaw": 10.0,
+}
+
+# BeyondMimic per-joint action scale: 0.25 * effort_limit / kp.
+# Source: whole_body_tracking/robots/g1.py in MTC training codebase.
+# https://github.com/HybridRobotics/motion_tracking_controller
+# Used as fallback when ONNX metadata does not include action_scale.
+# ---------------------------------------------------------------------------
+BM_ACTION_SCALE_29DOF: Dict[str, float] = {
+    "left_hip_pitch": 0.548, "left_hip_roll": 0.351, "left_hip_yaw": 0.548,
+    "left_knee": 0.351, "left_ankle_pitch": 0.439, "left_ankle_roll": 0.439,
+    "right_hip_pitch": 0.548, "right_hip_roll": 0.351, "right_hip_yaw": 0.548,
+    "right_knee": 0.351, "right_ankle_pitch": 0.439, "right_ankle_roll": 0.439,
+    "waist_yaw": 0.548, "waist_roll": 0.439, "waist_pitch": 0.439,
+    "left_shoulder_pitch": 0.439, "left_shoulder_roll": 0.439,
+    "left_shoulder_yaw": 0.439, "left_elbow": 0.439,
+    "left_wrist_roll": 0.439, "left_wrist_pitch": 0.075, "left_wrist_yaw": 0.075,
+    "right_shoulder_pitch": 0.439, "right_shoulder_roll": 0.439,
+    "right_shoulder_yaw": 0.439, "right_elbow": 0.439,
+    "right_wrist_roll": 0.439, "right_wrist_pitch": 0.075, "right_wrist_yaw": 0.075,
 }
 
 # Torque limits: config-name -> max torque in Nm (SPEC 2.2)
@@ -693,6 +752,7 @@ class SafetyConfig:
     joint_position_limits: bool = True
     joint_velocity_limits: bool = True
     torque_limits: bool = True
+    fault_threshold: float = 0.95
 
 
 @dataclass

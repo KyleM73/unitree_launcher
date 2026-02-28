@@ -14,15 +14,15 @@ import mujoco
 import numpy as np
 import pytest
 
-from src.config import (
+from unitree_launcher.config import (
     Config,
     G1_29DOF_JOINTS,
     G1_29DOF_MUJOCO_JOINTS,
     Q_HOME_29DOF,
     load_config,
 )
-from src.robot.base import RobotCommand, RobotState
-from src.robot.sim_robot import SimRobot
+from unitree_launcher.robot.base import RobotCommand, RobotState
+from unitree_launcher.robot.sim_robot import SimRobot
 
 # ---------------------------------------------------------------------------
 # Helpers / fixtures
@@ -139,28 +139,34 @@ def test_sim_robot_gravity(robot):
 # ---------------------------------------------------------------------------
 
 def test_sim_robot_damping_holds(robot):
-    """Damping command produces correct ctrl values (resisting joint velocity)."""
-    robot.reset()
-    # Step a few times to build up some joint velocities
-    for _ in range(10):
-        robot.step()
+    """Damping command sets position actuator to pure damping (kp=0, kv=kd).
 
-    state = robot.get_state()
+    With position actuators, a damping command sets:
+      ctrl = 0 (target position), gainprm = 0 (kp), biasprm[2] = -kd
+    The actuator then computes: force = 0*(ctrl-q) - kd*dq = -kd*dq
+    """
+    robot.reset()
     kd_val = 10.0
     cmd = RobotCommand.damping(29, kd=kd_val)
     robot.send_command(cmd)
+    robot.step()  # applies command
 
-    # Verify ctrl[i] = kd * (0 - dq_actual) = -kd * dq_actual
-    # (kp=0, tau_ff=0, dq_des=0, q_des=0)
-    nm = robot.mj_model.nu
-    sd = robot.mj_data.sensordata
     for cfg_i in range(29):
         mj_i = robot._cfg_to_mj[cfg_i]
-        dq_actual = sd[nm + mj_i]
-        expected_ctrl = kd_val * (0.0 - dq_actual)
+        # ctrl = target position = 0 (from damping command)
         np.testing.assert_allclose(
-            robot.mj_data.ctrl[mj_i], expected_ctrl, atol=1e-12,
-            err_msg=f"Damping ctrl mismatch at joint {cfg_i}"
+            robot.mj_data.ctrl[mj_i], 0.0, atol=1e-12,
+            err_msg=f"Damping ctrl (target pos) mismatch at joint {cfg_i}"
+        )
+        # kp = 0 (no position tracking)
+        np.testing.assert_allclose(
+            robot.mj_model.actuator_gainprm[mj_i, 0], 0.0, atol=1e-12,
+            err_msg=f"Damping kp mismatch at joint {cfg_i}"
+        )
+        # kv = kd (velocity damping)
+        np.testing.assert_allclose(
+            robot.mj_model.actuator_biasprm[mj_i, 2], -kd_val, atol=1e-12,
+            err_msg=f"Damping kv mismatch at joint {cfg_i}"
         )
 
 
@@ -199,7 +205,7 @@ def test_sim_robot_imu_upright(robot):
 
 def test_sim_robot_connect_disconnect(robot):
     """connect() and disconnect() run without errors (mocked DDS)."""
-    with patch("src.robot.sim_robot.patch_unitree_threading"):
+    with patch("unitree_launcher.robot.sim_robot.patch_unitree_threading"):
         with patch.dict("sys.modules", {
             "unitree_sdk2py.core.channel": MagicMock(),
             "unitree_sdk2py.idl.unitree_hg.msg.dds_": MagicMock(),
@@ -231,46 +237,61 @@ def test_sim_robot_exposes_lock(robot):
 # ---------------------------------------------------------------------------
 
 def test_sim_robot_impedance_control_values(robot):
-    """Verify ctrl matches hand-computed impedance control law.
+    """Verify position actuator setup matches the PD command.
 
-    ctrl[i] = tau_ff + kp*(q_des - q_actual) + kd*(dq_des - dq_actual)
+    With position actuators, send_command sets:
+      ctrl[i] = q_des (target position)
+      gainprm[i,0] = kp, biasprm[i,1] = -kp, biasprm[i,2] = -kd
+      qfrc_applied[dof_i] = tau_ff (feedforward torque)
+
+    MuJoCo then computes: force = kp*(q_des - q) - kd*dq + tau_ff
     """
     robot.reset()
-    # Forward to compute sensor data
     mujoco.mj_forward(robot.mj_model, robot.mj_data)
-
-    nm = robot.mj_model.nu
-    sd = robot.mj_data.sensordata
 
     # Known command values
     kp = np.full(29, 50.0)
     kd = np.full(29, 5.0)
     q_des = np.linspace(0.0, 0.5, 29)
-    dq_des = np.linspace(-0.1, 0.1, 29)
     tau_ff = np.linspace(-1.0, 1.0, 29)
 
     cmd = RobotCommand(
         joint_positions=q_des.copy(),
-        joint_velocities=dq_des.copy(),
+        joint_velocities=np.zeros(29),
         joint_torques=tau_ff.copy(),
         kp=kp.copy(),
         kd=kd.copy(),
     )
     robot.send_command(cmd)
+    robot.step()  # applies command
 
-    # Compute expected ctrl for each joint
     for cfg_i in range(29):
         mj_i = robot._cfg_to_mj[cfg_i]
-        q_actual = sd[mj_i]
-        dq_actual = sd[nm + mj_i]
-        expected = (
-            tau_ff[cfg_i]
-            + kp[cfg_i] * (q_des[cfg_i] - q_actual)
-            + kd[cfg_i] * (dq_des[cfg_i] - dq_actual)
+        dof_i = robot._dof_addr[cfg_i]
+
+        # ctrl = target position
+        np.testing.assert_allclose(
+            robot.mj_data.ctrl[mj_i], q_des[cfg_i], rtol=1e-10,
+            err_msg=f"ctrl mismatch at joint {cfg_i}"
+        )
+        # gainprm = kp
+        np.testing.assert_allclose(
+            robot.mj_model.actuator_gainprm[mj_i, 0], kp[cfg_i], rtol=1e-10,
+            err_msg=f"kp mismatch at joint {cfg_i}"
+        )
+        # biasprm[1] = -kp, biasprm[2] = -kd
+        np.testing.assert_allclose(
+            robot.mj_model.actuator_biasprm[mj_i, 1], -kp[cfg_i], rtol=1e-10,
+            err_msg=f"biasprm[1] mismatch at joint {cfg_i}"
         )
         np.testing.assert_allclose(
-            robot.mj_data.ctrl[mj_i], expected, rtol=1e-10,
-            err_msg=f"ctrl mismatch at joint {cfg_i}"
+            robot.mj_model.actuator_biasprm[mj_i, 2], -kd[cfg_i], rtol=1e-10,
+            err_msg=f"biasprm[2] mismatch at joint {cfg_i}"
+        )
+        # feedforward in qfrc_applied
+        np.testing.assert_allclose(
+            robot.mj_data.qfrc_applied[dof_i], tau_ff[cfg_i], rtol=1e-10,
+            err_msg=f"qfrc_applied mismatch at joint {cfg_i}"
         )
 
 
@@ -426,3 +447,21 @@ def test_sim_robot_get_state_returns_copies(robot):
     # Get state again — should not be affected
     state2 = robot.get_state()
     np.testing.assert_array_equal(state2.joint_positions, original_pos)
+
+
+# ---------------------------------------------------------------------------
+# Test: send_command wrong shape
+# ---------------------------------------------------------------------------
+
+def test_send_command_wrong_shape(robot):
+    """send_command with wrong-shaped arrays should raise on step, not silently corrupt."""
+    cmd = RobotCommand(
+        joint_positions=np.zeros(10),  # wrong: 10 != 29
+        joint_velocities=np.zeros(10),
+        joint_torques=np.zeros(10),
+        kp=np.full(10, 100.0),
+        kd=np.full(10, 10.0),
+    )
+    robot.send_command(cmd)
+    with pytest.raises((IndexError, ValueError)):
+        robot.step()

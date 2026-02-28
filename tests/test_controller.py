@@ -14,18 +14,18 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 
-from src.config import (
+from unitree_launcher.config import (
     Config,
     G1_29DOF_JOINTS,
     Q_HOME_29DOF,
     load_config,
 )
-from src.control.controller import Controller
-from src.control.safety import SafetyController, SystemState
-from src.policy.base import PolicyInterface
-from src.policy.joint_mapper import JointMapper
-from src.policy.observations import ObservationBuilder
-from src.robot.base import RobotCommand, RobotInterface, RobotState
+from unitree_launcher.control.controller import Controller
+from unitree_launcher.control.safety import SafetyController, SystemState
+from unitree_launcher.policy.base import PolicyInterface
+from unitree_launcher.policy.joint_mapper import JointMapper
+from unitree_launcher.policy.observations import ObservationBuilder
+from unitree_launcher.robot.base import RobotCommand, RobotInterface, RobotState
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -129,7 +129,7 @@ class TestControllerInit:
 
 class TestBuildCommand:
     def test_build_command_isaaclab_values(self):
-        """Verify: target_pos = q_home + Ka * action, kp=config.kp, kd=config.kd, dq=0, tau=0."""
+        """Verify: target_pos = q_home + Ka * action, kp/kd = IsaacLab per-joint gains, dq=0, tau=0."""
         ctrl = _make_controller()
         state = ctrl.robot.get_state()
 
@@ -138,37 +138,22 @@ class TestBuildCommand:
 
         cmd = ctrl._build_command(state, action)
 
-        # Expected: target_pos[i] = q_home[i] + 0.5 * 1.0
-        expected_pos = ctrl._q_home + 0.5 * action
+        # Expected: target_pos[i] = q_home[i] + isaaclab_ka[i] * 1.0
+        expected_pos = ctrl._q_home + ctrl._isaaclab_ka * action
         ctrl_idx = ctrl.joint_mapper.controlled_indices
         np.testing.assert_array_almost_equal(cmd.joint_positions[ctrl_idx], expected_pos)
 
-        # kp, kd from config
-        np.testing.assert_array_almost_equal(cmd.kp[ctrl_idx], np.full(29, 100.0))
-        np.testing.assert_array_almost_equal(cmd.kd[ctrl_idx], np.full(29, 10.0))
+        # kp, kd from IsaacLab per-joint training gains
+        np.testing.assert_array_almost_equal(cmd.kp[ctrl_idx], ctrl._isaaclab_kp)
+        np.testing.assert_array_almost_equal(cmd.kd[ctrl_idx], ctrl._isaaclab_kd)
 
         # dq_target = 0, tau = 0
         np.testing.assert_array_equal(cmd.joint_velocities, np.zeros(29))
         np.testing.assert_array_equal(cmd.joint_torques, np.zeros(29))
 
-    def test_build_command_isaaclab_specific_values(self):
-        """Test with specific q_home=0.5, Ka=0.3, action=1.0 per plan spec."""
-        config = _make_config()
-        config.control.ka = 0.3
-        ctrl = _make_controller(config=config)
-
-        action = np.ones(29)
-        state = ctrl.robot.get_state()
-        cmd = ctrl._build_command(state, action)
-
-        # target_pos = q_home + 0.3 * 1.0
-        expected_pos = ctrl._q_home + 0.3
-        ctrl_idx = ctrl.joint_mapper.controlled_indices
-        np.testing.assert_array_almost_equal(cmd.joint_positions[ctrl_idx], expected_pos)
-
     def test_build_command_beyondmimic_values(self):
         """Verify BM: target = default_q + Ka * action, dq_target = 0."""
-        from src.policy.beyondmimic_policy import BeyondMimicPolicy
+        from unitree_launcher.policy.beyondmimic_policy import BeyondMimicPolicy
 
         config = _make_config()
         mapper = JointMapper(G1_29DOF_JOINTS)
@@ -455,7 +440,7 @@ class TestKeyHandling:
         create_isaaclab_onnx(obs_dim, 29, p2)
 
         # Use a real IsaacLab policy that can actually load
-        from src.policy.isaaclab_policy import IsaacLabPolicy
+        from unitree_launcher.policy.isaaclab_policy import IsaacLabPolicy
         policy = IsaacLabPolicy(mapper, obs_dim)
         policy.load(p1)
 
@@ -488,7 +473,7 @@ class TestKeyHandling:
         create_isaaclab_onnx(obs_dim, 29, p1)
         create_isaaclab_onnx(obs_dim, 29, p2)
 
-        from src.policy.isaaclab_policy import IsaacLabPolicy
+        from unitree_launcher.policy.isaaclab_policy import IsaacLabPolicy
         policy = IsaacLabPolicy(mapper, obs_dim)
         policy.load(p1)
 
@@ -516,7 +501,7 @@ class TestPolicyReload:
     def test_reload_policy_while_stopped(self, tmp_path):
         """reload_policy() loads and resets successfully."""
         from tests.conftest import create_isaaclab_onnx
-        from src.policy.isaaclab_policy import IsaacLabPolicy
+        from unitree_launcher.policy.isaaclab_policy import IsaacLabPolicy
 
         mapper = JointMapper(G1_29DOF_JOINTS)
         config = _make_config()
@@ -548,7 +533,7 @@ class TestPolicyReload:
     def test_reload_policy_invalid_path(self, tmp_path):
         """Invalid path raises error, original policy is preserved."""
         from tests.conftest import create_isaaclab_onnx
-        from src.policy.isaaclab_policy import IsaacLabPolicy
+        from unitree_launcher.policy.isaaclab_policy import IsaacLabPolicy
 
         mapper = JointMapper(G1_29DOF_JOINTS)
         config = _make_config()
@@ -592,7 +577,7 @@ class TestBeyondMimicTrajectory:
         safety = SafetyController(config, n_dof=29)
         robot = _make_mock_robot()
 
-        from src.policy.beyondmimic_policy import BeyondMimicPolicy
+        from unitree_launcher.policy.beyondmimic_policy import BeyondMimicPolicy
         bm_policy = MagicMock(spec=BeyondMimicPolicy)
         bm_policy.__class__ = BeyondMimicPolicy
         bm_policy.default_joint_pos = np.full(29, 0.2)
@@ -634,6 +619,26 @@ class TestBeyondMimicTrajectory:
 # ============================================================================
 # Auto-termination
 # ============================================================================
+
+class TestNaNHandling:
+    def test_nan_state_does_not_produce_nan_command(self):
+        """NaN joint positions in robot state should be handled by safety clamp."""
+        ctrl = _make_controller()
+
+        # Mock get_state to return NaN positions
+        state_with_nan = ctrl.robot.get_state.return_value
+        state_with_nan.joint_positions = np.full(29, np.nan)
+
+        state = ctrl.robot.get_state()
+        action = np.zeros(29)
+        cmd = ctrl._build_command(state, action)
+        clamped = ctrl.safety.clamp_command(cmd)
+
+        # After safety clamping, command positions should not contain NaN
+        # (they get clamped to joint limits)
+        assert not np.any(np.isnan(clamped.joint_positions)), \
+            "Safety clamp should handle NaN positions"
+
 
 class TestAutoTermination:
     def test_auto_termination_max_steps(self):

@@ -1,0 +1,61 @@
+# Unitree G1 Deployment Stack — Docker Compose profiles
+#
+# Run from repo root:
+#   docker compose -f docker/docker-compose.yml --profile headless run --rm sim-headless \
+#       sim --headless --policy assets/policies/stance_29dof.onnx --duration 10
+#   docker compose -f docker/docker-compose.yml --profile gui run --rm sim-gui \
+#       sim --policy assets/policies/stance_29dof.onnx
+#   docker compose -f docker/docker-compose.yml --profile real run --rm real-robot \
+#       real --policy assets/policies/stance_29dof.onnx --interface eth0
+#   docker compose -f docker/docker-compose.yml --profile test run --rm test
+
+services:
+  # ── Headless simulation (macOS + Linux) ────────────────────────────
+  sim-headless:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    profiles: [headless]
+    environment:
+      - MUJOCO_GL=egl
+    volumes:
+      - ../logs:/app/logs
+      - ../assets/policies:/app/assets/policies:ro
+
+  # ── GUI simulation via X11 (Linux only) ────────────────────────────
+  sim-gui:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    profiles: [gui]
+    environment:
+      - MUJOCO_GL=glx
+      - DISPLAY=${DISPLAY}
+    volumes:
+      - ../logs:/app/logs
+      - ../assets/policies:/app/assets/policies:ro
+      - /tmp/.X11-unix:/tmp/.X11-unix
+
+  # ── Real robot (Linux only, host networking for DDS) ───────────────
+  real-robot:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    profiles: [real]
+    network_mode: host
+    environment:
+      - MUJOCO_GL=egl
+    volumes:
+      - ../logs:/app/logs
+      - ../assets/policies:/app/assets/policies:ro
+
+  # ── Test runner ────────────────────────────────────────────────────
+  test:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    profiles: [test]
+    environment:
+      - MUJOCO_GL=egl
+    entrypoint: ["python", "-m", "pytest"]
+    command: ["tests/", "-v"]

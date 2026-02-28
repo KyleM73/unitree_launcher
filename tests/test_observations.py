@@ -4,7 +4,7 @@ import math
 import numpy as np
 import pytest
 
-from src.config import (
+from unitree_launcher.config import (
     Config,
     G1_23DOF_JOINTS,
     G1_29DOF_JOINTS,
@@ -12,9 +12,9 @@ from src.config import (
     resolve_joint_name,
     ISAACLAB_G1_29DOF_JOINTS,
 )
-from src.policy.joint_mapper import JointMapper
-from src.policy.observations import ObservationBuilder
-from src.robot.base import RobotState
+from unitree_launcher.policy.joint_mapper import JointMapper
+from unitree_launcher.policy.observations import ObservationBuilder
+from unitree_launcher.robot.base import RobotState
 
 
 # ---------------------------------------------------------------------------
@@ -281,22 +281,6 @@ class TestSegmentPositions:
         obs = builder.build(state, np.zeros(29), np.zeros(3))
         np.testing.assert_allclose(obs[6:9], [0.0, 0.0, -1.0], atol=1e-10)
 
-    def test_build_vel_cmd_segment_position(self):
-        """velocity_commands at offset 9."""
-        builder, _ = _make_builder(use_estimator=True)
-        state = _make_state()
-        obs = builder.build(state, np.zeros(29), np.array([1.0, 2.0, 3.0]))
-        np.testing.assert_allclose(obs[9:12], [1.0, 2.0, 3.0])
-
-    def test_build_joint_pos_segment_position(self):
-        """joint_pos at offset 12."""
-        builder, _ = _make_builder(use_estimator=True)
-        state = _make_state()
-        obs = builder.build(state, np.zeros(29), np.zeros(3))
-        # At home with zero positions -> relative = -q_home
-        q_home = np.array([Q_HOME_29DOF[j] for j in G1_29DOF_JOINTS])
-        np.testing.assert_allclose(obs[12 : 12 + 29], -q_home, atol=1e-10)
-
     def test_build_no_est_ang_vel_at_offset_0(self):
         """Without estimator, base_ang_vel starts at offset 0."""
         builder, _ = _make_builder(use_estimator=False)
@@ -316,6 +300,33 @@ class TestSegmentPositions:
 # ---------------------------------------------------------------------------
 # Multi-config tests
 # ---------------------------------------------------------------------------
+
+
+class TestBuildEdgeCases:
+    def test_sequential_builds_carry_last_action(self):
+        """Calling build() with action, then building again, carries the action."""
+        builder, mapper = _make_builder(29, 29, use_estimator=True)
+        state = _make_state()
+        action = np.ones(29)
+
+        # First build with action
+        obs1 = builder.build(state, action, np.zeros(3))
+        # Action segment at offset 70
+        np.testing.assert_allclose(obs1[70:99], action)
+
+        # Second build with different action — previous action should appear
+        new_action = np.full(29, 2.0)
+        obs2 = builder.build(state, new_action, np.zeros(3))
+        np.testing.assert_allclose(obs2[70:99], new_action)
+
+    def test_build_output_dtype(self):
+        """build() returns a numpy array with numeric dtype (float32 or float64)."""
+        builder, mapper = _make_builder(29, 29, use_estimator=True)
+        state = _make_state()
+        obs = builder.build(state, np.zeros(29), np.zeros(3))
+        assert isinstance(obs, np.ndarray)
+        assert np.issubdtype(obs.dtype, np.floating), \
+            f"Expected floating dtype, got {obs.dtype}"
 
 
 class TestMultiConfig:

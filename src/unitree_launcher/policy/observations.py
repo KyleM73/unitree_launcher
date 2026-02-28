@@ -11,9 +11,9 @@ from __future__ import annotations
 
 import numpy as np
 
-from src.config import Config, Q_HOME_23DOF, Q_HOME_29DOF
-from src.policy.joint_mapper import JointMapper
-from src.robot.base import RobotState
+from unitree_launcher.config import Config, Q_HOME_23DOF, Q_HOME_29DOF
+from unitree_launcher.policy.joint_mapper import JointMapper
+from unitree_launcher.robot.base import RobotState
 
 
 class ObservationBuilder:

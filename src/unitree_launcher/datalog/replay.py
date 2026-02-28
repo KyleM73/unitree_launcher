@@ -11,7 +11,7 @@ from typing import Optional
 import numpy as np
 import yaml
 
-from src.robot.base import RobotState
+from unitree_launcher.robot.base import RobotState
 
 
 class LogReplay:

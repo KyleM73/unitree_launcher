@@ -6,7 +6,15 @@ over CycloneDDS using unitree_hg IDL types (LowCmd_ / LowState_).
 Threading model:
     DDS subscriber thread:  receives LowState_ callbacks, copies into _latest_state
     Control loop thread:    get_state() -> policy -> send_command()
+    500 Hz publish thread:  re-publishes the latest LowCmd_ at 500 Hz
     Watchdog:               checked each get_state(), triggers E-stop on timeout
+
+Lock ordering (must never be reversed):
+    _cmd_lock -> _state_lock
+
+The 500 Hz publish thread ensures the robot's onboard controller sees fresh
+commands every 2 ms, which is required to avoid the robot's own communication
+watchdog triggering a protective shutdown.
 
 SAFETY WARNING: All development should happen in simulation first. Real robot
 testing should start with the robot hanging from a support harness.
@@ -20,9 +28,9 @@ from typing import Optional
 
 import numpy as np
 
-from src.compat import patch_unitree_threading, resolve_network_interface
-from src.config import Config, _get_joints_for_variant
-from src.robot.base import RobotCommand, RobotInterface, RobotState
+from unitree_launcher.compat import RecurrentThread, patch_unitree_threading, resolve_network_interface
+from unitree_launcher.config import Config, _get_joints_for_variant
+from unitree_launcher.robot.base import RobotCommand, RobotInterface, RobotState
 
 logger = logging.getLogger(__name__)
 
@@ -58,12 +66,22 @@ class RealRobot(RobotInterface):
         self._state_sub = None
         self._low_cmd_msg = None
         self._crc = None
+        self._publish_thread: Optional[RecurrentThread] = None
+
+        # Command lock: protects _low_cmd_msg and _cmd_ready.
+        # Lock ordering: _cmd_lock -> _state_lock (never reversed).
+        self._cmd_lock = threading.Lock()
+        self._cmd_ready = False
 
         # Latest state from DDS subscriber callback (protected by lock)
         self._state_lock = threading.Lock()
         self._latest_state: Optional[RobotState] = None
         self._last_state_time: float = 0.0
         self._state_received = threading.Event()
+
+        # Hardware identification from LowState (protected by _state_lock)
+        self._mode_machine: int = 0
+        self._version: tuple[int, int] = (0, 0)
 
         # Optional safety controller reference (set externally for watchdog)
         self._safety = None
@@ -114,8 +132,23 @@ class RealRobot(RobotInterface):
                 "Is the robot powered on and connected?"
             )
 
+        # Start 500 Hz command re-publish thread
+        self._publish_thread = RecurrentThread(
+            interval=0.002, target=self._publish_cmd, name="cmd_publish"
+        )
+        self._publish_thread.Start()
+
         self._connected = True
-        logger.info("RealRobot connected on interface %s (domain_id=0)", iface)
+
+        # Log hardware identification
+        with self._state_lock:
+            mode_machine = self._mode_machine
+            version = self._version
+        logger.info(
+            "RealRobot connected on interface %s (domain_id=0) — "
+            "mode_machine=%d, version=(%d, %d)",
+            iface, mode_machine, version[0], version[1],
+        )
 
         # Print startup orientation check
         state = self.get_state()
@@ -124,13 +157,50 @@ class RealRobot(RobotInterface):
             *state.imu_quaternion,
         )
 
+    def graceful_shutdown(self, damping_duration: float = 0.5) -> None:
+        """Send damping commands then disconnect. Safe to call from signal handlers.
+
+        Sends zero-torque damping commands for *damping_duration* seconds so the
+        robot decelerates smoothly before the command stream stops. Idempotent —
+        calling multiple times is harmless.
+
+        Args:
+            damping_duration: How long to send damping commands (seconds).
+        """
+        if not self._connected:
+            return
+
+        logger.info(
+            "Graceful shutdown: sending damping commands for %.1fs",
+            damping_duration,
+        )
+
+        try:
+            from unitree_launcher.robot.base import RobotCommand
+
+            cmd = RobotCommand.damping(self._n_dof)
+            self.send_command(cmd)
+
+            # Let the 500 Hz publish thread re-send the damping command
+            deadline = time.monotonic() + damping_duration
+            while time.monotonic() < deadline:
+                time.sleep(0.01)
+        except Exception:
+            logger.exception("Error during graceful shutdown damping")
+
+        self.disconnect()
+
     def disconnect(self) -> None:
-        """Clean up DDS resources."""
+        """Clean up DDS resources. Shuts down publish thread first."""
+        if self._publish_thread is not None:
+            self._publish_thread.Shutdown()
+            self._publish_thread = None
         if self._state_sub is not None:
             self._state_sub.Close()
             self._state_sub = None
         self._cmd_pub = None
         self._connected = False
+        self._cmd_ready = False
         logger.info("RealRobot disconnected")
 
     def get_state(self) -> RobotState:
@@ -154,29 +224,56 @@ class RealRobot(RobotInterface):
             return self._latest_state.copy()
 
     def send_command(self, cmd: RobotCommand) -> None:
-        """Publish LowCmd_ to rt/lowcmd via DDS.
+        """Build LowCmd_ and publish immediately + mark ready for 500Hz re-publish.
 
         Sets motor_cmd[i].mode = 0x01 (PMSM servo mode) for each controlled
-        joint and computes CRC32 before publishing.
+        joint, zeros out non-controlled slots 29-34, echoes mode_machine from
+        the latest LowState, sets mode_pr=0, and computes CRC32 before
+        publishing.
         """
         if self._cmd_pub is None or self._low_cmd_msg is None:
             return
 
-        msg = self._low_cmd_msg
+        # Read mode_machine from latest state (brief lock)
+        with self._state_lock:
+            mode_machine = self._mode_machine
 
-        for cfg_i in range(self._n_dof):
-            motor = msg.motor_cmd[cfg_i]
-            motor.mode = _MOTOR_MODE_SERVO
-            motor.q = float(cmd.joint_positions[cfg_i])
-            motor.dq = float(cmd.joint_velocities[cfg_i])
-            motor.tau = float(cmd.joint_torques[cfg_i])
-            motor.kp = float(cmd.kp[cfg_i])
-            motor.kd = float(cmd.kd[cfg_i])
+        with self._cmd_lock:
+            msg = self._low_cmd_msg
 
-        # Compute and set CRC32
-        msg.crc = self._crc.Crc(msg)
+            # Echo mode_machine from LowState
+            msg.mode_machine = mode_machine
 
-        self._cmd_pub.Write(msg)
+            # Pitch/roll ankle mode: 0 = position control
+            msg.mode_pr = 0
+
+            # Fill controlled joints
+            for cfg_i in range(self._n_dof):
+                motor = msg.motor_cmd[cfg_i]
+                motor.mode = _MOTOR_MODE_SERVO
+                motor.q = float(cmd.joint_positions[cfg_i])
+                motor.dq = float(cmd.joint_velocities[cfg_i])
+                motor.tau = float(cmd.joint_torques[cfg_i])
+                motor.kp = float(cmd.kp[cfg_i])
+                motor.kd = float(cmd.kd[cfg_i])
+
+            # Zero out non-controlled motor slots (29-34)
+            for i in range(self._n_dof, _NUM_MOTOR_IDL_HG):
+                motor = msg.motor_cmd[i]
+                motor.mode = 0
+                motor.q = 0.0
+                motor.dq = 0.0
+                motor.tau = 0.0
+                motor.kp = 0.0
+                motor.kd = 0.0
+
+            # Compute and set CRC32
+            msg.crc = self._crc.Crc(msg)
+
+            self._cmd_ready = True
+
+            # Publish immediately (first send, don't wait for 500Hz tick)
+            self._cmd_pub.Write(msg)
 
     def step(self) -> None:
         """No-op for real robot (physics runs on hardware)."""
@@ -193,6 +290,13 @@ class RealRobot(RobotInterface):
         return self._n_dof
 
     # ---- Private ----
+
+    def _publish_cmd(self) -> None:
+        """500 Hz re-publish target. No-op until first send_command() sets _cmd_ready."""
+        with self._cmd_lock:
+            if not self._cmd_ready or self._cmd_pub is None:
+                return
+            self._cmd_pub.Write(self._low_cmd_msg)
 
     def _on_low_state(self, msg) -> None:
         """DDS callback: convert LowState_ to RobotState and store."""
@@ -232,6 +336,10 @@ class RealRobot(RobotInterface):
         with self._state_lock:
             self._latest_state = state
             self._last_state_time = now
+            self._mode_machine = getattr(msg, 'mode_machine', 0)
+            version = getattr(msg, 'version', None)
+            if version is not None:
+                self._version = (int(version[0]), int(version[1]))
 
         # Signal first message received (for connect() wait)
         self._state_received.set()

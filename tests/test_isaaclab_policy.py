@@ -5,11 +5,11 @@ import tempfile
 import numpy as np
 import pytest
 
-from src.config import G1_29DOF_JOINTS, load_config
-from src.policy.base import detect_policy_format
-from src.policy.isaaclab_policy import IsaacLabPolicy
-from src.policy.joint_mapper import JointMapper
-from src.policy.observations import ObservationBuilder
+from unitree_launcher.config import G1_29DOF_JOINTS, load_config
+from unitree_launcher.policy.base import detect_policy_format
+from unitree_launcher.policy.isaaclab_policy import IsaacLabPolicy
+from unitree_launcher.policy.joint_mapper import JointMapper
+from unitree_launcher.policy.observations import ObservationBuilder
 from tests.conftest import PROJECT_ROOT, create_isaaclab_onnx
 
 

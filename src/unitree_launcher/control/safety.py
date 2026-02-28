@@ -5,12 +5,13 @@ state machine transitions, and command limit enforcement.
 """
 from __future__ import annotations
 
+import logging
 import threading
 from enum import Enum
 
 import numpy as np
 
-from src.config import (
+from unitree_launcher.config import (
     Config,
     G1_23DOF_JOINTS,
     G1_29DOF_JOINTS,
@@ -21,7 +22,9 @@ from src.config import (
     VELOCITY_LIMITS_23DOF,
     VELOCITY_LIMITS_29DOF,
 )
-from src.robot.base import RobotCommand, RobotState
+from unitree_launcher.robot.base import RobotCommand, RobotState
+
+logger = logging.getLogger(__name__)
 
 
 class SystemState(Enum):
@@ -35,6 +38,8 @@ class ControlMode(Enum):
     HOLD = "hold"            # Static PD at home pose (gantry / pre-default-policy)
     DEFAULT = "default"      # Default policy running (IL velocity tracking, zero vel = stance)
     ACTIVE_POLICY = "active" # Running the --policy (BM, another IL, etc.)
+    DAMPING = "damping"      # Pure velocity damping (kp=0, kd=kd_damp)
+    INTERPOLATE = "interpolate"  # Cosine-ramp position + gains over a duration
 
 
 class SafetyController:
@@ -70,6 +75,7 @@ class SafetyController:
             torque_limits = TORQUE_LIMITS_23DOF
             vel_limits = VELOCITY_LIMITS_23DOF
 
+        self._joints = list(joints)
         self._pos_min = np.array([pos_limits[j][0] for j in joints])
         self._pos_max = np.array([pos_limits[j][1] for j in joints])
         self._torque_max = np.array([torque_limits[j] for j in joints])
@@ -114,6 +120,9 @@ class SafetyController:
         """Generate damping command: target_pos = current_pos, kp=0, kd=kd_damp.
 
         The resulting torque is: tau = -kd_damp * q_dot (pure velocity damping).
+        kd_damp must be high enough to overcome gravity torques (~15 Nm on
+        legs) — MuJoCo's per-actuator forcerange automatically clips the
+        torque for weaker joints (e.g. wrists at ±5 Nm).
         """
         kd_damp = self._control_config.kd_damp
         return RobotCommand(
@@ -183,3 +192,67 @@ class SafetyController:
             )
 
         return result
+
+    def check_state_limits(self, state: RobotState) -> bool:
+        """Check measured robot state against safety thresholds.
+
+        Monitors actual joint positions, velocities, and torques (not commands).
+        If any measured value exceeds ``fault_threshold`` fraction of its limit,
+        triggers E-stop and logs the offending joint.
+
+        Each check respects the corresponding SafetyConfig boolean toggle.
+        Skips entirely if in IDLE (pre-operational) or ESTOP (avoids log spam).
+
+        Returns:
+            True if a fault was detected (ESTOP triggered), False otherwise.
+        """
+        if self._state in (SystemState.IDLE, SystemState.ESTOP):
+            return False
+
+        threshold = self._safety_config.fault_threshold
+
+        if self._safety_config.joint_position_limits:
+            pos = state.joint_positions
+            margin = (1.0 - threshold) * (self._pos_max - self._pos_min)
+            low = self._pos_min + margin
+            high = self._pos_max - margin
+            for i in range(self._n_dof):
+                if pos[i] < low[i] or pos[i] > high[i]:
+                    logger.error(
+                        "State fault: %s position %.4f outside threshold "
+                        "[%.4f, %.4f] (limits [%.4f, %.4f])",
+                        self._joints[i], pos[i], low[i], high[i],
+                        self._pos_min[i], self._pos_max[i],
+                    )
+                    self.estop()
+                    return True
+
+        if self._safety_config.joint_velocity_limits:
+            vel = state.joint_velocities
+            vel_thresh = threshold * self._vel_max
+            for i in range(self._n_dof):
+                if abs(vel[i]) > vel_thresh[i]:
+                    logger.error(
+                        "State fault: %s velocity %.4f exceeds threshold "
+                        "%.4f (limit %.4f)",
+                        self._joints[i], vel[i], vel_thresh[i],
+                        self._vel_max[i],
+                    )
+                    self.estop()
+                    return True
+
+        if self._safety_config.torque_limits:
+            tau = state.joint_torques
+            tau_thresh = threshold * self._torque_max
+            for i in range(self._n_dof):
+                if abs(tau[i]) > tau_thresh[i]:
+                    logger.error(
+                        "State fault: %s torque %.4f exceeds threshold "
+                        "%.4f (limit %.4f)",
+                        self._joints[i], tau[i], tau_thresh[i],
+                        self._torque_max[i],
+                    )
+                    self.estop()
+                    return True
+
+        return False

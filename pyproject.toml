@@ -10,14 +10,17 @@ dependencies = [
     "h5py",
     "cyclonedds==0.10.2",
     "unitree-sdk2py @ git+https://github.com/unitreerobotics/unitree_sdk2_python.git",
-]
-
-[project.optional-dependencies]
-dev = [
+    "hidapi>=0.14",
+    "mink>=1.0; python_version>='3.10'",
     "pytest>=7.0",
     "pytest-cov",
     "onnx>=1.14",
+    "matplotlib>=3.5",
 ]
+
+[build-system]
+requires = ["uv_build>=0.10.6,<0.11.0"]
+build-backend = "uv_build"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

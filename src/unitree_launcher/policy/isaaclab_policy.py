@@ -13,8 +13,8 @@ from __future__ import annotations
 import numpy as np
 import onnxruntime as ort
 
-from src.policy.base import PolicyInterface
-from src.policy.joint_mapper import JointMapper
+from unitree_launcher.policy.base import PolicyInterface
+from unitree_launcher.policy.joint_mapper import JointMapper
 
 
 class IsaacLabPolicy(PolicyInterface):

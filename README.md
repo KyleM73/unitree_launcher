@@ -10,8 +10,72 @@ Control stack for the Unitree G1 humanoid robot. Supports both MuJoCo simulation
 ## Requirements
 
 - Python 3.10 (hard ceiling -- CycloneDDS ARM64 wheel limit)
-- macOS (Apple Silicon) or Linux (x86_64 / ARM64)
+- macOS (Apple Silicon) or Linux (x86_64 / ARM64), or Docker
 - Real robot deployment requires Linux + Ethernet connection to the G1
+
+## Hardware Setup (Real Robot)
+
+### Network Configuration
+
+The G1 communicates over Ethernet using DDS (CycloneDDS). Connect your machine directly to the robot's Ethernet port.
+
+| Parameter | Value |
+|-----------|-------|
+| Robot IP | `192.168.123.161` |
+| Subnet | `192.168.123.x/24` |
+| Host IP | Any unused address on `192.168.123.x` (e.g., `.100`) |
+| DDS domain | `0` |
+
+Configure a static IP on your Ethernet interface:
+
+```bash
+# Linux (replace enp3s0 with your interface name)
+sudo ip addr add 192.168.123.100/24 dev enp3s0
+sudo ip link set enp3s0 up
+
+# Verify connectivity
+ping 192.168.123.161
+```
+
+### DDS Topics
+
+| Topic | Direction | Message type | Rate |
+|-------|-----------|-------------|------|
+| `rt/lowstate` | Robot -> Host | `LowState_` | ~500 Hz |
+| `rt/lowcmd` | Host -> Robot | `LowCmd_` | 500 Hz (required) |
+
+### Protocol Fields
+
+- **`mode_machine`**: Echoed from `LowState_` into every `LowCmd_`. Must match the robot's current mode (`5` = 29-DOF).
+- **`mode_pr`**: Set to `0` in every `LowCmd_` (position control for pitch/roll ankles).
+- **Motor slots**: All 35 IDL motor slots are filled. Controlled joints (0-28) get `mode=0x01` (PMSM servo). Non-controlled slots (29-34) get `mode=0` with zeroed fields.
+
+### 500 Hz Command Publishing
+
+The robot's onboard controller expects commands at ~500 Hz. A dedicated `RecurrentThread` re-publishes the latest `LowCmd_` every 2 ms. The control loop (50 Hz) updates the command contents; between updates, the publish thread re-sends the most recent command to keep the robot's communication watchdog satisfied.
+
+### Verification
+
+Confirm DDS communication before running policies:
+
+```python
+from unitree_launcher.compat import patch_unitree_threading, resolve_network_interface
+patch_unitree_threading()
+
+from unitree_sdk2py.core.channel import ChannelFactoryInitialize, ChannelSubscriber
+from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowState_
+
+ChannelFactoryInitialize(0, "enp3s0")  # your interface
+sub = ChannelSubscriber("rt/lowstate", LowState_)
+sub.Init(handler=lambda msg: print(
+    f"mode_machine={msg.mode_machine}, "
+    f"q[0]={msg.motor_state[0].q:.3f}"
+), queueLen=1)
+
+import time; time.sleep(5)
+```
+
+You should see `mode_machine=5` and streaming joint positions.
 
 ## Installation
 
@@ -26,13 +90,63 @@ uv pip install -e ".[dev]"
 
 **Note:** The Unitree SDK is installed from GitHub source. If you encounter an import error about a missing `b2` submodule, patch `.venv/.../unitree_sdk2py/__init__.py` to wrap the `b2` import in a try/except. See LOG.md Phase 0 for details.
 
-### Validate Environment (macOS)
+## Docker
+
+Docker provides a portable way to run simulations, evaluations, and tests without installing dependencies locally. The image supports both headless (EGL) and GUI (GLX/X11) rendering. Docker files live in `docker/`.
+
+### Build
 
 ```bash
-python scripts/validate_macos.py
+docker build -f docker/Dockerfile -t unitree-launcher .
 ```
 
-Checks MuJoCo, ONNX Runtime, CycloneDDS, SDK, and G1 model loading. All checks should pass except `RecurrentThread` (expected failure on macOS, handled by `src/compat.py`).
+### Headless Simulation (Any Platform)
+
+```bash
+docker run --rm \
+    -v ./logs:/app/logs \
+    -v ./assets/policies:/app/assets/policies:ro \
+    unitree-launcher sim --headless --policy assets/policies/stance_29dof.onnx --duration 10
+```
+
+Or with Docker Compose:
+
+```bash
+docker compose -f docker/docker-compose.yml --profile headless run --rm sim-headless \
+    sim --headless --policy assets/policies/stance_29dof.onnx --duration 10
+```
+
+### GUI via X11 (Linux Only)
+
+```bash
+# Allow Docker to connect to X11
+xhost +local:docker
+
+docker run --rm \
+    -e DISPLAY=$DISPLAY \
+    -e MUJOCO_GL=glx \
+    -v /tmp/.X11-unix:/tmp/.X11-unix \
+    -v ./logs:/app/logs \
+    -v ./assets/policies:/app/assets/policies:ro \
+    unitree-launcher sim --policy assets/policies/stance_29dof.onnx
+```
+
+### Real Robot in Docker (Linux Only)
+
+Requires host networking so DDS can reach the robot:
+
+```bash
+docker run --rm --network host \
+    -v ./logs:/app/logs \
+    -v ./assets/policies:/app/assets/policies:ro \
+    unitree-launcher real --policy assets/policies/stance_29dof.onnx --interface eth0
+```
+
+### Run Tests in Docker
+
+```bash
+docker compose -f docker/docker-compose.yml --profile test run --rm test
+```
 
 ## Quick Start
 
@@ -40,18 +154,30 @@ Checks MuJoCo, ONNX Runtime, CycloneDDS, SDK, and G1 model loading. All checks s
 
 ```bash
 # macOS requires mjpython (ships with the mujoco package)
-mjpython -m src.main sim --policy path/to/policy.onnx
+mjpython -m unitree_launcher.main sim --policy path/to/policy.onnx
 
 # Linux — standard python works
-python -m src.main sim --policy path/to/policy.onnx
+python -m unitree_launcher.main sim --policy path/to/policy.onnx
 ```
 
 A MuJoCo viewer window opens with the G1 robot. Use keyboard controls to operate (see [Keybindings](#keybindings) below). On macOS, `mjpython` is required because MuJoCo's passive viewer must run on the main thread.
 
+### Gantry Mode (Simulation)
+
+```bash
+# With viewer (use mjpython on macOS)
+mjpython -m unitree_launcher.main sim --gantry
+
+# Headless
+python -m unitree_launcher.main sim --gantry --headless
+```
+
+Runs a gantry hang sequence: DAMPING (5s) -> INTERPOLATE (5s) -> HOLD (5s) -> DAMPING (5s). No policy needed. The robot hangs from an elastic band, settles under gravity, smoothly interpolates to home position with IsaacLab gains, holds, then damps to rest.
+
 ### Headless Simulation
 
 ```bash
-python -m src.main sim --policy path/to/policy.onnx --headless --duration 30
+python -m unitree_launcher.main sim --policy path/to/policy.onnx --headless --duration 30
 ```
 
 Runs without a viewer. Prints status to stdout at 1 Hz. Auto-terminates after 30 seconds.
@@ -59,7 +185,7 @@ Runs without a viewer. Prints status to stdout at 1 Hz. Auto-terminates after 30
 ### Real Robot
 
 ```bash
-python -m src.main real --policy path/to/policy.onnx --interface eth0
+python -m unitree_launcher.main real --policy path/to/policy.onnx --interface eth0
 ```
 
 Connects to the G1 over Ethernet via DDS. Runs in headless mode (no viewer). The robot must be powered on and reachable on the specified network interface.
@@ -75,7 +201,7 @@ Connects to the G1 over Ethernet via DDS. Runs in headless mode (no viewer). The
 ## CLI Reference
 
 ```
-python -m src.main {sim,real} [options]
+python -m unitree_launcher.main {sim,real} [options]
 ```
 
 ### Sub-commands
@@ -89,7 +215,7 @@ python -m src.main {sim,real} [options]
 
 | Argument | Default | Description |
 |----------|---------|-------------|
-| `--policy PATH` | *(required)* | Path to ONNX policy file |
+| `--policy PATH` | *(required unless `--gantry`)* | Path to ONNX policy file |
 | `--config PATH` | `configs/default.yaml` | YAML configuration file |
 | `--robot VARIANT` | from config | Robot variant: `g1_29dof` or `g1_23dof` |
 | `--policy-dir DIR` | none | Directory of ONNX files for runtime switching (`=`/`-` keys) |
@@ -102,6 +228,7 @@ python -m src.main {sim,real} [options]
 
 | Argument | Default | Description |
 |----------|---------|-------------|
+| `--gantry` | false | Gantry mode: damping -> interpolate -> hold (no `--policy` needed) |
 | `--headless` | false | Run without MuJoCo viewer |
 | `--duration SECS` | none | Auto-stop after N seconds (headless) |
 | `--steps N` | none | Auto-stop after N policy steps (headless) |
@@ -210,58 +337,64 @@ python scripts/replay_log.py logs/<run>/ --format csv --output data.csv
 
 ```
 unitree_launcher/
-  src/
-    main.py                     # CLI entry point, viewer, headless runner
-    config.py                   # Constants, dataclasses, YAML loading
-    compat.py                   # macOS compatibility (RecurrentThread shim)
+  src/unitree_launcher/           # Installable Python package
+    main.py                       # CLI entry point, viewer, headless runner
+    config.py                     # Constants, dataclasses, YAML loading
+    compat.py                     # macOS compatibility (RecurrentThread shim)
+    gantry.py                     # Gantry harness utilities (elastic band)
+    mirror.py                     # Real robot state mirroring
     robot/
-      base.py                   # RobotState, RobotCommand, RobotInterface ABC
-      sim_robot.py              # MuJoCo simulation backend
-      real_robot.py             # DDS communication with physical robot
+      base.py                     # RobotState, RobotCommand, RobotInterface ABC
+      sim_robot.py                # MuJoCo simulation backend
+      real_robot.py               # DDS communication with physical robot
     policy/
-      base.py                   # PolicyInterface ABC, format auto-detection
-      joint_mapper.py           # Joint ordering between robot/policy/MuJoCo
-      observations.py           # IsaacLab observation vector construction
-      isaaclab_policy.py        # IsaacLab ONNX policy wrapper
-      beyondmimic_policy.py     # BeyondMimic ONNX policy wrapper
+      base.py                     # PolicyInterface ABC, format auto-detection
+      joint_mapper.py             # Joint ordering between robot/policy/MuJoCo
+      observations.py             # IsaacLab observation vector construction
+      isaaclab_policy.py          # IsaacLab ONNX policy wrapper
+      beyondmimic_policy.py       # BeyondMimic ONNX policy wrapper
     control/
-      controller.py             # Main control loop (50 Hz), command building
-      safety.py                 # State machine, E-stop, command clamping
+      controller.py               # Main control loop (50 Hz), command building
+      safety.py                   # State machine, E-stop, command clamping
     logging/
-      logger.py                 # HDF5/NPZ time-series logging
-      replay.py                 # Log loading, CSV export, summary
+      logger.py                   # HDF5/NPZ time-series logging
+      replay.py                   # Log loading, CSV export, summary
   configs/
-    default.yaml                # Default configuration
-    g1_29dof.yaml               # 29-DOF variant
-    g1_23dof.yaml               # 23-DOF variant
+    default.yaml                  # Default configuration
+    g1_29dof.yaml                 # 29-DOF variant
+    g1_23dof.yaml                 # 23-DOF variant
   assets/robots/g1/
-    g1_29dof.xml                # MuJoCo robot model (29 actuators)
-    g1_23dof.xml                # MuJoCo robot model (23 controlled)
-    scene_29dof.xml             # Scene with ground plane and lighting
+    g1_29dof.xml                  # MuJoCo robot model (29 actuators)
+    g1_23dof.xml                  # MuJoCo robot model (23 controlled)
+    scene_29dof.xml               # Scene with ground plane and lighting
     scene_23dof.xml
-    meshes/                     # 60 STL mesh files
+    meshes/                       # 64 STL mesh files
   scripts/
-    run_sim.sh                  # Simulation launcher
-    run_real.sh                 # Real robot launcher
-    run_eval.sh                 # Headless evaluation launcher
-    replay_log.py               # Log replay CLI
-    validate_macos.py           # Environment validation
-  tests/                        # 373 tests, 94% coverage
-    conftest.py                 # Shared fixtures, ONNX model helpers
-    test_config.py              # Constants, config loading, validation
-    test_compat.py              # RecurrentThread, SDK patching
-    test_joint_mapper.py        # Joint ordering, reordering roundtrips
-    test_observations.py        # Gravity projection, velocity transforms
-    test_safety.py              # State machine, clamping, thread safety
-    test_isaaclab_policy.py     # Load, inference, dimension validation
-    test_beyondmimic_policy.py  # Geometry helpers, observation construction
-    test_sim_robot.py           # Impedance control, sensor mapping, DDS
-    test_controller.py          # Command building, key handling, lifecycle
-    test_real_robot.py          # DDS command/state, watchdog, CRC
-    test_logger.py              # HDF5/NPZ roundtrip, events, replay
-    test_viewer.py              # GLFW key map, viewer/headless runners
-    test_main.py                # CLI parsing, config integration, wiring
-    test_integration.py         # End-to-end headless pipeline tests
+    run_sim.sh                    # Simulation launcher
+    run_real.sh                   # Real robot launcher
+    run_eval.sh                   # Headless evaluation launcher
+    replay_log.py                 # Log replay CLI
+    gantry_sim.py                 # Gantry hang test (sim & real)
+    wrist_validation.py           # Wrist sinusoid tracking test
+    mirror_real_robot.py          # Mirror real robot state in MuJoCo
+  tests/                          # 393 tests
+    conftest.py                   # Shared fixtures, ONNX model helpers
+    test_config.py                # Constants, config loading, validation
+    test_compat.py                # RecurrentThread, SDK patching
+    test_gantry.py                # Gantry harness hanging test
+    test_joint_mapper.py          # Joint ordering, reordering roundtrips
+    test_observations.py          # Gravity projection, velocity transforms
+    test_safety.py                # State machine, clamping, thread safety
+    test_isaaclab_policy.py       # Load, inference, dimension validation
+    test_beyondmimic_policy.py    # Geometry helpers, observation construction
+    test_sim_robot.py             # Impedance control, sensor mapping, DDS
+    test_controller.py            # Command building, key handling, lifecycle
+    test_real_robot.py            # DDS command/state, watchdog, CRC
+    test_logger.py                # HDF5/NPZ roundtrip, events, replay
+    test_viewer.py                # GLFW key map, viewer/headless runners
+    test_main.py                  # CLI parsing, config integration, wiring
+    test_integration.py           # End-to-end headless pipeline tests
+    test_scaffolding.py           # Testing utilities
 ```
 
 ## Testing
@@ -271,7 +404,7 @@ unitree_launcher/
 pytest tests/ -v
 
 # Run with coverage
-pytest tests/ --cov=src --cov-report=term-missing
+pytest tests/ --cov=src/unitree_launcher --cov-report=term-missing
 
 # Skip slow tests
 pytest tests/ -m "not slow"

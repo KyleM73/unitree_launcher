@@ -1,0 +1,39 @@
+# Version control
+.git/
+.gitignore
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# Logs and artifacts
+logs/
+*.log
+MUJOCO_LOG.TXT
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Documentation (not needed in container)
+reference/
+PLAN_DOCKER.md
+PLAN_METAL.md
+SPEC.md
+TASK.md
+LOG.md
+WORK.md
+LICENSE
+
+# Lock files (re-resolved in container)
+uv.lock
+
+# Docker
+docker/
+.dockerignore

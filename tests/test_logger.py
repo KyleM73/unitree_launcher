@@ -7,11 +7,11 @@ import numpy as np
 import pytest
 import yaml
 
-from src.config import LoggingConfig
-from src.control.safety import SystemState
-from src.logging.logger import DataLogger, _state_to_int
-from src.logging.replay import LogReplay
-from src.robot.base import RobotCommand, RobotState
+from unitree_launcher.config import LoggingConfig
+from unitree_launcher.control.safety import SystemState
+from unitree_launcher.datalog.logger import DataLogger, _state_to_int
+from unitree_launcher.datalog.replay import LogReplay
+from unitree_launcher.robot.base import RobotCommand, RobotState
 
 
 # ---------------------------------------------------------------------------
@@ -101,7 +101,11 @@ class TestDataLoggerDirectory:
 
 class TestDataLoggerMetadata:
     def test_logger_writes_metadata(self, tmp_log_dir):
-        meta = {"robot": {"variant": "g1_29dof"}, "policy": {"format": "isaaclab"}}
+        meta = {
+            "robot": {"variant": "g1_29dof"},
+            "policy": {"format": "isaaclab"},
+            "control": {"policy_frequency": 50, "kp": 100.0, "kd": 10.0},
+        }
         logger = _make_logger(tmp_log_dir, metadata=meta)
         logger.start()
         logger.stop()
@@ -111,21 +115,7 @@ class TestDataLoggerMetadata:
         loaded = yaml.safe_load(meta_path.read_text())
         assert loaded["robot"]["variant"] == "g1_29dof"
         assert loaded["policy"]["format"] == "isaaclab"
-
-    def test_logger_metadata_contains_config(self, tmp_log_dir):
-        meta = {
-            "robot": {"variant": "g1_29dof", "n_dof": 29},
-            "policy": {"format": "isaaclab", "action_scale": 0.25},
-            "control": {"policy_frequency": 50, "kp": 100.0, "kd": 10.0},
-        }
-        logger = _make_logger(tmp_log_dir, metadata=meta)
-        logger.start()
-        logger.stop()
-
-        meta_path = Path(tmp_log_dir, "test_run", "metadata.yaml")
-        loaded = yaml.safe_load(meta_path.read_text())
         assert loaded["control"]["policy_frequency"] == 50
-        assert loaded["control"]["kp"] == 100.0
 
 
 class TestDataLoggerHDF5:
@@ -227,18 +217,6 @@ class TestDataLoggerEvents:
         assert events[0]["data"]["mode"] == "sim"
         assert events[1]["type"] == "estop"
         assert events[1]["data"]["reason"] == "orientation"
-        assert "timestamp" in events[0]
-
-    def test_logger_log_event(self, tmp_log_dir):
-        logger = _make_logger(tmp_log_dir)
-        logger.start()
-        logger.log_event("estop", {"reason": "orientation"})
-        logger.stop()
-
-        events_path = Path(tmp_log_dir, "test_run", "events.json")
-        events = json.loads(events_path.read_text())
-        assert len(events) == 1
-        assert events[0]["type"] == "estop"
         assert "timestamp" in events[0]
         assert isinstance(events[0]["timestamp"], float)
 

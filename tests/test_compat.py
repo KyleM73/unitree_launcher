@@ -5,7 +5,7 @@ from unittest import mock
 
 import pytest
 
-from src.compat import (
+from unitree_launcher.compat import (
     RecurrentThread,
     get_loopback_interface,
     patch_unitree_threading,
@@ -127,13 +127,13 @@ class TestRecurrentThread:
 class TestNetworkInterface:
     def test_get_loopback_interface_macos(self):
         """Returns lo0 on macOS."""
-        with mock.patch("src.compat.platform") as mock_plat:
+        with mock.patch("unitree_launcher.compat.platform") as mock_plat:
             mock_plat.system.return_value = "Darwin"
             assert get_loopback_interface() == "lo0"
 
     def test_get_loopback_interface_linux(self):
         """Returns lo on Linux."""
-        with mock.patch("src.compat.platform") as mock_plat:
+        with mock.patch("unitree_launcher.compat.platform") as mock_plat:
             mock_plat.system.return_value = "Linux"
             assert get_loopback_interface() == "lo"
 
@@ -160,7 +160,7 @@ class TestPatchUnitreeThreading:
 
     def test_patch_unitree_threading_linux_noop(self):
         """On Linux, patch_unitree_threading() is a no-op."""
-        with mock.patch("src.compat.platform") as mock_plat:
+        with mock.patch("unitree_launcher.compat.platform") as mock_plat:
             mock_plat.system.return_value = "Linux"
             # Should return immediately without touching SDK
             patch_unitree_threading()

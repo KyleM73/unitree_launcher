@@ -13,9 +13,9 @@ from typing import Dict, List, Optional
 import numpy as np
 import yaml
 
-from src.config import LoggingConfig
-from src.control.safety import SystemState
-from src.robot.base import RobotCommand, RobotState
+from unitree_launcher.config import LoggingConfig
+from unitree_launcher.control.safety import SystemState
+from unitree_launcher.robot.base import RobotCommand, RobotState
 
 
 class DataLogger:

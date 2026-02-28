@@ -51,7 +51,14 @@ class RecurrentThread:
             self._thread.join(timeout=2.0)
 
     def _run(self):
-        """Main loop: call target, sleep for interval, repeat."""
+        """Main loop: call target, wait for interval, repeat.
+
+        Uses a hybrid sleep strategy: sleep for most of the interval
+        then busy-wait for the remainder.  This avoids the macOS
+        scheduler rounding ``time.sleep(0.002)`` up to ~2.5 ms while
+        keeping CPU usage low for longer intervals.
+        """
+        next_tick = time.perf_counter() + self._interval
         while not self._stop_event.is_set():
             try:
                 self._target()
@@ -59,11 +66,20 @@ class RecurrentThread:
                 logger.exception(
                     "Exception in RecurrentThread '%s' target", self._name
                 )
-            # Sleep for the interval. If the target took longer than
-            # the interval, we just call it again immediately (no
-            # negative sleep, no accumulating delay).
-            elapsed = 0.0  # We don't measure elapsed here; sleep is best-effort
-            time.sleep(self._interval)
+            # Hybrid wait: coarse sleep then busy-wait for precision
+            now = time.perf_counter()
+            remaining = next_tick - now
+            if remaining > 0.001:
+                time.sleep(remaining - 0.001)
+            while time.perf_counter() < next_tick:
+                pass
+            # Advance next_tick to avoid drift accumulation
+            now = time.perf_counter()
+            if now - next_tick > self._interval:
+                # We fell behind — reset to avoid burst of catch-up calls
+                next_tick = now + self._interval
+            else:
+                next_tick += self._interval
 
 
 def get_loopback_interface() -> str:

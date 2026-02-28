@@ -1,14 +1,21 @@
 <mujoco model="g1_29dof">
-  <!-- Matches BeyondMimic training URDF/XML (g1_bm/g1.xml) dynamics.
-       Joint parameters (armature, frictionloss, solimplimit) replicate
-       the IsaacLab training environment.  Collision geometry and contact
-       pairs are from the training XML. -->
+  <!-- G1 29-DOF model matching mujocolab/mjlab (unitree_rl_mjlab) dynamics.
+       Position actuators with per-joint kp/kv derived from motor armature:
+         kp = armature * (10·2π)²,  kv = 2 * 2.0 * armature * (10·2π)
+       Armature from mjlab g1_constants.py via reflected_inertia_from_two_stage_planetary.
+       No dof_damping or frictionloss (damping is entirely from actuator kv).
+       BeyondMimic overrides kp/kv at runtime via actuator gainprm/biasprm.
+       Collision geometry and contact pairs from the training XML. -->
   <compiler angle="radian" meshdir="meshes" />
+
+  <visual>
+    <global offwidth="1920" offheight="1080"/>
+  </visual>
 
   <default>
     <default class="g1">
       <geom contype="0" conaffinity="0"/>
-      <joint frictionloss="0.1" solimplimit="0.97 0.995 0.001"/>
+      <joint solimplimit="0.97 0.995 0.001"/>
 
       <default class="hip">
         <default class="hip_pitch">
@@ -376,40 +383,48 @@
     </body>
   </worldbody>
 
+  <!-- Position actuators matching mjlab BuiltinPositionActuatorCfg.
+       kp/kv from motor armature: kp = armature*(10·2π)², kv = 4*armature*(10·2π).
+       forcerange = motor effort limit. ctrllimited=false (mjlab default). -->
   <actuator>
-    <motor name="left_hip_pitch" joint="left_hip_pitch_joint" ctrlrange="-88 88" />
-    <motor name="left_hip_roll" joint="left_hip_roll_joint" ctrlrange="-139 139" />
-    <motor name="left_hip_yaw" joint="left_hip_yaw_joint" ctrlrange="-88 88" />
-    <motor name="left_knee" joint="left_knee_joint" ctrlrange="-139 139" />
-    <motor name="left_ankle_pitch" joint="left_ankle_pitch_joint" ctrlrange="-50 50" />
-    <motor name="left_ankle_roll" joint="left_ankle_roll_joint" ctrlrange="-50 50" />
+    <!-- Left leg: 7520_14 / 7520_22 / 2×5020 -->
+    <position name="left_hip_pitch" joint="left_hip_pitch_joint" kp="40.18" kv="2.558" forcerange="-88 88"/>
+    <position name="left_hip_roll" joint="left_hip_roll_joint" kp="99.10" kv="6.309" forcerange="-139 139"/>
+    <position name="left_hip_yaw" joint="left_hip_yaw_joint" kp="40.18" kv="2.558" forcerange="-88 88"/>
+    <position name="left_knee" joint="left_knee_joint" kp="99.10" kv="6.309" forcerange="-139 139"/>
+    <position name="left_ankle_pitch" joint="left_ankle_pitch_joint" kp="28.50" kv="1.814" forcerange="-50 50"/>
+    <position name="left_ankle_roll" joint="left_ankle_roll_joint" kp="28.50" kv="1.814" forcerange="-50 50"/>
 
-    <motor name="right_hip_pitch" joint="right_hip_pitch_joint" ctrlrange="-88 88" />
-    <motor name="right_hip_roll" joint="right_hip_roll_joint" ctrlrange="-139 139" />
-    <motor name="right_hip_yaw" joint="right_hip_yaw_joint" ctrlrange="-88 88" />
-    <motor name="right_knee" joint="right_knee_joint" ctrlrange="-139 139" />
-    <motor name="right_ankle_pitch" joint="right_ankle_pitch_joint" ctrlrange="-50 50" />
-    <motor name="right_ankle_roll" joint="right_ankle_roll_joint" ctrlrange="-50 50" />
+    <!-- Right leg: 7520_14 / 7520_22 / 2×5020 -->
+    <position name="right_hip_pitch" joint="right_hip_pitch_joint" kp="40.18" kv="2.558" forcerange="-88 88"/>
+    <position name="right_hip_roll" joint="right_hip_roll_joint" kp="99.10" kv="6.309" forcerange="-139 139"/>
+    <position name="right_hip_yaw" joint="right_hip_yaw_joint" kp="40.18" kv="2.558" forcerange="-88 88"/>
+    <position name="right_knee" joint="right_knee_joint" kp="99.10" kv="6.309" forcerange="-139 139"/>
+    <position name="right_ankle_pitch" joint="right_ankle_pitch_joint" kp="28.50" kv="1.814" forcerange="-50 50"/>
+    <position name="right_ankle_roll" joint="right_ankle_roll_joint" kp="28.50" kv="1.814" forcerange="-50 50"/>
 
-    <motor name="waist_yaw" joint="waist_yaw_joint" ctrlrange="-88 88" />
-    <motor name="waist_roll" joint="waist_roll_joint" ctrlrange="-50 50" />
-    <motor name="waist_pitch" joint="waist_pitch_joint" ctrlrange="-50 50" />
+    <!-- Torso: 7520_14 / 2×5020 -->
+    <position name="waist_yaw" joint="waist_yaw_joint" kp="40.18" kv="2.558" forcerange="-88 88"/>
+    <position name="waist_roll" joint="waist_roll_joint" kp="28.50" kv="1.814" forcerange="-50 50"/>
+    <position name="waist_pitch" joint="waist_pitch_joint" kp="28.50" kv="1.814" forcerange="-50 50"/>
 
-    <motor name="left_shoulder_pitch" joint="left_shoulder_pitch_joint" ctrlrange="-25 25" />
-    <motor name="left_shoulder_roll" joint="left_shoulder_roll_joint" ctrlrange="-25 25" />
-    <motor name="left_shoulder_yaw" joint="left_shoulder_yaw_joint" ctrlrange="-25 25" />
-    <motor name="left_elbow" joint="left_elbow_joint" ctrlrange="-25 25" />
-    <motor name="left_wrist_roll" joint="left_wrist_roll_joint" ctrlrange="-25 25" />
-    <motor name="left_wrist_pitch" joint="left_wrist_pitch_joint" ctrlrange="-5 5" />
-    <motor name="left_wrist_yaw" joint="left_wrist_yaw_joint" ctrlrange="-5 5" />
+    <!-- Left arm: 5020 / 4010 -->
+    <position name="left_shoulder_pitch" joint="left_shoulder_pitch_joint" kp="14.25" kv="0.907" forcerange="-25 25"/>
+    <position name="left_shoulder_roll" joint="left_shoulder_roll_joint" kp="14.25" kv="0.907" forcerange="-25 25"/>
+    <position name="left_shoulder_yaw" joint="left_shoulder_yaw_joint" kp="14.25" kv="0.907" forcerange="-25 25"/>
+    <position name="left_elbow" joint="left_elbow_joint" kp="14.25" kv="0.907" forcerange="-25 25"/>
+    <position name="left_wrist_roll" joint="left_wrist_roll_joint" kp="14.25" kv="0.907" forcerange="-25 25"/>
+    <position name="left_wrist_pitch" joint="left_wrist_pitch_joint" kp="16.78" kv="1.068" forcerange="-5 5"/>
+    <position name="left_wrist_yaw" joint="left_wrist_yaw_joint" kp="16.78" kv="1.068" forcerange="-5 5"/>
 
-    <motor name="right_shoulder_pitch" joint="right_shoulder_pitch_joint" ctrlrange="-25 25" />
-    <motor name="right_shoulder_roll" joint="right_shoulder_roll_joint" ctrlrange="-25 25" />
-    <motor name="right_shoulder_yaw" joint="right_shoulder_yaw_joint" ctrlrange="-25 25" />
-    <motor name="right_elbow" joint="right_elbow_joint" ctrlrange="-25 25" />
-    <motor name="right_wrist_roll" joint="right_wrist_roll_joint" ctrlrange="-25 25" />
-    <motor name="right_wrist_pitch" joint="right_wrist_pitch_joint" ctrlrange="-5 5" />
-    <motor name="right_wrist_yaw" joint="right_wrist_yaw_joint" ctrlrange="-5 5" />
+    <!-- Right arm: 5020 / 4010 -->
+    <position name="right_shoulder_pitch" joint="right_shoulder_pitch_joint" kp="14.25" kv="0.907" forcerange="-25 25"/>
+    <position name="right_shoulder_roll" joint="right_shoulder_roll_joint" kp="14.25" kv="0.907" forcerange="-25 25"/>
+    <position name="right_shoulder_yaw" joint="right_shoulder_yaw_joint" kp="14.25" kv="0.907" forcerange="-25 25"/>
+    <position name="right_elbow" joint="right_elbow_joint" kp="14.25" kv="0.907" forcerange="-25 25"/>
+    <position name="right_wrist_roll" joint="right_wrist_roll_joint" kp="14.25" kv="0.907" forcerange="-25 25"/>
+    <position name="right_wrist_pitch" joint="right_wrist_pitch_joint" kp="16.78" kv="1.068" forcerange="-5 5"/>
+    <position name="right_wrist_yaw" joint="right_wrist_yaw_joint" kp="16.78" kv="1.068" forcerange="-5 5"/>
   </actuator>
 
   <sensor>

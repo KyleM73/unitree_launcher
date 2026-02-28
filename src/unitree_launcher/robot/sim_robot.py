@@ -17,21 +17,19 @@ from __future__ import annotations
 import logging
 import threading
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import mujoco
 import numpy as np
 
-from src.compat import RecurrentThread, resolve_network_interface, patch_unitree_threading
-from src.config import (
+from unitree_launcher.compat import RecurrentThread, resolve_network_interface, patch_unitree_threading
+from unitree_launcher.config import (
     Config,
     G1_29DOF_MUJOCO_JOINTS,
     G1_23DOF_MUJOCO_JOINTS,
-    TORQUE_LIMITS_29DOF,
-    TORQUE_LIMITS_23DOF,
     _get_joints_for_variant,
 )
-from src.robot.base import RobotCommand, RobotInterface, RobotState
+from unitree_launcher.robot.base import RobotCommand, RobotInterface, RobotState
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +37,7 @@ logger = logging.getLogger(__name__)
 _NUM_MOTOR_IDL_HG = 35
 
 # Asset root relative to this file
-_ASSETS_DIR = Path(__file__).resolve().parent.parent.parent / "assets"
+_ASSETS_DIR = Path(__file__).resolve().parent.parent.parent.parent / "assets"
 
 
 class SimRobot(RobotInterface):
@@ -92,18 +90,11 @@ class SimRobot(RobotInterface):
             self._qpos_addr[cfg_idx] = self._model.jnt_qposadr[jnt_id]
             self._dof_addr[cfg_idx] = self._model.jnt_dofadr[jnt_id]
 
-        # Non-controlled MuJoCo actuator indices (for damping in 23-DOF mode)
+        # Non-controlled MuJoCo actuator indices (for 23-DOF mode)
         controlled_set = set(self._cfg_to_mj.tolist())
         self._non_controlled_mj = np.array(
             [i for i in range(self._num_motor) if i not in controlled_set],
             dtype=np.intp,
-        )
-
-        # Per-joint torque limits for clamping computed PD torques
-        torque_lim_dict = TORQUE_LIMITS_29DOF if variant == "g1_29dof" else TORQUE_LIMITS_23DOF
-        self._torque_max = np.array(
-            [torque_lim_dict[self._cfg_joints[i]] for i in range(self._n_dof)],
-            dtype=np.float64,
         )
 
         # Sensor data layout: pos[0:nm], vel[nm:2*nm], torque[2*nm:3*nm], IMU, frame
@@ -117,6 +108,9 @@ class SimRobot(RobotInterface):
 
         # Pending command for per-substep PD (set by send_command, applied in step)
         self._pending_cmd: Optional[RobotCommand] = None
+
+        # Optional per-substep callback (e.g. for elastic band forces)
+        self._substep_callback: Optional[Callable[[mujoco.MjModel, mujoco.MjData], None]] = None
 
         # DDS state (lazy init in connect())
         self._dds_initialized = False
@@ -198,49 +192,46 @@ class SimRobot(RobotInterface):
     def send_command(self, cmd: RobotCommand) -> None:
         """Store command for the next ``step()`` call.
 
-        The actual PD control law is computed inside ``step()`` at each
-        physics substep, reading from ``qpos``/``qvel`` (not sensordata).
-        This avoids a one-step state lag that destabilizes high-gain PD:
-        after ``mj_step``, sensordata reflects the *pre*-integration state
-        while ``qpos``/``qvel`` reflect the *post*-integration state.
+        At the start of ``step()``, the command's target positions are
+        written to ``data.ctrl`` and kp/kd are applied to the position
+        actuator's gainprm/biasprm.  MuJoCo computes PD forces internally
+        at each physics substep, reading the latest ``qpos``/``qvel``.
         """
         self._pending_cmd = cmd
 
-    def _apply_pd(self, cmd: RobotCommand) -> None:
-        """Apply impedance control law via MuJoCo ``qfrc_applied``.
+    def _apply_cmd(self, cmd: RobotCommand) -> None:
+        """Apply command through MuJoCo position actuators.
 
-        Reads joint state from ``qpos``/``qvel`` (current, post-integration)
-        rather than ``sensordata`` (lagged, pre-integration) for accurate
-        high-rate PD.  Torques are written to ``qfrc_applied`` (generalized
-        forces at DOF level) which bypasses actuator ``ctrlrange`` limits.
+        Sets target positions via ``data.ctrl`` and updates per-actuator
+        kp/kv (``gainprm``/``biasprm``) from the command's kp/kd arrays.
+        MuJoCo computes the PD force internally at each physics substep:
 
-        For each controlled joint i (in config order):
-            qfrc_applied[dof_i] = clamp(tau_ff + kp * (q_des - q) + kd * (dq_des - dq))
+            actuator_force = kp * (ctrl - q) - kv * dq
 
-        Non-controlled joints (23-DOF mode) get passive damping:
-            qfrc_applied[dof_i] = -kd_damp * dq
+        Force is clamped by the actuator's ``forcerange`` (matching motor
+        torque limits).  Torque feedforward is added via ``qfrc_applied``.
+
+        Non-controlled joints (23-DOF mode) keep their XML-default kp/kv.
         """
-        self._data.ctrl[:] = 0.0
+        self._data.qfrc_applied[:] = 0.0
 
         for cfg_i in range(self._n_dof):
-            dof_i = self._dof_addr[cfg_i]
-            q_actual = self._data.qpos[self._qpos_addr[cfg_i]]
-            dq_actual = self._data.qvel[dof_i]
-            tau = (
-                cmd.joint_torques[cfg_i]
-                + cmd.kp[cfg_i] * (cmd.joint_positions[cfg_i] - q_actual)
-                + cmd.kd[cfg_i] * (cmd.joint_velocities[cfg_i] - dq_actual)
-            )
-            limit = self._torque_max[cfg_i]
-            self._data.qfrc_applied[dof_i] = max(-limit, min(limit, tau))
+            mj_i = self._cfg_to_mj[cfg_i]
 
-        # Damp non-controlled joints
-        kd_damp = self._config.control.kd_damp
-        for mj_i in self._non_controlled_mj:
-            act_joint_id = self._model.actuator_trnid[mj_i, 0]
-            dof_i = self._model.jnt_dofadr[act_joint_id]
-            dq = self._data.qvel[dof_i]
-            self._data.qfrc_applied[dof_i] = -kd_damp * dq
+            # Set target position for the position actuator
+            self._data.ctrl[mj_i] = float(cmd.joint_positions[cfg_i])
+
+            # Update actuator gains: kp -> gainprm[0], -kp -> biasprm[1], -kd -> biasprm[2]
+            kp = float(cmd.kp[cfg_i])
+            kd = float(cmd.kd[cfg_i])
+            self._model.actuator_gainprm[mj_i, 0] = kp
+            self._model.actuator_biasprm[mj_i, 1] = -kp
+            self._model.actuator_biasprm[mj_i, 2] = -kd
+
+            # Feedforward torque via qfrc_applied (not subject to actuator forcerange)
+            tau_ff = float(cmd.joint_torques[cfg_i])
+            if tau_ff != 0.0:
+                self._data.qfrc_applied[self._dof_addr[cfg_i]] = tau_ff
 
     def get_gravity_compensation(self) -> np.ndarray:
         """Get per-joint gravity compensation torques in config order.
@@ -254,19 +245,35 @@ class SimRobot(RobotInterface):
             grav[cfg_i] = self._data.qfrc_bias[dof_idx]
         return grav
 
+    def set_substep_callback(
+        self, fn: Callable[[mujoco.MjModel, mujoco.MjData], None] | None
+    ) -> None:
+        """Register a callback invoked before each physics substep.
+
+        Use this to apply external forces (e.g. elastic band) without
+        reaching into SimRobot internals.  Pass ``None`` to clear.
+        """
+        self._substep_callback = fn
+
     def step(self) -> None:
         """Advance simulation by one policy timestep (multiple physics substeps).
 
-        PD torques are recomputed from ``qpos``/``qvel`` at each substep
-        for numerical stability with high-gain control (200 Hz PD vs 50 Hz
-        policy).  The command targets (positions, velocities, gains) are
-        held constant across substeps — only the measured state changes.
+        Position actuators compute PD forces internally at each ``mj_step``
+        call, reading the latest ``qpos``/``qvel``.  We only need to set
+        ``ctrl`` and actuator gains once per policy step.
+
+        If a substep callback is registered (via ``set_substep_callback``),
+        it is called before each ``mj_step`` — used for external forces
+        like the elastic band.
         """
         cmd = self._pending_cmd
+        cb = self._substep_callback
         with self._lock:
+            if cmd is not None:
+                self._apply_cmd(cmd)
             for _ in range(self._substeps):
-                if cmd is not None:
-                    self._apply_pd(cmd)
+                if cb is not None:
+                    cb(self._model, self._data)
                 mujoco.mj_step(self._model, self._data)
 
     def reset(self, initial_state: Optional[RobotState] = None) -> None:
@@ -308,6 +315,27 @@ class SimRobot(RobotInterface):
         for cfg_i in range(self._n_dof):
             dof_idx = self._dof_addr[cfg_i]
             self._model.dof_armature[dof_idx] = armature_native_order[cfg_i]
+
+    def set_actuator_gains(self, kp: float | np.ndarray, kv: float | np.ndarray) -> None:
+        """Set per-joint actuator kp/kv in the MuJoCo model.
+
+        Updates the position actuator's gainprm/biasprm for each controlled
+        joint.  This is used to match the training environment's gains when
+        switching policies (e.g. BeyondMimic vs IsaacLab).
+
+        Args:
+            kp: Position gain — scalar or array in config order.
+            kv: Velocity gain — scalar or array in config order.
+        """
+        kp_scalar = np.isscalar(kp)
+        kv_scalar = np.isscalar(kv)
+        for cfg_i in range(self._n_dof):
+            mj_i = self._cfg_to_mj[cfg_i]
+            _kp = float(kp) if kp_scalar else float(kp[cfg_i])
+            _kv = float(kv) if kv_scalar else float(kv[cfg_i])
+            self._model.actuator_gainprm[mj_i, 0] = _kp
+            self._model.actuator_biasprm[mj_i, 1] = -_kp
+            self._model.actuator_biasprm[mj_i, 2] = -_kv
 
     def set_reference_pose(
         self,

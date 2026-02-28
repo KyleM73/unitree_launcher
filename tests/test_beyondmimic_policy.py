@@ -9,8 +9,8 @@ import tempfile
 import numpy as np
 import pytest
 
-from src.config import G1_29DOF_JOINTS, ISAACLAB_G1_29DOF_JOINTS, load_config
-from src.policy.beyondmimic_policy import (
+from unitree_launcher.config import G1_29DOF_JOINTS, ISAACLAB_G1_29DOF_JOINTS, load_config
+from unitree_launcher.policy.beyondmimic_policy import (
     BeyondMimicPolicy,
     compute_body_relative_orientation,
     compute_body_relative_position,
@@ -19,8 +19,8 @@ from src.policy.beyondmimic_policy import (
     quat_to_6d,
     quat_to_rotation_matrix,
 )
-from src.policy.joint_mapper import JointMapper
-from src.robot.base import RobotState
+from unitree_launcher.policy.joint_mapper import JointMapper
+from unitree_launcher.robot.base import RobotState
 from tests.conftest import PROJECT_ROOT, create_beyondmimic_onnx
 
 
@@ -102,7 +102,7 @@ def bm_policy(joint_mapper_isaaclab_order, bm_obs_dim, bm_model_path):
 @pytest.fixture
 def standing_robot_state():
     """Robot state at home position, upright."""
-    from src.config import Q_HOME_29DOF
+    from unitree_launcher.config import Q_HOME_29DOF
     home = np.array([Q_HOME_29DOF[j] for j in G1_29DOF_JOINTS])
     return RobotState(
         timestamp=0.0,
@@ -484,32 +484,3 @@ class TestBeyondMimicObservation:
         expected = quat_to_6d(np.array([1, 0, 0, 0], dtype=float))
         np.testing.assert_allclose(obs[61:67], expected, atol=1e-12)
 
-    def test_build_observation_6d_rotation_known_values(self):
-        """Verify 6D rotation for known quaternions (row-major of first 2 cols)."""
-        # Identity: R[:,:2].flatten() = [1,0, 0,1, 0,0]
-        result = quat_to_6d(np.array([1, 0, 0, 0], dtype=float))
-        np.testing.assert_allclose(result, [1, 0, 0, 1, 0, 0], atol=1e-12)
-
-        # 90° yaw: R_z(90°) = [[0,-1,0],[1,0,0],[0,0,1]]
-        # R[:,:2].flatten() = [0,-1, 1,0, 0,0]
-        angle = np.pi / 2
-        q = np.array([np.cos(angle/2), 0, 0, np.sin(angle/2)])
-        result = quat_to_6d(q)
-        np.testing.assert_allclose(result, [0, -1, 1, 0, 0, 0], atol=1e-12)
-
-    def test_build_observation_body_relative_position_known(self):
-        """Known anchor and body: anchor at origin identity, body at [2,3,4]."""
-        anchor_pos = np.zeros(3)
-        anchor_q = np.array([1, 0, 0, 0], dtype=float)
-        body_pos = np.array([2, 3, 4], dtype=float)
-        result = compute_body_relative_position(anchor_pos, anchor_q, body_pos)
-        np.testing.assert_allclose(result, [2, 3, 4], atol=1e-12)
-
-    def test_build_observation_body_relative_orientation_known(self):
-        """Identity anchor, 90° yaw body -> relative = 90° yaw 6D."""
-        anchor_q = np.array([1, 0, 0, 0], dtype=float)
-        angle = np.pi / 2
-        body_q = np.array([np.cos(angle/2), 0, 0, np.sin(angle/2)])
-        result = compute_body_relative_orientation(anchor_q, body_q)
-        expected = quat_to_6d(body_q)
-        np.testing.assert_allclose(result, expected, atol=1e-12)

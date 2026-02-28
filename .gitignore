@@ -31,6 +31,10 @@ logs/
 # MuJoCo
 MUJOCO_LOG.TXT
 
+# Media artifacts
+*.mp4
+*.png
+
 # Diagnostic scripts
 diag_*.py
 

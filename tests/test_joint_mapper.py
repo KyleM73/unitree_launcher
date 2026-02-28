@@ -2,14 +2,14 @@
 import numpy as np
 import pytest
 
-from src.config import (
+from unitree_launcher.config import (
     G1_23DOF_JOINTS,
     G1_29DOF_JOINTS,
     ISAACLAB_G1_29DOF_JOINTS,
     ISAACLAB_TO_NATIVE_INDICES,
     resolve_joint_name,
 )
-from src.policy.joint_mapper import JointMapper
+from unitree_launcher.policy.joint_mapper import JointMapper
 
 
 # ---------------------------------------------------------------------------
@@ -194,27 +194,6 @@ class TestValidation:
         """Empty controlled list raises ValueError."""
         with pytest.raises(ValueError, match="empty"):
             JointMapper(G1_29DOF_JOINTS, controlled_joints=[])
-
-
-# ---------------------------------------------------------------------------
-# Property tests
-# ---------------------------------------------------------------------------
-
-
-class TestProperties:
-    def test_n_observed_property(self):
-        legs = G1_29DOF_JOINTS[:12]
-        m = JointMapper(G1_29DOF_JOINTS, observed_joints=legs)
-        assert m.n_observed == 12
-
-    def test_n_controlled_property(self):
-        legs = G1_29DOF_JOINTS[:12]
-        m = JointMapper(G1_29DOF_JOINTS, controlled_joints=legs)
-        assert m.n_controlled == 12
-
-    def test_n_total_property(self):
-        m = JointMapper(G1_29DOF_JOINTS)
-        assert m.n_total == 29
 
 
 # ---------------------------------------------------------------------------

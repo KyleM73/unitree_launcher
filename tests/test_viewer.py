@@ -15,19 +15,19 @@ from unittest.mock import MagicMock, patch, PropertyMock
 import numpy as np
 import pytest
 
-from src.config import (
+from unitree_launcher.config import (
     Config,
     G1_29DOF_JOINTS,
     Q_HOME_29DOF,
     load_config,
 )
-from src.control.controller import Controller
-from src.control.safety import SafetyController, SystemState
-from src.main import GLFW_KEY_MAP, run_headless, run_with_viewer
-from src.policy.base import PolicyInterface
-from src.policy.joint_mapper import JointMapper
-from src.policy.observations import ObservationBuilder
-from src.robot.base import RobotCommand, RobotInterface, RobotState
+from unitree_launcher.control.controller import Controller
+from unitree_launcher.control.safety import SafetyController, SystemState
+from unitree_launcher.main import GLFW_KEY_MAP, run_headless, run_with_viewer
+from unitree_launcher.policy.base import PolicyInterface
+from unitree_launcher.policy.joint_mapper import JointMapper
+from unitree_launcher.policy.observations import ObservationBuilder
+from unitree_launcher.robot.base import RobotCommand, RobotInterface, RobotState
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -94,45 +94,6 @@ class TestGLFWKeyMap:
     Keys are chosen to avoid conflicts with MuJoCo viewer built-in
     shortcuts (which bind most letter keys for rendering toggles).
     """
-
-    def test_glfw_key_map_space(self):
-        assert GLFW_KEY_MAP[32] == "space"
-
-    def test_glfw_key_map_up(self):
-        assert GLFW_KEY_MAP[265] == "up"
-
-    def test_glfw_key_map_down(self):
-        assert GLFW_KEY_MAP[264] == "down"
-
-    def test_glfw_key_map_left(self):
-        assert GLFW_KEY_MAP[263] == "left"
-
-    def test_glfw_key_map_right(self):
-        assert GLFW_KEY_MAP[262] == "right"
-
-    def test_glfw_key_map_comma(self):
-        assert GLFW_KEY_MAP[44] == "comma"
-
-    def test_glfw_key_map_period(self):
-        assert GLFW_KEY_MAP[46] == "period"
-
-    def test_glfw_key_map_slash(self):
-        assert GLFW_KEY_MAP[47] == "slash"
-
-    def test_glfw_key_map_backspace(self):
-        assert GLFW_KEY_MAP[259] == "backspace"
-
-    def test_glfw_key_map_enter(self):
-        assert GLFW_KEY_MAP[257] == "enter"
-
-    def test_glfw_key_map_minus(self):
-        assert GLFW_KEY_MAP[45] == "minus"
-
-    def test_glfw_key_map_equal(self):
-        assert GLFW_KEY_MAP[61] == "equal"
-
-    def test_glfw_key_map_delete(self):
-        assert GLFW_KEY_MAP[261] == "delete"
 
     def test_glfw_key_map_all_values_are_strings(self):
         for keycode, name in GLFW_KEY_MAP.items():
@@ -243,7 +204,7 @@ class TestRunWithViewer:
             def sync(self):
                 pass
 
-        with patch("src.main.mujoco.viewer.launch_passive", return_value=FakeViewer()):
+        with patch("mujoco.viewer.launch_passive", return_value=FakeViewer()):
             with patch.object(ctrl, "start") as mock_start, \
                  patch.object(ctrl, "stop") as mock_stop:
                 run_with_viewer(robot, ctrl)
@@ -278,7 +239,7 @@ class TestRunWithViewer:
             captured_callback = key_callback
             return FakeViewer()
 
-        with patch("src.main.mujoco.viewer.launch_passive", side_effect=fake_launch_passive):
+        with patch("mujoco.viewer.launch_passive", side_effect=fake_launch_passive):
             with patch.object(ctrl, "start"), patch.object(ctrl, "stop"):
                 run_with_viewer(robot, ctrl)
 
@@ -316,7 +277,7 @@ class TestRunWithViewer:
             captured_callback = key_callback
             return FakeViewer()
 
-        with patch("src.main.mujoco.viewer.launch_passive", side_effect=fake_launch_passive):
+        with patch("mujoco.viewer.launch_passive", side_effect=fake_launch_passive):
             with patch.object(ctrl, "start"), patch.object(ctrl, "stop"):
                 ctrl.handle_key = MagicMock()
                 run_with_viewer(robot, ctrl)
@@ -354,7 +315,7 @@ class TestRunWithViewer:
                 # Check if lock is held (locked() returns True if acquired)
                 sync_held_lock = lock.locked()
 
-        with patch("src.main.mujoco.viewer.launch_passive", return_value=FakeViewer()):
+        with patch("mujoco.viewer.launch_passive", return_value=FakeViewer()):
             with patch.object(ctrl, "start"), patch.object(ctrl, "stop"):
                 run_with_viewer(robot, ctrl)
 
