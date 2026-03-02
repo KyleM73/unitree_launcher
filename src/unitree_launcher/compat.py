@@ -102,6 +102,20 @@ def resolve_network_interface(config_value: str) -> str:
     return config_value
 
 
+def patch_unitree_b2_import():
+    """Prevent unitree_sdk2py from importing nonexistent 'b2' submodule.
+
+    The upstream unitree_sdk2py __init__.py imports ``b2``, which doesn't
+    exist and causes an ImportError.  We block the import by injecting
+    an empty stub module before unitree_sdk2py is imported.
+
+    This function is idempotent — safe to call multiple times.
+    """
+    b2_name = "unitree_sdk2py.b2"
+    if b2_name not in sys.modules:
+        sys.modules[b2_name] = types.ModuleType(b2_name)
+
+
 def patch_unitree_threading():
     """Monkey-patch unitree SDK to use our RecurrentThread on macOS.
 

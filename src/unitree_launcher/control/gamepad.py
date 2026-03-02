@@ -191,3 +191,18 @@ class GamepadMonitor:
                 self._clear_held = False
 
             time.sleep(1.0 / self._poll_hz)
+
+
+def start_gamepad(safety, debug: bool = False):
+    """Create and start a GamepadMonitor, or return None on failure.
+
+    Convenience function used by main.py and scripts. Catches import
+    errors (hidapi not installed) and device-not-found gracefully.
+    """
+    try:
+        monitor = GamepadMonitor(safety, debug=debug)
+        monitor.start()
+        return monitor
+    except Exception as exc:
+        print(f"[gamepad] WARNING: init failed: {exc}. Continuing without gamepad.")
+        return None

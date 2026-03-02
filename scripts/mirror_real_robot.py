@@ -23,7 +23,8 @@ import time
 import mujoco.viewer
 import numpy as np
 
-from unitree_launcher.compat import patch_unitree_threading, resolve_network_interface
+from unitree_launcher.compat import patch_unitree_b2_import, patch_unitree_threading, resolve_network_interface
+patch_unitree_b2_import()
 from unitree_launcher.mirror import RealtimeMirror
 from unitree_launcher.robot.base import RobotState
 

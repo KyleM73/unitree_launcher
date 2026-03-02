@@ -148,6 +148,47 @@ docker run --rm --network host \
 docker compose -f docker/docker-compose.yml --profile test run --rm test
 ```
 
+## Web Viewer (Viser)
+
+The `--viser` flag launches a web-based 3D viewer using [viser](https://viser.studio). The robot scene streams over WebSockets to any browser -- ideal for Docker on macOS, remote servers, or headless-with-monitoring use cases.
+
+### Local Usage
+
+```bash
+python -m unitree_launcher.main sim --policy path/to/policy.onnx --viser
+# Open http://localhost:8080 in your browser
+```
+
+### Custom Port
+
+```bash
+python -m unitree_launcher.main sim --policy path/to/policy.onnx --viser 9090
+```
+
+### Docker on macOS
+
+```bash
+docker compose -f docker/docker-compose.yml --profile viser run --rm --service-ports sim-viser \
+    sim --headless --policy assets/policies/stance_29dof.onnx --viser --duration 30
+# Open http://localhost:8080 in your host browser
+```
+
+### GUI Controls
+
+The viser sidebar provides interactive controls:
+
+| Control | Action |
+|---------|--------|
+| **Start / Stop** button | Toggle policy (same as Space in GLFW) |
+| **E-STOP** button | Emergency stop (same as Backspace) |
+| **Clear E-stop** button | Clear E-stop (same as Enter) |
+| **Reset** button | Reset robot to home position |
+| **vx / vy / yaw** sliders | Continuous velocity commands |
+| **Zero Velocity** button | Zero all velocity commands |
+| **Prev / Next Policy** buttons | Cycle through `--policy-dir` |
+
+The status panel shows current system state, sim time, velocity commands, and active policy name.
+
 ## Quick Start
 
 ### Simulation with Viewer
@@ -223,6 +264,7 @@ python -m unitree_launcher.main {sim,real} [options]
 | `--log-dir DIR` | `logs/` | Log output directory |
 | `--no-log` | false | Disable logging |
 | `--no-est` | false | Omit base linear velocity from observations |
+| `--viser [PORT]` | none | Web viewer on PORT (default: 8080) |
 
 ### Sim-only Arguments
 
@@ -356,9 +398,12 @@ unitree_launcher/
     control/
       controller.py               # Main control loop (50 Hz), command building
       safety.py                   # State machine, E-stop, command clamping
-    logging/
+    datalog/
       logger.py                   # HDF5/NPZ time-series logging
       replay.py                   # Log loading, CSV export, summary
+    viz/
+      viser_viewer.py             # Viser web-based 3D viewer
+      conversions.py              # MuJoCo geom to trimesh conversion
   configs/
     default.yaml                  # Default configuration
     g1_29dof.yaml                 # 29-DOF variant
@@ -418,7 +463,7 @@ pytest tests/test_controller.py -v
 ```
                     +-----------+
   Keyboard ------->| Controller|-------> DataLogger
-  (GLFW keys)      |  (50 Hz)  |         (HDF5/NPZ)
+  (GLFW/Viser)     |  (50 Hz)  |         (HDF5/NPZ)
                     +-----+-----+
                           |
               +-----------+-----------+
@@ -438,6 +483,10 @@ pytest tests/test_controller.py -v
               +-----------+-----------+
               |                       |
         MuJoCo (sim)           DDS (real)
+              |
+     +--------+--------+
+     |                  |
+  GLFW viewer    Viser (web)
 ```
 
 ### Threading Model

@@ -10,11 +10,11 @@ Press Space to start the BM policy (just like the normal viewer).
 Close the viewer window to stop and generate the plot.
 
 Usage:
-    mjpython scripts/validate_estimator.py [--duration 10] [--output estimator_validation.png]
+    mjpython scripts/tests/test_estimator.py --gui [--output estimator_validation.png]
+    python scripts/tests/test_estimator.py --viser
 """
 from __future__ import annotations
 
-import argparse
 import queue
 import time
 from pathlib import Path
@@ -25,8 +25,9 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-# Patch SDK threading before any unitree imports.
-from unitree_launcher.compat import patch_unitree_threading
+# Patch SDK before any unitree imports.
+from unitree_launcher.compat import patch_unitree_b2_import, patch_unitree_threading
+patch_unitree_b2_import()
 patch_unitree_threading()
 
 from unitree_launcher.config import (
@@ -202,79 +203,17 @@ def build_sim(policy_path: str):
 # Viewer loop (mirrors main.py run_with_viewer)
 # ---------------------------------------------------------------------------
 
-def run_with_viewer(robot, controller, safety, stance_before=5.0, stance_after=5.0, recorder=None):
-    """Run with MuJoCo viewer.
+def _run_automated_sequence(
+    robot, controller, safety,
+    stance_before, stance_after, recorder,
+    viewer_sync=None, sleep_hz=50.0,
+):
+    """Shared automated BM sequence used by all viewer modes.
 
-    Automated sequence:
-        1. Stance (default policy) for ``stance_before`` seconds
-        2. Auto-start BM policy (simulates pressing Space)
-        3. BM walks until trajectory ends (controller auto-returns to stance)
-        4. Stance for ``stance_after`` seconds
-        5. Stop and close viewer
-
-    Manual keys still work (Space, Backspace, etc.) if you want to
-    override the automation.
+    Args:
+        viewer_sync: Callable to update the viewer each tick (or None).
+        sleep_hz: Loop frequency.
     """
-    import mujoco.viewer
-
-    key_queue: queue.SimpleQueue = queue.SimpleQueue()
-
-    def key_callback(keycode):
-        key = GLFW_KEY_MAP.get(keycode)
-        if key:
-            key_queue.put(key)
-
-    start = time.time()
-    bm_started = False
-    bm_ended = False
-    bm_end_time = None
-
-    with mujoco.viewer.launch_passive(
-        robot.mj_model, robot.mj_data, key_callback=key_callback,
-    ) as viewer:
-        controller.start()
-        try:
-            while viewer.is_running():
-                # Drain manual key events
-                while not key_queue.empty():
-                    controller.handle_key(key_queue.get_nowait())
-
-                with robot.lock:
-                    viewer.sync()
-                # Capture OUTSIDE the lock — never block the control thread.
-                if recorder:
-                    recorder.capture(robot.mj_data)
-
-                elapsed = time.time() - start
-
-                # Phase 1 → 2: auto-start BM after stance_before seconds
-                if not bm_started and elapsed >= stance_before:
-                    bm_started = True
-                    safety.start()
-                    print(f"[val] t={elapsed:.1f}s: Auto-starting BM policy")
-
-                # Phase 2 → 3: detect BM trajectory end
-                if bm_started and not bm_ended:
-                    if safety.state == SystemState.STOPPED:
-                        bm_ended = True
-                        bm_end_time = time.time()
-                        print(f"[val] t={elapsed:.1f}s: BM trajectory ended, "
-                              f"stance for {stance_after:.0f}s more")
-
-                # Phase 3 → done: stop after stance_after seconds post-BM
-                if bm_ended and (time.time() - bm_end_time) >= stance_after:
-                    print(f"[val] t={elapsed:.1f}s: Post-BM stance complete. Stopping.")
-                    break
-
-                time.sleep(1.0 / 100.0)
-        except KeyboardInterrupt:
-            pass
-        finally:
-            controller.stop()
-
-
-def run_headless(robot, controller, safety, stance_before=5.0, stance_after=5.0, recorder=None):
-    """Run without viewer (same automated sequence as run_with_viewer)."""
     start = time.time()
     bm_started = False
     bm_ended = False
@@ -283,7 +222,9 @@ def run_headless(robot, controller, safety, stance_before=5.0, stance_after=5.0,
     controller.start()
     try:
         while True:
-            # Capture outside any lock — never block the control thread.
+            if viewer_sync is not None:
+                viewer_sync()
+
             if recorder:
                 recorder.capture(robot.mj_data)
 
@@ -305,11 +246,64 @@ def run_headless(robot, controller, safety, stance_before=5.0, stance_after=5.0,
                 print(f"[val] t={elapsed:.1f}s: Post-BM stance complete. Stopping.")
                 break
 
-            time.sleep(0.05)
+            time.sleep(1.0 / sleep_hz)
     except KeyboardInterrupt:
         pass
     finally:
         controller.stop()
+
+
+def run_with_viewer(robot, controller, safety, stance_before=5.0, stance_after=5.0, recorder=None):
+    """Run with MuJoCo viewer."""
+    import mujoco.viewer
+
+    key_queue: queue.SimpleQueue = queue.SimpleQueue()
+
+    def key_callback(keycode):
+        key = GLFW_KEY_MAP.get(keycode)
+        if key:
+            key_queue.put(key)
+
+    with mujoco.viewer.launch_passive(
+        robot.mj_model, robot.mj_data, key_callback=key_callback,
+    ) as viewer:
+        def sync():
+            while not key_queue.empty():
+                controller.handle_key(key_queue.get_nowait())
+            with robot.lock:
+                viewer.sync()
+
+        _run_automated_sequence(
+            robot, controller, safety, stance_before, stance_after,
+            recorder, viewer_sync=sync, sleep_hz=100.0,
+        )
+
+
+def run_with_viser(robot, controller, safety, port=8080, stance_before=5.0, stance_after=5.0, recorder=None):
+    """Run with viser web viewer."""
+    from unitree_launcher.viz.viser_viewer import ViserViewer
+
+    viser = ViserViewer(robot.mj_model, port=port)
+    viser.setup()
+
+    def sync():
+        viser.update(robot.mj_data, robot.lock)
+
+    try:
+        _run_automated_sequence(
+            robot, controller, safety, stance_before, stance_after,
+            recorder, viewer_sync=sync, sleep_hz=50.0,
+        )
+    finally:
+        viser.close()
+
+
+def run_headless(robot, controller, safety, stance_before=5.0, stance_after=5.0, recorder=None):
+    """Run without viewer."""
+    _run_automated_sequence(
+        robot, controller, safety, stance_before, stance_after,
+        recorder, viewer_sync=None, sleep_hz=50.0,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -480,27 +474,35 @@ def make_plot(data: dict, output_path: str):
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Validate InEKF estimator vs MuJoCo GT")
-    parser.add_argument("--stance-before", type=float, default=5.0,
+    from unitree_launcher.script_utils import build_script_parser
+
+    def _extra(p):
+        p.add_argument("--stance-before", type=float, default=5.0,
                         help="Seconds of stance before BM starts (default: 5)")
-    parser.add_argument("--stance-after", type=float, default=5.0,
+        p.add_argument("--stance-after", type=float, default=5.0,
                         help="Seconds of stance after BM ends (default: 5)")
-    parser.add_argument("--policy", default="assets/policies/beyondmimic_29dof.onnx",
+        p.add_argument("--policy", default="assets/policies/beyondmimic_29dof.onnx",
                         help="Path to BM policy ONNX file")
-    parser.add_argument("--headless", action="store_true",
-                        help="Run without MuJoCo viewer")
-    parser.add_argument("--output", "-o", default="estimator_validation.png",
+        p.add_argument("--output", "-o", default="estimator_validation.png",
                         help="Output PNG path (default: estimator_validation.png)")
-    parser.add_argument("--record", nargs="?", const="sim.mp4", default=None,
-                        metavar="PATH",
-                        help="Record video to MP4 (default: recording.mp4)")
+
+    parser = build_script_parser(
+        "Validate InEKF estimator vs MuJoCo GT",
+        sim_only=True, extra_args_fn=_extra,
+    )
     args = parser.parse_args()
 
     robot, controller, safety, estimator = build_sim(args.policy)
 
+    # ---- Gamepad e-stop ----
+    gamepad_monitor = None
+    if args.gamepad:
+        from unitree_launcher.control.gamepad import start_gamepad
+        gamepad_monitor = start_gamepad(safety)
+
     print(f"[val] Sequence: {args.stance_before}s stance -> BM trajectory -> "
           f"{args.stance_after}s stance -> plot")
-    if not args.headless:
+    if args.gui:
         print(f"[val] Viewer will open. Close window early to stop & generate plot.")
 
     # ---- Video recorder ----
@@ -513,13 +515,21 @@ def main():
             step_fn=lambda: controller.sim_step_count,
         )
 
-    run_fn = run_headless if args.headless else run_with_viewer
+    if args.gui:
+        run_fn = run_with_viewer
+    elif args.viser:
+        def run_fn(r, c, s, **kw):
+            return run_with_viser(r, c, s, port=args.port, **kw)
+    else:
+        run_fn = run_headless
     try:
         run_fn(robot, controller, safety,
                stance_before=args.stance_before,
                stance_after=args.stance_after,
                recorder=recorder)
     finally:
+        if gamepad_monitor is not None:
+            gamepad_monitor.stop()
         if recorder:
             recorder.close()
         robot.disconnect()

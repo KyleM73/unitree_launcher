@@ -223,6 +223,10 @@ class Controller:
                 glob.glob(os.path.join(policy_dir, "*.onnx"))
             )
 
+        # Pre-loaded policy objects: {path: (policy, mapper, obs_builder)}
+        # Populated by main() at startup for instant switching.
+        self._preloaded_policies: Dict[str, Tuple] = {}
+
         # Auto-termination
         self._max_steps = max_steps
         self._max_duration = max_duration
@@ -336,22 +340,68 @@ class Controller:
             return dict(self._telemetry)
 
     def reload_policy(self, policy_path: str) -> None:
-        """Load a new ONNX active policy. Stops control loop if running.
+        """Switch to a pre-loaded active policy by path.
 
-        Thread-safe. After reload, the policy and internal state are reset.
+        Looks up the policy in ``_preloaded_policies`` (populated at startup)
+        and swaps in the pre-built policy, joint mapper, obs builder, and
+        gain arrays.  Falls back to loading from disk if not pre-loaded.
+
+        Temporarily stops the control thread to swap objects, then restores
+        the previous running/safety state so the mode carries over.
 
         Raises:
             ValueError: If the path is invalid or model cannot be loaded.
         """
+        prev_safety_state = self.safety.state
         was_running = self._running
         if was_running:
             self.safety.stop()
             self.stop()
 
-        # Attempt load -- if it fails, original policy is preserved
-        self.policy.load(policy_path)
+        entry = self._preloaded_policies.get(policy_path)
+        if entry is not None:
+            policy, mapper, obs_builder = entry
+            self.policy = policy
+            self.joint_mapper = mapper
+            self.obs_builder = obs_builder
+        else:
+            # Not pre-loaded — try loading into the current policy object.
+            self.policy.load(policy_path)
+
+        # Rebuild active-policy gains from (possibly new) mapper.
+        n_ctrl = self.joint_mapper.n_controlled
+        ctrl_joints = self.joint_mapper.controlled_joints
+        self._kp = self._expand_gain(self.config.control.kp, n_ctrl)
+        self._kd = self._expand_gain(self.config.control.kd, n_ctrl)
+        self._ka = self._expand_gain(self.config.control.ka, n_ctrl)
+        self._isaaclab_kp = np.array(
+            [ISAACLAB_KP_29DOF.get(j, 40.0) for j in ctrl_joints]
+        )
+        self._isaaclab_kd = np.array(
+            [ISAACLAB_KD_29DOF.get(j, 2.0) for j in ctrl_joints]
+        )
+        self._isaaclab_ka = np.array(
+            [BM_ACTION_SCALE_29DOF.get(j, 0.439) for j in ctrl_joints]
+        )
+        self._bm_ka = np.array(
+            [BM_ACTION_SCALE_29DOF.get(j, 0.439) for j in ctrl_joints]
+        )
+        variant = self.config.robot.variant
+        q_home_dict = self.config.control.q_home
+        if q_home_dict is None:
+            q_home_dict = Q_HOME_29DOF if variant == "g1_29dof" else Q_HOME_23DOF
+        self._q_home = np.array(
+            [q_home_dict[j] for j in ctrl_joints]
+        )
+
         self.policy.reset()
         self._time_step = 0
+
+        # Restore previous state so mode carries over the switch.
+        if was_running:
+            self.start()
+            if prev_safety_state == SystemState.RUNNING:
+                self.safety.start()
 
     def handle_key(self, key: str) -> None:
         """Handle keyboard input (from MuJoCo viewer or CLI).
@@ -384,6 +434,7 @@ class Controller:
             self.safety.clear_estop()
         elif key == "delete":
             self.robot.reset()
+            self.safety.clear_estop()
         elif key == "up":
             self._adjust_velocity(0, 0.1, -1.0, 1.0)
         elif key == "down":
@@ -927,14 +978,22 @@ class Controller:
                 last_action = action.copy()
                 step_count += 1
 
-                # 10. Log
+                # 10. Log (expand to fixed widths for consistent array shape)
                 if self._logger is not None:
                     loop_time = time.perf_counter() - loop_start
+                    log_action = self.joint_mapper.action_to_robot(action)
+                    # Pad obs to fixed width so policy switches don't break logging.
+                    _LOG_OBS_DIM = 160  # max(IsaacLab=99, BeyondMimic=160)
+                    if obs.shape[0] < _LOG_OBS_DIM:
+                        log_obs = np.zeros(_LOG_OBS_DIM, dtype=obs.dtype)
+                        log_obs[:obs.shape[0]] = obs
+                    else:
+                        log_obs = obs
                     self._logger.log_step(
                         timestamp=time.time(),
                         robot_state=state,
-                        observation=obs,
-                        action=action,
+                        observation=log_obs,
+                        action=log_action,
                         command=cmd,
                         system_state=self.safety.state,
                         velocity_command=self.get_velocity_command(),

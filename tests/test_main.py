@@ -54,13 +54,14 @@ class TestParseSimArgs:
         args = _parse(["sim", "--policy", "test.onnx"])
         assert args.mode == "sim"
         assert args.policy == "test.onnx"
-        assert args.headless is False
+        assert args.gui is False
+        assert args.viser is False
         assert args.config == "configs/default.yaml"
 
-    def test_parse_sim_headless(self):
-        args = _parse(["sim", "--policy", "p.onnx", "--headless",
+    def test_parse_sim_headless_with_duration(self):
+        args = _parse(["sim", "--policy", "p.onnx",
                         "--duration", "10", "--steps", "500"])
-        assert args.headless is True
+        assert args.gui is False
         assert args.duration == 10.0
         assert args.steps == 500
 
@@ -72,7 +73,7 @@ class TestParseSimArgs:
         assert args.robot is None
         assert args.log_dir == "logs/"
         assert args.no_log is False
-        assert args.policy_dir is None
+        assert args.policy_dir.endswith("assets/policies")
 
     def test_missing_policy_without_gantry_errors(self):
         """--policy is required unless --gantry is set."""
@@ -85,10 +86,11 @@ class TestParseSimArgs:
         assert args.gantry is True
         assert args.policy is None
 
-    def test_gantry_with_headless_parsed(self):
-        args = _parse(["sim", "--gantry", "--headless"])
+    def test_gantry_headless_by_default(self):
+        args = _parse(["sim", "--gantry"])
         assert args.gantry is True
-        assert args.headless is True
+        assert args.gui is False
+        assert args.viser is False
 
     def test_missing_mode_errors(self):
         with pytest.raises(SystemExit):
@@ -282,8 +284,7 @@ class TestMainIntegration:
             MockLogger.return_value = mock_logger
 
             main([
-                "sim", "--policy", onnx_path, "--headless",
-                "--config", DEFAULT_CONFIG, "--no-log",
+                "sim", "--policy", onnx_path,                 "--config", DEFAULT_CONFIG, "--no-log",
             ])
 
             MockSimRobot.assert_called_once()
@@ -296,7 +297,7 @@ class TestMainIntegration:
             )
 
     def test_main_sim_viewer_wiring(self, tmp_path):
-        """main() in sim (non-headless) mode calls run_with_viewer."""
+        """main() with --gui calls run_with_viewer."""
         onnx_path = str(tmp_path / "test_policy.onnx")
         _make_isaaclab_onnx(onnx_path)
 
@@ -308,7 +309,7 @@ class TestMainIntegration:
             MockSimRobot.return_value = mock_robot
 
             main([
-                "sim", "--policy", onnx_path,
+                "sim", "--policy", onnx_path, "--gui",
                 "--config", DEFAULT_CONFIG, "--no-log",
             ])
 
@@ -355,8 +356,7 @@ class TestMainIntegration:
             MockLogger.return_value = mock_logger
 
             main([
-                "sim", "--policy", onnx_path, "--headless",
-                "--config", DEFAULT_CONFIG, "--log-dir", log_dir,
+                "sim", "--policy", onnx_path,                 "--config", DEFAULT_CONFIG, "--log-dir", log_dir,
             ])
 
             MockLogger.assert_called_once()
@@ -377,8 +377,7 @@ class TestMainIntegration:
             MockSimRobot.return_value = mock_robot
 
             main([
-                "sim", "--policy", onnx_path, "--headless",
-                "--config", DEFAULT_CONFIG, "--no-log",
+                "sim", "--policy", onnx_path,                 "--config", DEFAULT_CONFIG, "--no-log",
             ])
 
             MockLogger.assert_not_called()
@@ -392,8 +391,7 @@ class TestMainIntegration:
 
             with pytest.raises((FileNotFoundError, Exception)):
                 main([
-                    "sim", "--policy", "/nonexistent/path.onnx", "--headless",
-                    "--config", DEFAULT_CONFIG, "--no-log",
+                    "sim", "--policy", "/nonexistent/path.onnx",                     "--config", DEFAULT_CONFIG, "--no-log",
                 ])
 
     def test_run_headless_keyboard_interrupt(self, tmp_path):
@@ -446,8 +444,7 @@ class TestMainIntegration:
             MockController.return_value = MagicMock()
 
             main([
-                "sim", "--policy", onnx_path, "--headless",
-                "--config", DEFAULT_CONFIG, "--no-log",
+                "sim", "--policy", onnx_path,                 "--config", DEFAULT_CONFIG, "--no-log",
                 "--policy-dir", pol_dir,
             ])
 

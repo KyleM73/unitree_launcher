@@ -12,13 +12,21 @@
 #   docker run --rm -e DISPLAY=$DISPLAY -v /tmp/.X11-unix:/tmp/.X11-unix -e MUJOCO_GL=glx \
 #       unitree-launcher sim --policy assets/policies/stance_29dof.onnx
 
+# ── Build args ─────────────────────────────────────────────────────────
+# Set BUILD_CPP_BACKEND=1 to include the C++ unitree_interface pybind11
+# module for real robot deployment (requires Linux, adds ~2 min build time).
+ARG BUILD_CPP_BACKEND=0
+
 # ── Builder stage ──────────────────────────────────────────────────────
 FROM python:3.10-slim-bookworm AS builder
+
+ARG BUILD_CPP_BACKEND
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
         cmake \
         git \
+        $([ "$BUILD_CPP_BACKEND" = "1" ] && echo "patchelf" || true) \
     && rm -rf /var/lib/apt/lists/*
 
 # Build CycloneDDS C library from source (required by the Python binding).
@@ -58,6 +66,40 @@ RUN sed -i 's/from \. import idl, utils, core, rpc, go2, b2/from . import idl, u
     /app/.venv/lib/python3.10/site-packages/unitree_sdk2py/__init__.py \
     && sed -i '/"b2",/d' \
     /app/.venv/lib/python3.10/site-packages/unitree_sdk2py/__init__.py
+
+# ── Optional: C++ unitree_interface backend ────────────────────────────
+# Build the pybind11 module from amazon-far/unitree_sdk2 for real robot
+# deployment. Adds 500 Hz jitter-free DDS command publishing.
+RUN if [ "$BUILD_CPP_BACKEND" = "1" ]; then \
+        set -e \
+        && echo "[docker] Building C++ unitree_interface backend..." \
+        && ARCH="$(uname -m)" \
+        && . /app/.venv/bin/activate \
+        && uv pip install pybind11 --quiet \
+        && git clone --depth 1 --branch dev \
+            https://github.com/amazon-far/unitree_sdk2.git /tmp/unitree_sdk2 \
+        && mkdir -p /tmp/unitree_sdk2/build \
+        && cmake -S /tmp/unitree_sdk2 -B /tmp/unitree_sdk2/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_PYTHON_BINDING=ON \
+            -DBUILD_EXAMPLES=OFF \
+            -Dpybind11_DIR="$(python -c 'import pybind11; print(pybind11.get_cmake_dir())')" \
+        && cmake --build /tmp/unitree_sdk2/build --target unitree_interface --parallel $(nproc) \
+        && SITE_PKG="$(python -c 'import site; print(site.getsitepackages()[0])')" \
+        && cp /tmp/unitree_sdk2/build/python_binding/unitree_interface*.so "$SITE_PKG/" \
+        && DDS_DIR="/tmp/unitree_sdk2/thirdparty/lib/$ARCH" \
+        && for lib in libddsc.so libddscxx.so; do \
+            SRC="$(find "$DDS_DIR" -name "${lib}*" -type f | head -1)"; \
+            [ -n "$SRC" ] && cp "$(readlink -f "$SRC")" "$SITE_PKG/$lib"; \
+        done \
+        && SO_FILE="$(ls "$SITE_PKG"/unitree_interface*.so)" \
+        && patchelf --set-rpath '$ORIGIN' "$SO_FILE" \
+        && python -c "import unitree_interface; print('[docker] unitree_interface OK:', dir(unitree_interface))" \
+        && rm -rf /tmp/unitree_sdk2 \
+        && echo "[docker] C++ backend installed successfully"; \
+    else \
+        echo "[docker] Skipping C++ backend (BUILD_CPP_BACKEND=0)"; \
+    fi
 
 # ── Runtime stage ──────────────────────────────────────────────────────
 FROM python:3.10-slim-bookworm AS runtime

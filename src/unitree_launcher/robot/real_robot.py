@@ -86,9 +86,11 @@ class RealRobot(RobotInterface):
         # Optional safety controller reference (set externally for watchdog)
         self._safety = None
 
+
     def set_safety(self, safety) -> None:
         """Set safety controller reference for watchdog E-stop."""
         self._safety = safety
+
 
     # ---- RobotInterface implementation ----
 

@@ -7,8 +7,9 @@ Provides:
 """
 from __future__ import annotations
 
-# Patch SDK threading FIRST (before any unitree_sdk2py imports).
-from unitree_launcher.compat import patch_unitree_threading
+# Patch SDK FIRST (before any unitree_sdk2py imports).
+from unitree_launcher.compat import patch_unitree_b2_import, patch_unitree_threading
+patch_unitree_b2_import()
 patch_unitree_threading()
 
 import argparse
@@ -62,8 +63,17 @@ GLFW_KEY_MAP = {
 # Viewer / Headless Runners
 # ============================================================================
 
-def run_with_viewer(sim_robot: SimRobot, controller: Controller, recorder=None) -> None:
+def run_with_viewer(
+    sim_robot: SimRobot,
+    controller: Controller,
+    recorder=None,
+    viser_port: Optional[int] = None,
+) -> None:
     """Run simulation with interactive MuJoCo viewer.
+
+    Args:
+        viser_port: If set, also launch a viser web viewer on this port
+            alongside the GLFW viewer (both stay in sync).
 
     Threading model:
         Main thread   -- viewer.sync() + drain key queue (this function)
@@ -76,6 +86,13 @@ def run_with_viewer(sim_robot: SimRobot, controller: Controller, recorder=None) 
     the lock before calling viewer.sync().
     """
     import mujoco.viewer  # Local import — requires display (GLFW)
+
+    # Optional viser sidecar.
+    viser_viewer = None
+    if viser_port is not None:
+        from unitree_launcher.viz.viser_viewer import ViserViewer
+        viser_viewer = ViserViewer(sim_robot.mj_model, port=viser_port)
+        viser_viewer.setup()
 
     key_queue: queue.SimpleQueue = queue.SimpleQueue()
 
@@ -98,6 +115,11 @@ def run_with_viewer(sim_robot: SimRobot, controller: Controller, recorder=None) 
 
                 with sim_robot.lock:
                     viewer.sync()
+
+                # Update viser sidecar (outside lock).
+                if viser_viewer is not None:
+                    viser_viewer.update(sim_robot.mj_data, sim_robot.lock)
+
                 # Capture OUTSIDE the lock — offscreen render can take
                 # several ms and must never block the control thread.
                 if recorder:
@@ -107,6 +129,8 @@ def run_with_viewer(sim_robot: SimRobot, controller: Controller, recorder=None) 
             pass
         finally:
             controller.stop()
+            if viser_viewer is not None:
+                viser_viewer.close()
 
 
 def run_headless(
@@ -171,6 +195,109 @@ def run_headless(
         controller.stop()
 
 
+def run_with_viser(
+    sim_robot: SimRobot,
+    controller: Controller,
+    port: int = 8080,
+    duration: Optional[float] = None,
+    max_steps: Optional[int] = None,
+    play: bool = False,
+    policy_paths: Optional[list[str]] = None,
+    active_policy: Optional[str] = None,
+    recorder=None,
+) -> None:
+    """Run simulation with the viser web viewer.
+
+    Combines viser visualization with headless termination logic so
+    ``--viser`` works with ``--duration``/``--steps`` flags.
+
+    Args:
+        play: If True, don't exit when trajectory ends or controller stops.
+            The simulation loops until Ctrl+C or duration limit.
+        policy_paths: List of ONNX policy files for the dropdown selector.
+        active_policy: Display name (stem) of the initially active policy.
+
+    Threading model:
+        Main thread    -- drain key queue, velocity sliders, viewer.update()
+        Control thread -- get_state / send_command / mj_step (controller)
+        Viser thread   -- asyncio WebSocket server (never touches mj_data)
+    """
+    from unitree_launcher.viz.viser_viewer import ViserViewer
+
+    viewer = ViserViewer(
+        sim_robot.mj_model,
+        port=port,
+        policy_paths=policy_paths,
+        active_policy=active_policy,
+    )
+    viewer.setup()
+
+    if max_steps is not None:
+        controller._max_steps = max_steps
+
+    controller.start()
+    current_policy_name = active_policy or "unknown"
+
+    start_time = time.time()
+    try:
+        while viewer.is_running():
+            # Drain key events from GUI buttons.
+            for key in viewer.drain_key_queue():
+                controller.handle_key(key)
+                # Re-capture follow origin on start or reset.
+                if key in ("space", "delete"):
+                    viewer._follow_origin_xy = None
+
+            # Handle policy button selection.
+            selected_policy = viewer.drain_policy_selection()
+            if selected_policy is not None:
+                try:
+                    controller.reload_policy(selected_policy)
+                    current_policy_name = Path(selected_policy).stem
+                    print(f"[viser] Loaded policy: {current_policy_name}")
+                except Exception as exc:
+                    print(f"[viser] Failed to load policy: {exc}")
+
+            # Read velocity sliders and apply to controller.
+            vel = viewer.get_velocity_commands()
+            if vel is not None:
+                vx, vy, yaw = vel
+                controller.set_velocity_command(vx, vy, yaw)
+
+            # Update scene transforms.
+            viewer.update(sim_robot.mj_data, sim_robot.lock)
+
+            # Update status panel.
+            state_name = controller.safety.state.name
+            viewer.set_status(state_name, current_policy_name)
+
+            # Capture recording outside lock.
+            if recorder:
+                recorder.capture(sim_robot.mj_data)
+
+            # Termination checks (play mode skips trajectory-end exits).
+            if duration is not None and (time.time() - start_time) >= duration:
+                print(f"[viser] Duration limit reached ({duration}s). Stopping.")
+                break
+
+            if not play:
+                if not controller.is_running:
+                    print("[viser] Controller stopped.")
+                    break
+
+                if controller.safety.state == SystemState.STOPPED:
+                    print("[viser] Active policy completed. Returning to stance.")
+                    break
+
+            time.sleep(1.0 / 50.0)  # 50 Hz update
+
+    except KeyboardInterrupt:
+        print("\n[viser] Ctrl+C received. Stopping.")
+    finally:
+        controller.stop()
+        viewer.close()
+
+
 # ============================================================================
 # CLI
 # ============================================================================
@@ -183,8 +310,11 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
                         help="Path to ONNX policy file")
     parser.add_argument("--default-policy", default=None,
                         help="Override default stance/velocity-tracking policy")
-    parser.add_argument("--policy-dir", default=None,
-                        help="Directory of ONNX files for N/P key cycling")
+    _default_policy_dir = str(
+        Path(__file__).resolve().parent.parent.parent / "assets" / "policies"
+    )
+    parser.add_argument("--policy-dir", default=_default_policy_dir,
+                        help="Directory of ONNX files for policy switching")
     parser.add_argument("--robot", default=None,
                         help="Robot variant override (g1_29dof or g1_23dof)")
     parser.add_argument("--domain-id", type=int, default=None,
@@ -204,6 +334,12 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
                         help="Enable gamepad e-stop (Logitech F310)")
     parser.add_argument("--gamepad-debug", action="store_true",
                         help="Log raw HID reports on change (for button mapping)")
+    parser.add_argument("--gui", action="store_true",
+                        help="Launch MuJoCo GLFW viewer (use mjpython on macOS)")
+    parser.add_argument("--viser", action="store_true",
+                        help="Launch viser web viewer")
+    parser.add_argument("--port", type=int, default=8080,
+                        help="Viser web viewer port (default: 8080)")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -218,35 +354,37 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common_args(sim_parser)
     sim_parser.add_argument("--gantry", action="store_true",
                             help="Gantry mode: damping -> interpolate -> hold (no policy needed)")
-    sim_parser.add_argument("--headless", action="store_true",
-                            help="Run without viewer (for server evals)")
     sim_parser.add_argument("--duration", type=float, default=None,
-                            help="Auto-stop after N seconds (headless only)")
+                            help="Auto-stop after N seconds")
     sim_parser.add_argument("--steps", type=int, default=None,
-                            help="Auto-stop after N policy steps (headless only)")
+                            help="Auto-stop after N policy steps")
+    sim_parser.add_argument("--play", action="store_true",
+                            help="Loop forever: don't exit when trajectory ends (viser only)")
+    # Real-only args with defaults (so args.interface etc. always exist).
+    sim_parser.set_defaults(interface=None, backend="python")
 
     # -- real sub-command --
     real_parser = subparsers.add_parser("real", help="Real robot mode")
     _add_common_args(real_parser)
     real_parser.add_argument("--interface", required=True,
                              help="Network interface (e.g. eth0)")
+    real_parser.add_argument("--backend", choices=["python", "cpp"], default="python",
+                             help="Real robot SDK: python (unitree_sdk2py) or cpp (pybind11)")
+    # Sim-only args with defaults (so args.gantry etc. always exist).
+    real_parser.set_defaults(gantry=False, duration=None, steps=None, play=False)
 
     return parser
 
 
 def _start_gamepad(args, safety):
     """Create and start a GamepadMonitor, or return None on failure."""
-    try:
-        from unitree_launcher.control.gamepad import GamepadMonitor
-        monitor = GamepadMonitor(
-            safety,
-            debug=getattr(args, "gamepad_debug", False),
-        )
-        monitor.start()
-        return monitor
-    except Exception as exc:
-        print(f"[main] WARNING: Gamepad init failed: {exc}. Continuing without gamepad.")
-        return None
+    from unitree_launcher.control.gamepad import start_gamepad
+    return start_gamepad(safety, debug=args.gamepad_debug)
+
+
+def _is_docker() -> bool:
+    """Return True if running inside a Docker container."""
+    return Path("/.dockerenv").exists() or Path("/run/.containerenv").exists()
 
 
 def main(argv: Optional[list] = None) -> None:
@@ -258,8 +396,18 @@ def main(argv: Optional[list] = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
 
+    # ---- Validate display flags ----
+    if args.gui and _is_docker():
+        parser.error("--gui is not supported in Docker (no GLFW display). Use --viser instead.")
+
     # ---- Validate ----
-    is_gantry = args.mode == "sim" and getattr(args, "gantry", False)
+    is_gantry = args.mode == "sim" and args.gantry
+    # When --policy-dir is given without --policy, pick the first ONNX file.
+    if not args.policy and args.policy_dir:
+        import glob as _glob
+        _candidates = sorted(_glob.glob(str(Path(args.policy_dir) / "*.onnx")))
+        if _candidates:
+            args.policy = _candidates[0]
     if not is_gantry and not args.policy:
         parser.error("--policy is required (or use --gantry for gantry simulation)")
 
@@ -281,6 +429,9 @@ def main(argv: Optional[list] = None) -> None:
     variant = config.robot.variant
     if args.mode == "sim":
         robot = SimRobot(config)
+    elif args.backend == "cpp":
+        from unitree_launcher.robot.cpp_real_robot import CppRealRobot
+        robot = CppRealRobot(config)
     else:
         robot = RealRobot(config)
 
@@ -341,16 +492,28 @@ def main(argv: Optional[list] = None) -> None:
 
         # ---- Gamepad E-Stop (gantry) ----
         gamepad_monitor = None
-        if getattr(args, "gamepad", False):
+        if args.gamepad:
             gamepad_monitor = _start_gamepad(args, safety)
 
         try:
-            if not args.headless:
-                run_with_viewer(robot, controller, recorder=recorder)
+            _gui = args.gui
+            _vis = args.viser
+            if _gui:
+                run_with_viewer(
+                    robot, controller, recorder=recorder,
+                    viser_port=args.port if _vis else None,
+                )
+            elif _vis:
+                run_with_viser(
+                    robot, controller, port=args.port,
+                    duration=args.duration,
+                    play=args.play,
+                    recorder=recorder,
+                )
             else:
                 run_headless(
                     robot, controller,
-                    duration=getattr(args, "duration", None),
+                    duration=args.duration,
                     auto_start_policy=False,
                     recorder=recorder,
                 )
@@ -546,7 +709,7 @@ def main(argv: Optional[list] = None) -> None:
 
     # ---- State Estimator (for real robot or estimator-in-the-loop) ----
     estimator = None
-    if args.mode == "real" or getattr(args, "estimator", False):
+    if args.mode == "real" or args.estimator:
         from unitree_launcher.estimation import StateEstimator
         estimator = StateEstimator(config)
         print("[main] State estimator enabled (InEKF).")
@@ -568,6 +731,68 @@ def main(argv: Optional[list] = None) -> None:
     if estimator is not None:
         controller.set_estimator(estimator)
 
+    # ---- Pre-load all policies in policy_dir for instant switching ----
+    for policy_file in controller._policy_files:
+        if policy_file == args.policy:
+            # Already loaded as the active policy — register it directly.
+            controller._preloaded_policies[policy_file] = (
+                active_policy, active_joint_mapper, active_obs_builder,
+            )
+            continue
+        try:
+            fmt = detect_policy_format(policy_file)
+            if fmt == "isaaclab":
+                import onnxruntime as _ort
+                _sess = _ort.InferenceSession(
+                    policy_file, providers=["CPUExecutionProvider"]
+                )
+                _n_act = _sess.get_outputs()[0].shape[1]
+                del _sess
+                _il_joints = [
+                    j.replace("_joint", "")
+                    for j in ISAACLAB_G1_29DOF_JOINTS[:_n_act]
+                ]
+                _mapper = JointMapper(
+                    robot_joints=robot_joints,
+                    observed_joints=_il_joints,
+                    controlled_joints=_il_joints,
+                )
+                _use_est = config.policy.use_estimator
+                if args.no_est:
+                    _use_est = False
+                _obs = ObservationBuilder(_mapper, config, use_estimator=_use_est)
+                _pol: PolicyInterface = IsaacLabPolicy(_mapper, _obs.observation_dim)
+                _pol.load(policy_file)
+                controller._preloaded_policies[policy_file] = (_pol, _mapper, _obs)
+            else:
+                _meta = BeyondMimicPolicy.load_metadata(policy_file)
+                _pj = None
+                if "joint_names" in _meta:
+                    _pj = [
+                        j.strip().replace("_joint", "")
+                        for j in _meta["joint_names"].split(",")
+                    ]
+                _mapper = JointMapper(
+                    robot_joints=robot_joints,
+                    observed_joints=_pj,
+                    controlled_joints=_pj,
+                )
+                _pol = BeyondMimicPolicy(
+                    _mapper, obs_dim=160,
+                    use_onnx_metadata=config.policy.use_onnx_metadata,
+                )
+                _pol.load(policy_file)
+                controller._preloaded_policies[policy_file] = (_pol, _mapper, None)
+            print(f"[main] Pre-loaded policy: {Path(policy_file).stem}")
+        except Exception as exc:
+            print(f"[main] WARNING: Could not pre-load {Path(policy_file).name}: {exc}")
+
+    # Also register the active policy if not already in the dir listing.
+    if args.policy and args.policy not in controller._preloaded_policies:
+        controller._preloaded_policies[args.policy] = (
+            active_policy, active_joint_mapper, active_obs_builder,
+        )
+
     # ---- Connect & run ----
     robot.connect()
     if logger is not None:
@@ -575,7 +800,7 @@ def main(argv: Optional[list] = None) -> None:
 
     # ---- Gamepad E-Stop ----
     gamepad_monitor = None
-    if getattr(args, "gamepad", False):
+    if args.gamepad:
         gamepad_monitor = _start_gamepad(args, safety)
 
     # ---- Video recorder (created after logger.start so log dir exists) ----
@@ -613,14 +838,33 @@ def main(argv: Optional[list] = None) -> None:
     prev_sigterm = signal.signal(signal.SIGTERM, _signal_shutdown)
     prev_sighup = signal.signal(signal.SIGHUP, _signal_shutdown)
 
+    use_gui = args.gui
+    use_viser = args.viser
     try:
-        if args.mode == "sim" and not args.headless:
-            run_with_viewer(robot, controller, recorder=recorder)
+        if use_gui:
+            # --gui (optionally with --viser sidecar)
+            run_with_viewer(
+                robot, controller, recorder=recorder,
+                viser_port=args.port if use_viser else None,
+            )
+        elif use_viser:
+            # --viser only (headless physics + web viewer)
+            _viser_paths = list(controller._preloaded_policies.keys())
+            run_with_viser(
+                robot, controller, port=args.port,
+                duration=args.duration,
+                max_steps=args.steps,
+                play=args.play,
+                policy_paths=_viser_paths or None,
+                active_policy=Path(args.policy).stem if args.policy else None,
+                recorder=recorder,
+            )
         else:
+            # headless (default)
             run_headless(
                 robot, controller,
-                duration=getattr(args, "duration", None),
-                max_steps=getattr(args, "steps", None),
+                duration=args.duration,
+                max_steps=args.steps,
                 recorder=recorder,
             )
     finally:

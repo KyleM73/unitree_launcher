@@ -41,10 +41,26 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+      args:
+        BUILD_CPP_BACKEND: 1
     profiles: [real]
     network_mode: host
     environment:
       - MUJOCO_GL=egl
+    volumes:
+      - ../logs:/app/logs
+      - ../assets/policies:/app/assets/policies:ro
+
+  # ── Viser web viewer (macOS + Linux) ──────────────────────────────
+  sim-viser:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    profiles: [viser]
+    environment:
+      - MUJOCO_GL=egl
+    ports:
+      - "${VISER_PORT:-8080}:8080"
     volumes:
       - ../logs:/app/logs
       - ../assets/policies:/app/assets/policies:ro
