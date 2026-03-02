@@ -116,6 +116,46 @@ def patch_unitree_b2_import():
         sys.modules[b2_name] = types.ModuleType(b2_name)
 
 
+def patch_unitree_crc():
+    """Patch CRC class to fall back to pure-Python when native .so is missing.
+
+    The upstream unitree_sdk2py ships crc_amd64.so / crc_aarch64.so in a
+    ``lib/`` subdirectory, but git-based installs (via uv) don't include
+    them because the package lacks proper package_data configuration.
+
+    On Linux the CRC class crashes in __init__ trying to load the .so.
+    This patch makes it fall back to the pure-Python implementation,
+    which is fine at 50 Hz command rates.
+    """
+    if platform.system() != "Linux":
+        return
+
+    try:
+        from unitree_sdk2py.utils.crc import CRC
+    except Exception:
+        return  # Can't import yet, will be patched later
+
+    _orig_init = CRC.__init__
+
+    def _patched_init(self):
+        try:
+            _orig_init(self)
+        except OSError:
+            import ctypes
+            # Set up struct pack formats (same as original __init__)
+            self._CRC__packFmtLowCmd = '<4B4IH2x' + 'B3x5f3I' * 20 + '4B' + '55Bx2I'
+            self._CRC__packFmtLowState = '<4B4IH2x' + '13fb3x' + 'B3x7fb3x3I' * 20 + '4BiH4b15H' + '8hI41B3xf2b2x2f4h2I'
+            self._CRC__packFmtHGLowCmd = '<2B2x' + 'B3x5fI' * 35 + '5I'
+            self._CRC__packFmtHGLowState = '<2I2B2xI' + '13fh2x' + 'B3x4f2hf7I' * 35 + '40B5I'
+            self.platform = "PythonFallback"
+            self.crc_lib = None
+            logger.warning(
+                "CRC native library (crc_amd64.so) not found — using pure-Python fallback"
+            )
+
+    CRC.__init__ = _patched_init
+
+
 def patch_unitree_threading():
     """Monkey-patch unitree SDK to use our RecurrentThread on macOS.
 

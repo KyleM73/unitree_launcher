@@ -88,10 +88,7 @@ RUN if [ "$BUILD_CPP_BACKEND" = "1" ]; then \
         && SITE_PKG="$(python -c 'import site; print(site.getsitepackages()[0])')" \
         && cp /tmp/unitree_sdk2/build/python_binding/unitree_interface*.so "$SITE_PKG/" \
         && DDS_DIR="/tmp/unitree_sdk2/thirdparty/lib/$ARCH" \
-        && for lib in libddsc.so libddscxx.so; do \
-            SRC="$(find "$DDS_DIR" -name "${lib}*" -type f | head -1)"; \
-            [ -n "$SRC" ] && cp "$(readlink -f "$SRC")" "$SITE_PKG/$lib"; \
-        done \
+        && cp -a "$DDS_DIR"/libddsc.so* "$DDS_DIR"/libddscxx.so* "$SITE_PKG/" \
         && SO_FILE="$(ls "$SITE_PKG"/unitree_interface*.so)" \
         && patchelf --set-rpath '$ORIGIN' "$SO_FILE" \
         && python -c "import unitree_interface; print('[docker] unitree_interface OK:', dir(unitree_interface))" \

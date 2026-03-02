@@ -9,9 +9,10 @@ Provides:
 from __future__ import annotations
 
 # Patch SDK before any unitree_sdk2py imports.
-from unitree_launcher.compat import patch_unitree_b2_import, patch_unitree_threading
+from unitree_launcher.compat import patch_unitree_b2_import, patch_unitree_crc, patch_unitree_threading
 patch_unitree_b2_import()
 patch_unitree_threading()
+patch_unitree_crc()
 
 import argparse
 import time

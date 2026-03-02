@@ -183,23 +183,33 @@ info "Installing to $SITE_PACKAGES"
 cp "$SO_FILE" "$SITE_PACKAGES/"
 
 # ── Install DDS shared libraries alongside ──────────────────────────────
-DDS_LIBS=(libddsc.so libddscxx.so)
-for lib in "${DDS_LIBS[@]}"; do
-    # Find the actual file (may have version suffix like libddsc.so.0.10.2)
-    SRC="$(find "$DDS_LIB_DIR" -name "${lib}*" -type f | head -1)"
-    if [[ -z "$SRC" ]]; then
-        # Try symlink
-        SRC="$(find "$DDS_LIB_DIR" -name "${lib}*" | head -1)"
+# Copy all versioned variants and create symlinks so the dynamic linker
+# can resolve both libddsc.so and libddsc.so.0 (the SONAME).
+DDS_LIBS=(libddsc libddscxx)
+for base in "${DDS_LIBS[@]}"; do
+    # Find all files matching this lib (e.g. libddsc.so, libddsc.so.0, libddsc.so.0.10.2)
+    FOUND=()
+    while IFS= read -r f; do
+        FOUND+=("$f")
+    done < <(find "$DDS_LIB_DIR" -name "${base}.so*" | sort)
+
+    if [[ ${#FOUND[@]} -eq 0 ]]; then
+        warn "  DDS library not found: ${base}.so in $DDS_LIB_DIR (may be statically linked)"
+        continue
     fi
-    if [[ -n "$SRC" ]]; then
-        # Copy the actual file
-        REAL_SRC="$(readlink -f "$SRC")"
-        DEST_NAME="$lib"
-        cp "$REAL_SRC" "$SITE_PACKAGES/$DEST_NAME"
-        info "  Installed $DEST_NAME"
-    else
-        warn "  DDS library not found: $lib in $DDS_LIB_DIR (may be statically linked)"
-    fi
+
+    # Copy all files/symlinks preserving the link structure
+    for f in "${FOUND[@]}"; do
+        fname="$(basename "$f")"
+        if [[ -L "$f" ]]; then
+            # Recreate symlink
+            target="$(readlink "$f")"
+            ln -sf "$target" "$SITE_PACKAGES/$fname"
+        else
+            cp "$f" "$SITE_PACKAGES/$fname"
+        fi
+    done
+    info "  Installed ${base}.so ($(printf '%s ' "${FOUND[@]##*/}"))"
 done
 
 # ── Set RPATH so .so finds DDS libs without LD_LIBRARY_PATH ─────────────
