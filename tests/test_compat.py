@@ -1,4 +1,4 @@
-"""Tests for src/compat.py — Phase 3."""
+"""Tests for compat.py — cross-platform utilities and SDK patches."""
 import threading
 import time
 from unittest import mock

@@ -12,11 +12,9 @@ policy:
 
 control:
   policy_frequency: 50
-  sim_frequency: 200
-  kp: 100.0
-  kd: 10.0
-  ka: 0.5
-  kd_damp: 5.0
+  sim_frequency: 500
+  kd_damp: 8.0
+  transition_steps: 5
   q_home: null
 
 safety:

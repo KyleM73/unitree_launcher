@@ -1,7 +1,4 @@
-"""Tests for src/config.py — constants, dataclasses, and config loading.
-
-Covers PLAN_METAL Phase 2 Tasks 2.1, 2.2, 2.5, 2.6.
-"""
+"""Tests for config.py — constants, dataclasses, and config loading."""
 import os
 import tempfile
 from pathlib import Path
@@ -38,7 +35,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
 # ============================================================================
-# Part 1: Robot Constants (Task 2.1)
+# Part 1: Robot Constants
 # ============================================================================
 
 class TestJointCounts:
@@ -98,7 +95,7 @@ class TestIsaacLabMapping:
         assert sorted(ISAACLAB_TO_NATIVE_INDICES) == list(range(29))
 
     def test_isaaclab_index_mapping_known_values(self):
-        # Verify specific mappings from SPEC section 2.2.1
+        # Verify specific mappings for known joint indices
         assert ISAACLAB_TO_NATIVE_INDICES[0] == 0   # left_hip_pitch
         assert ISAACLAB_TO_NATIVE_INDICES[1] == 6   # right_hip_pitch
         assert ISAACLAB_TO_NATIVE_INDICES[2] == 12  # waist_yaw
@@ -123,7 +120,7 @@ class TestMujocoJointNames:
 
 
 # ============================================================================
-# Part 2: Dataclasses (Task 2.2)
+# Part 2: Dataclasses
 # ============================================================================
 
 class TestRobotState:
@@ -170,7 +167,7 @@ class TestRobotCommand:
 
 
 # ============================================================================
-# Part 3: Joint Name Resolution (Task 2.5)
+# Part 3: Joint Name Resolution
 # ============================================================================
 
 class TestJointNameResolution:
@@ -194,7 +191,7 @@ class TestJointNameResolution:
 
 
 # ============================================================================
-# Part 4: Config Loading (Tasks 2.5, 2.6)
+# Part 4: Config Loading
 # ============================================================================
 
 class TestConfigLoading:
@@ -202,8 +199,10 @@ class TestConfigLoading:
         cfg = load_config(str(PROJECT_ROOT / "configs" / "default.yaml"))
         assert cfg.robot.variant == "g1_29dof"
         assert cfg.control.policy_frequency == 50
-        assert cfg.control.sim_frequency == 200
-        assert cfg.control.kp == 100.0
+        assert cfg.control.sim_frequency == 500
+        assert cfg.control.kp is None
+        assert cfg.control.kd is None
+        assert cfg.control.ka is None
         assert cfg.safety.joint_position_limits is True
         assert cfg.logging.format == "hdf5"
 
@@ -213,7 +212,7 @@ class TestConfigLoading:
         merged = merge_configs(base, override)
         assert merged.robot.variant == "g1_29dof"
         # Base values preserved where override doesn't set them
-        assert merged.control.kp == 100.0
+        assert merged.control.kp is None
 
     def test_load_23dof_config(self):
         base = load_config(str(PROJECT_ROOT / "configs" / "default.yaml"))
@@ -283,10 +282,11 @@ class TestConfigValidation:
         with pytest.raises(ValueError, match="format"):
             load_config(path)
 
-    def test_default_gains_are_scalar(self):
+    def test_default_gains_are_none(self):
         cfg = load_config(str(PROJECT_ROOT / "configs" / "default.yaml"))
-        assert isinstance(cfg.control.kp, float)
-        assert cfg.control.kp == 100.0
+        assert cfg.control.kp is None
+        assert cfg.control.kd is None
+        assert cfg.control.ka is None
 
     def test_viewer_config_defaults(self):
         cfg = Config()
@@ -298,14 +298,12 @@ class TestMergeConfigs:
     def test_merge_configs_none_preserves_base(self):
         base = Config(control=ControlConfig(kp=100.0))
         override = Config()
-        # PolicyConfig defaults have None for format, observed_joints, etc.
-        # But ControlConfig kp defaults to 100.0 (not None), so it will overwrite.
-        # We need to test with a field that is actually None.
+        # ControlConfig kp defaults to None, PolicyConfig format defaults to None.
         override.policy = PolicyConfig(format=None, controlled_joints=None)
         merged = merge_configs(base, override)
         # base policy.format was None, override is None -> stays None
         assert merged.policy.format is None
-        # base control.kp was 100.0, override is 100.0 (default) -> stays 100.0
+        # base control.kp was 100.0, override is None -> stays 100.0
         assert merged.control.kp == 100.0
 
     def test_cli_override_merges(self):

@@ -1,9 +1,12 @@
-"""Cross-platform threading utilities.
+"""Cross-platform utilities and unitree_sdk2py patches.
 
-Replaces unitree_sdk2py.utils.thread.RecurrentThread, which uses
-Linux-specific APIs (timerfd_create) that are unavailable on macOS.
+Provides:
+- RecurrentThread: drop-in for unitree SDK's Linux-only RecurrentThread
+- patch_unitree_*: fixes for unitree_sdk2py bugs (b2 import, CRC, threading)
+- resolve_network_interface: "auto" -> platform-appropriate loopback
 
-Reference: https://x.com/TairanHe99/status/1857935343825334693
+Only needed by MirrorRobot (Python DDS) and diagnostic test scripts.
+SimRobot and RealRobot do not use these patches.
 """
 import logging
 import platform

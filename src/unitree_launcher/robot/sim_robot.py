@@ -1,20 +1,18 @@
 """MuJoCo simulation robot backend.
 
-Implements the RobotInterface for the MuJoCo physics simulator with
-DDS bridge for state publishing.
+Pure MuJoCo — no DDS, no unitree_sdk2py. For mirroring real robot state
+into sim, see ``mirror_robot.py`` and ``scripts/mirror_real_robot.py``.
 
 Threading model (when viewer is active):
     Main thread:           drain key queue -> handle_key() -> lock -> viewer.sync() -> unlock
     Control loop thread:   get_state() -> policy -> send_command() -> lock -> mj_step() -> unlock
     Viewer thread:         GLFW rendering + event loop -> key_callback enqueues to SimpleQueue
-    DDS publishing thread: lock -> snapshot sensor data -> unlock -> publish LowState_
 
 A threading.Lock (self._lock) protects mjData during mj_step() and viewer.sync().
 The key_callback must never acquire the lock (fires on viewer thread -> deadlock risk).
 """
 from __future__ import annotations
 
-import logging
 import threading
 from pathlib import Path
 from typing import Callable, Optional
@@ -22,7 +20,6 @@ from typing import Callable, Optional
 import mujoco
 import numpy as np
 
-from unitree_launcher.compat import RecurrentThread, resolve_network_interface, patch_unitree_threading
 from unitree_launcher.config import (
     Config,
     G1_29DOF_MUJOCO_JOINTS,
@@ -31,20 +28,14 @@ from unitree_launcher.config import (
 )
 from unitree_launcher.robot.base import RobotCommand, RobotInterface, RobotState
 
-logger = logging.getLogger(__name__)
-
-# DDS IDL motor count for unitree_hg messages
-_NUM_MOTOR_IDL_HG = 35
-
 # Asset root relative to this file
 _ASSETS_DIR = Path(__file__).resolve().parent.parent.parent.parent / "assets"
 
 
 class SimRobot(RobotInterface):
-    """MuJoCo simulation backend with optional DDS bridge."""
+    """MuJoCo simulation backend."""
 
     def __init__(self, config: Config):
-        self._config = config
         variant = config.robot.variant
 
         # Load MuJoCo scene
@@ -90,16 +81,6 @@ class SimRobot(RobotInterface):
             self._qpos_addr[cfg_idx] = self._model.jnt_qposadr[jnt_id]
             self._dof_addr[cfg_idx] = self._model.jnt_dofadr[jnt_id]
 
-        # Non-controlled MuJoCo actuator indices (for 23-DOF mode)
-        controlled_set = set(self._cfg_to_mj.tolist())
-        self._non_controlled_mj = np.array(
-            [i for i in range(self._num_motor) if i not in controlled_set],
-            dtype=np.intp,
-        )
-
-        # Sensor data layout: pos[0:nm], vel[nm:2*nm], torque[2*nm:3*nm], IMU, frame
-        self._dim_motor_sensor = 3 * self._num_motor
-
         # Substeps per policy tick
         self._substeps = config.control.sim_frequency // config.control.policy_frequency
 
@@ -112,12 +93,6 @@ class SimRobot(RobotInterface):
         # Optional per-substep callback (e.g. for elastic band forces)
         self._substep_callback: Optional[Callable[[mujoco.MjModel, mujoco.MjData], None]] = None
 
-        # DDS state (lazy init in connect())
-        self._dds_initialized = False
-        self._state_pub_thread: Optional[RecurrentThread] = None
-        self._low_state_pub = None
-        self._low_state_msg = None
-
         # Save initial state for reset
         mujoco.mj_forward(self._model, self._data)
         self._initial_qpos = self._data.qpos.copy()
@@ -126,67 +101,42 @@ class SimRobot(RobotInterface):
     # ---- RobotInterface implementation ----
 
     def connect(self) -> None:
-        """Initialize DDS and start state publishing thread."""
-        if self._dds_initialized:
-            return
-
-        patch_unitree_threading()
-
-        from unitree_sdk2py.core.channel import (
-            ChannelPublisher,
-            ChannelFactoryInitialize,
-        )
-        from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowState_
-        from unitree_sdk2py.idl.default import unitree_hg_msg_dds__LowState_
-
-        iface = resolve_network_interface(self._config.network.interface)
-        ChannelFactoryInitialize(self._config.network.domain_id, iface)
-
-        self._low_state_msg = unitree_hg_msg_dds__LowState_()
-        self._low_state_pub = ChannelPublisher("rt/lowstate", LowState_)
-        self._low_state_pub.Init()
-
-        self._state_pub_thread = RecurrentThread(
-            interval=self._model.opt.timestep,
-            target=self._publish_low_state,
-            name="sim_lowstate",
-        )
-        self._state_pub_thread.Start()
-
-        self._dds_initialized = True
-        logger.info("SimRobot DDS connected on interface %s", iface)
+        """No-op for SimRobot (pure MuJoCo, no external connections)."""
+        pass
 
     def disconnect(self) -> None:
-        """Stop DDS publishing thread."""
-        if self._state_pub_thread is not None:
-            self._state_pub_thread.Shutdown()
-            self._state_pub_thread = None
-        self._dds_initialized = False
-        logger.info("SimRobot disconnected")
+        """No-op for SimRobot."""
+        pass
 
     def get_state(self) -> RobotState:
-        """Read current state from MuJoCo sensor data.
+        """Read current state from MuJoCo.
 
-        Note: sensordata is computed during ``mj_step1`` (before integration),
-        so it lags ``qpos``/``qvel`` by one substep.  This is acceptable for
-        observation building (matches real sensor latency), but NOT for the
-        PD control law — see ``_apply_pd()`` which reads ``qpos``/``qvel``.
+        Joint positions/velocities are read directly from ``qpos``/``qvel``
+        (current, post-integration — no sensor lag).  Torques from
+        ``actuator_force``.  IMU and frame data from remaining sensors.
+
+        Sensor layout (after removing joint sensors):
+          [0:4]   framequat (imu_quat)
+          [4:7]   gyro (imu_gyro)
+          [7:10]  accelerometer (imu_acc)
+          [10:13] framepos (frame_pos)
+          [13:16] framelinvel (frame_vel)
+          [16:20] framequat (secondary_imu_quat)
+          [20:23] gyro (secondary_imu_gyro)
+          [23:26] accelerometer (secondary_imu_acc)
         """
         sd = self._data.sensordata
-        mj = self._cfg_to_mj
-        nm = self._num_motor
-        dms = self._dim_motor_sensor
 
         return RobotState(
             timestamp=self._data.time,
-            joint_positions=sd[mj].copy(),
-            joint_velocities=sd[nm + mj].copy(),
-            joint_torques=sd[2 * nm + mj].copy(),
-            imu_quaternion=sd[dms + 0 : dms + 4].copy(),
-            imu_angular_velocity=sd[dms + 4 : dms + 7].copy(),
-            imu_linear_acceleration=sd[dms + 7 : dms + 10].copy(),
-            base_position=sd[dms + 10 : dms + 13].copy(),
-            base_velocity=sd[dms + 13 : dms + 16].copy(),
+            joint_positions=self._data.qpos[self._qpos_addr].copy(),
+            joint_velocities=self._data.qvel[self._dof_addr].copy(),
+            joint_torques=self._data.actuator_force[self._cfg_to_mj].copy(),
+            imu_quaternion=sd[0:4].copy(),
+            imu_angular_velocity=sd[4:7].copy(),
+            imu_linear_acceleration=sd[7:10].copy(),
+            base_position=sd[10:13].copy(),
+            base_velocity=sd[13:16].copy(),
         )
 
     def send_command(self, cmd: RobotCommand) -> None:
@@ -356,7 +306,7 @@ class SimRobot(RobotInterface):
             pelvis_quat_wxyz: Reference pelvis quaternion ``(4,)`` in wxyz.
             joint_mapper: Maps policy order to robot-native order.
         """
-        joint_native = joint_mapper.action_to_robot(joint_positions_policy)
+        joint_native = joint_mapper.policy_to_robot(joint_positions_policy)
         with self._lock:
             # Set root body (freejoint): [tx, ty, tz, qw, qx, qy, qz]
             self._data.qpos[0:3] = pelvis_pos
@@ -376,7 +326,7 @@ class SimRobot(RobotInterface):
     def n_dof(self) -> int:
         return self._n_dof
 
-    # ---- Metal-specific: viewer integration ----
+    # ---- Viewer integration ----
 
     @property
     def mj_model(self) -> mujoco.MjModel:
@@ -409,31 +359,3 @@ class SimRobot(RobotInterface):
             self._data.xquat[body_id].copy(),
         )
 
-    # ---- Private ----
-
-    def _publish_low_state(self) -> None:
-        """Publish LowState_ DDS message with current sensor data."""
-        if self._low_state_msg is None or self._low_state_pub is None:
-            return
-
-        with self._lock:
-            sd = self._data.sensordata
-            nm = self._num_motor
-            dms = self._dim_motor_sensor
-
-            for i in range(nm):
-                self._low_state_msg.motor_state[i].q = float(sd[i])
-                self._low_state_msg.motor_state[i].dq = float(sd[nm + i])
-                self._low_state_msg.motor_state[i].tau_est = float(sd[2 * nm + i])
-
-            # IMU
-            for j in range(4):
-                self._low_state_msg.imu_state.quaternion[j] = float(sd[dms + j])
-            for j in range(3):
-                self._low_state_msg.imu_state.gyroscope[j] = float(sd[dms + 4 + j])
-            for j in range(3):
-                self._low_state_msg.imu_state.accelerometer[j] = float(
-                    sd[dms + 7 + j]
-                )
-
-        self._low_state_pub.Write(self._low_state_msg)

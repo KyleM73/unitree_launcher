@@ -1,8 +1,8 @@
-"""Display-only MuJoCo model that mirrors robot state.
+"""Mirror mode: display real robot state in MuJoCo viewer.
 
-Loads a separate MuJoCo scene (no physics) and updates joint positions,
-velocities, and base orientation from a RobotState. Used by scripts that
-need to visualize the real robot's state in MuJoCo.
+Provides ``RealtimeMirror`` (display-only MuJoCo model) and ``run_mirror()``
+(the ``uv run mirror`` entry point). Subscribes to the real robot's DDS
+state over Ethernet via ``MirrorRobot`` and renders in gui or viser.
 """
 from __future__ import annotations
 
@@ -64,3 +64,67 @@ class RealtimeMirror:
         self.data.qpos[fj + 6] = state.imu_quaternion[3]  # z
 
         mujoco.mj_forward(self.model, self.data)
+
+
+def run_mirror(args) -> None:
+    """Run the mirror viewer: subscribe to real robot DDS and display.
+
+    Supports --gui (MuJoCo GLFW viewer) and --viser (web viewer).
+    Called by ``uv run mirror``. Requires unitree_sdk2py (Python DDS) to
+    read LowState_ from the real robot over Ethernet.
+    """
+    import logging
+    import time
+
+    from unitree_launcher.compat import patch_unitree_b2_import, patch_unitree_crc, patch_unitree_threading
+    from unitree_launcher.robot.mirror_robot import MirrorRobot
+    from unitree_launcher.config import load_config
+
+    logging.basicConfig(level=logging.INFO, format="[%(name)s] %(message)s")
+    logger = logging.getLogger("mirror")
+
+    config = load_config(args.config)
+    config.network.interface = args.interface
+    config.network.domain_id = 0
+
+    # Patches needed for Python DDS
+    patch_unitree_b2_import()
+    patch_unitree_threading()
+    patch_unitree_crc()
+
+    mirror_display = RealtimeMirror()
+    robot = MirrorRobot(config)
+
+    logger.info("Connecting to robot on interface %s", args.interface)
+    robot.connect()
+    logger.info("Connected")
+
+    try:
+        if args.gui:
+            logger.info("Launching MuJoCo viewer")
+            with mujoco.viewer.launch_passive(mirror_display.model, mirror_display.data) as viewer:
+                while viewer.is_running():
+                    state = robot.get_state()
+                    mirror_display.update(state)
+                    viewer.sync()
+                    time.sleep(0.02)
+
+        elif args.viser:
+            from unitree_launcher.viz.viser_viewer import ViserViewer
+            logger.info("Launching viser viewer on port %d", args.port)
+            viser_viewer = ViserViewer(mirror_display.model, port=args.port)
+            viser_viewer.setup()
+            try:
+                while True:
+                    state = robot.get_state()
+                    mirror_display.update(state)
+                    viser_viewer.sync(mirror_display.data)
+                    time.sleep(0.02)
+            except KeyboardInterrupt:
+                pass
+            finally:
+                viser_viewer.close()
+
+    finally:
+        robot.disconnect()
+        logger.info("Mirror stopped")

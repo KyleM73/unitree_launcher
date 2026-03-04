@@ -262,55 +262,6 @@ class TestViserViewerUpdate:
 
 
 # ============================================================================
-# CLI Argument Parsing Tests
-# ============================================================================
-
-class TestViserCLIArgs:
-    def test_parse_viser_default_port(self):
-        """--viser uses default port 8080."""
-        from unitree_launcher.main import build_parser
-        args = build_parser().parse_args(
-            ["sim", "--policy", "p.onnx", "--viser"]
-        )
-        assert args.viser is True
-        assert args.port == 8080
-
-    def test_parse_viser_custom_port(self):
-        """--viser --port 9090 sets port to 9090."""
-        from unitree_launcher.main import build_parser
-        args = build_parser().parse_args(
-            ["sim", "--policy", "p.onnx", "--viser", "--port", "9090"]
-        )
-        assert args.viser is True
-        assert args.port == 9090
-
-    def test_parse_headless_default(self):
-        """Sim defaults to headless (no --gui, no --viser)."""
-        from unitree_launcher.main import build_parser
-        args = build_parser().parse_args(["sim", "--policy", "p.onnx"])
-        assert args.gui is False
-        assert args.viser is False
-
-    def test_parse_gui_and_viser_together(self):
-        """--gui and --viser can both be set."""
-        from unitree_launcher.main import build_parser
-        args = build_parser().parse_args(
-            ["sim", "--policy", "p.onnx", "--gui", "--viser"]
-        )
-        assert args.gui is True
-        assert args.viser is True
-
-    def test_parse_viser_real_mode(self):
-        """--viser works in real mode."""
-        from unitree_launcher.main import build_parser
-        args = build_parser().parse_args(
-            ["real", "--policy", "p.onnx", "--interface", "eth0", "--viser"]
-        )
-        assert args.viser is True
-        assert args.port == 8080
-
-
-# ============================================================================
 # Runner Integration Tests (mocked ViserViewer)
 # ============================================================================
 
@@ -319,15 +270,12 @@ class TestRunWithViser:
         """run_with_viser starts the controller and stops it on exit."""
         from unitree_launcher.main import run_with_viser
 
-        robot = MagicMock()
-        robot.mj_model = mujoco.MjModel.from_xml_path(SCENE_XML)
-        robot.mj_data = mujoco.MjData(robot.mj_model)
-        robot.lock = threading.Lock()
-
-        ctrl = MagicMock()
-        ctrl.is_running = False  # Exit immediately
-        ctrl.safety = MagicMock()
-        ctrl.safety.velocity_command = np.zeros(3)
+        rt = MagicMock()
+        rt.is_running = False  # Exit immediately
+        rt.safety = MagicMock()
+        rt.robot.mj_model = mujoco.MjModel.from_xml_path(SCENE_XML)
+        rt.robot.mj_data = mujoco.MjData(rt.robot.mj_model)
+        rt.robot.lock = threading.Lock()
 
         mock_viewer = MagicMock()
         mock_viewer.is_running.return_value = True
@@ -338,62 +286,61 @@ class TestRunWithViser:
             "unitree_launcher.viz.viser_viewer.ViserViewer",
             return_value=mock_viewer,
         ):
-            run_with_viser(robot, ctrl, port=0)
+            run_with_viser(rt, port=0)
 
-        ctrl.start.assert_called_once()
-        ctrl.stop.assert_called_once()
+        rt.start_threaded.assert_called_once()
+        rt.stop.assert_called_once()
         mock_viewer.setup.assert_called_once()
         mock_viewer.close.assert_called_once()
 
-    def test_run_with_viser_drains_keys_to_handle_key(self):
-        """Keys from viser GUI buttons are forwarded to controller.handle_key."""
+    def test_run_with_viser_drains_keys_to_keyboard(self):
+        """Keys from viser GUI buttons are forwarded to keyboard input."""
         from unitree_launcher.main import run_with_viser
+        from unitree_launcher.controller.keyboard import KeyboardInput
+        from unitree_launcher.controller.input import InputManager
 
-        robot = MagicMock()
-        robot.mj_model = mujoco.MjModel.from_xml_path(SCENE_XML)
-        robot.mj_data = mujoco.MjData(robot.mj_model)
-        robot.lock = threading.Lock()
-
-        ctrl = MagicMock()
-        ctrl.safety = MagicMock()
-        ctrl.safety.velocity_command = np.zeros(3)
+        kb = KeyboardInput()
+        rt = MagicMock()
+        rt.robot.mj_model = mujoco.MjModel.from_xml_path(SCENE_XML)
+        rt.robot.mj_data = mujoco.MjData(rt.robot.mj_model)
+        rt.robot.lock = threading.Lock()
+        rt.safety = MagicMock()
+        rt.input_manager = InputManager([kb])
 
         call_count = [0]
 
         def fake_is_running():
             call_count[0] += 1
-            return call_count[0] <= 1  # One iteration
+            return call_count[0] <= 1
 
-        type(ctrl).is_running = property(lambda self: fake_is_running())
+        type(rt).is_running = property(lambda self: fake_is_running())
 
         mock_viewer = MagicMock()
         mock_viewer.is_running.return_value = True
-        mock_viewer.drain_key_queue.return_value = ["space", "up"]
+        mock_viewer.drain_key_queue.return_value = ["up"]
         mock_viewer.get_velocity_commands.return_value = None
 
         with patch(
             "unitree_launcher.viz.viser_viewer.ViserViewer",
             return_value=mock_viewer,
         ):
-            run_with_viser(robot, ctrl, port=0)
+            run_with_viser(rt, port=0)
 
-        ctrl.handle_key.assert_any_call("space")
-        ctrl.handle_key.assert_any_call("up")
+        # Keyboard should have received the key
+        vel = kb.get_velocity()
+        assert vel[0] > 0  # "up" key incremented vx
 
     def test_run_with_viser_duration_termination(self):
         """With duration=0.1, run exits quickly."""
         from unitree_launcher.main import run_with_viser
         import time
 
-        robot = MagicMock()
-        robot.mj_model = mujoco.MjModel.from_xml_path(SCENE_XML)
-        robot.mj_data = mujoco.MjData(robot.mj_model)
-        robot.lock = threading.Lock()
-
-        ctrl = MagicMock()
-        ctrl.safety = MagicMock()
-        ctrl.safety.velocity_command = np.zeros(3)
-        type(ctrl).is_running = property(lambda self: True)
+        rt = MagicMock()
+        rt.robot.mj_model = mujoco.MjModel.from_xml_path(SCENE_XML)
+        rt.robot.mj_data = mujoco.MjData(rt.robot.mj_model)
+        rt.robot.lock = threading.Lock()
+        rt.safety = MagicMock()
+        type(rt).is_running = property(lambda self: True)
 
         mock_viewer = MagicMock()
         mock_viewer.is_running.return_value = True
@@ -405,7 +352,7 @@ class TestRunWithViser:
             return_value=mock_viewer,
         ):
             start = time.time()
-            run_with_viser(robot, ctrl, port=0, duration=0.1)
+            run_with_viser(rt, port=0, duration=0.1)
             elapsed = time.time() - start
 
         assert elapsed < 2.0, f"Should have exited quickly, took {elapsed:.1f}s"

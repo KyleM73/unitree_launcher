@@ -6,7 +6,6 @@ run the G1 on a virtual or real gantry harness.
 from __future__ import annotations
 
 import math
-from pathlib import Path
 
 import mujoco
 import numpy as np
@@ -43,7 +42,7 @@ class ElasticBand:
     def __init__(
         self,
         stiffness: float = 500.0,
-        damping: float = 300.0,
+        damping: float = 1000.0,
         point: np.ndarray = ANCHOR_POINT,
         length: float = 0.0,
     ):

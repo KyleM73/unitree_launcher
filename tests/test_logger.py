@@ -1,4 +1,4 @@
-"""Tests for Phase 10: Logging System (DataLogger + LogReplay)."""
+"""Tests for DataLogger and LogReplay (datalog/)."""
 import json
 import time
 from pathlib import Path

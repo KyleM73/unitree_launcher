@@ -6,10 +6,13 @@ MuJoCo visualization to match the real joint positions and IMU orientation.
 No physics simulation — MuJoCo is used purely for display.
 
 Usage:
-    mjpython -m scripts.mirror_real_robot [--interface IFACE]
+    uv run mirror --gui --interface en8
 
     --interface: Network interface connected to the robot (default: "en8").
                  Use "auto" for loopback (testing).
+
+This standalone script is an alternative to ``uv run mirror``.
+Run via: uv run python scripts/mirror_real_robot.py --interface en8
 """
 from __future__ import annotations
 
@@ -168,7 +171,7 @@ def main():
              "Use 'auto' for loopback.",
     )
     parser.add_argument(
-        "--record", nargs="?", const="sim.mp4", default=None,
+        "--record", nargs="?", const="recording.mp4", default=None,
         metavar="PATH",
         help="Record video to MP4 (default: recording.mp4)",
     )

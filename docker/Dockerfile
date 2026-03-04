@@ -5,7 +5,7 @@
 #   docker build -f docker/Dockerfile -t unitree-launcher .
 #
 # Run headless:
-#   docker run --rm unitree-launcher sim --headless --policy assets/policies/stance_29dof.onnx --duration 5
+#   docker run --rm unitree-launcher sim --policy assets/policies/stance_29dof.onnx --duration 5
 #
 # Run with X11 (Linux):
 #   xhost +local:docker
@@ -58,14 +58,18 @@ COPY scripts/ scripts/
 # Create venv and install all dependencies (including dev for pytest).
 RUN uv venv /app/.venv --python 3.10 \
     && . /app/.venv/bin/activate \
-    && uv pip install -e ".[dev]"
+    && uv pip install -e ".[sim,dev]"
 
 # Patch unitree_sdk2py: remove 'b2' submodule import (doesn't exist, causes
 # circular import errors). We don't use the b2 API.
-RUN sed -i 's/from \. import idl, utils, core, rpc, go2, b2/from . import idl, utils, core, rpc, go2/' \
-    /app/.venv/lib/python3.10/site-packages/unitree_sdk2py/__init__.py \
-    && sed -i '/"b2",/d' \
-    /app/.venv/lib/python3.10/site-packages/unitree_sdk2py/__init__.py
+RUN INIT=/app/.venv/lib/python3.10/site-packages/unitree_sdk2py/__init__.py \
+    && if [ -f "$INIT" ] && grep -q 'import.*b2' "$INIT"; then \
+        sed -i 's/from \. import idl, utils, core, rpc, go2, b2/from . import idl, utils, core, rpc, go2/' "$INIT" \
+        && sed -i '/"b2",/d' "$INIT" \
+        && echo "[docker] Patched unitree_sdk2py (removed b2 import)"; \
+    else \
+        echo "[docker] unitree_sdk2py b2 patch not needed (file missing or already clean)"; \
+    fi
 
 # ── Optional: C++ unitree_interface backend ────────────────────────────
 # Build the pybind11 module from amazon-far/unitree_sdk2 for real robot

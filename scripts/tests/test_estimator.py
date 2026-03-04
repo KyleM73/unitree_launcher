@@ -147,7 +147,7 @@ def build_sim(policy_path: str):
 
         il_joints = [j.replace("_joint", "") for j in ISAACLAB_G1_29DOF_JOINTS[:n_actions]]
         default_joint_mapper = JointMapper(
-            robot_joints=robot_joints, observed_joints=il_joints, controlled_joints=il_joints,
+            robot_joints=robot_joints, policy_joints=il_joints,
         )
         for use_est in [True, False]:
             default_obs_builder = ObservationBuilder(default_joint_mapper, config, use_estimator=use_est)
@@ -165,7 +165,7 @@ def build_sim(policy_path: str):
         policy_joints = None
 
     active_mapper = JointMapper(
-        robot_joints=robot_joints, observed_joints=policy_joints, controlled_joints=policy_joints,
+        robot_joints=robot_joints, policy_joints=policy_joints,
     )
     active_policy = BeyondMimicPolicy(active_mapper, obs_dim=160, use_onnx_metadata=True)
     active_policy.load(policy_path)

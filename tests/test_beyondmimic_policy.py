@@ -1,10 +1,9 @@
-"""Tests for BeyondMimic policy backend (Phase 6, Task 6.4).
+"""Tests for BeyondMimicPolicy (policy/beyondmimic_policy.py).
 
 Includes value-level geometry checks for 6D rotation, body-relative
 transforms, and quaternion operations.
 """
 import os
-import tempfile
 
 import numpy as np
 import pytest
@@ -51,8 +50,7 @@ def joint_mapper_isaaclab_order():
     """JointMapper with observed/controlled in IsaacLab order."""
     return JointMapper(
         G1_29DOF_JOINTS,
-        observed_joints=_ISAACLAB_ORDER_CONFIG_NAMES,
-        controlled_joints=_ISAACLAB_ORDER_CONFIG_NAMES,
+        policy_joints=_ISAACLAB_ORDER_CONFIG_NAMES,
     )
 
 
@@ -319,9 +317,10 @@ class TestBeyondMimicLoad:
             joint_mapper_isaaclab_order, bm_obs_dim, use_onnx_metadata=False
         )
         policy.load(bm_model_path)
-        assert policy.stiffness is None
-        assert policy.damping is None
-        assert policy.action_scale is None
+        # stiffness/damping/action_scale return defaults (never None)
+        assert policy.stiffness is not None
+        assert policy.damping is not None
+        assert policy.action_scale is not None
 
     def test_metadata_missing_required_field(
         self, joint_mapper_isaaclab_order, bm_obs_dim, tmp_path
@@ -332,11 +331,6 @@ class TestBeyondMimicLoad:
         policy = BeyondMimicPolicy(joint_mapper_isaaclab_order, bm_obs_dim)
         with pytest.raises(ValueError, match="joint_names"):
             policy.load(path)
-
-    def test_metadata_malformed_string(self):
-        """_safe_parse should raise ValueError, not SyntaxError."""
-        with pytest.raises(ValueError, match="Failed to parse"):
-            BeyondMimicPolicy._safe_parse("{malformed[")
 
     def test_load_invalid_path_raises(
         self, joint_mapper_isaaclab_order, bm_obs_dim
@@ -442,7 +436,7 @@ class TestBeyondMimicObservation:
         # joint_pos starts at 73, length 29
         default_jp = bm_policy.default_joint_pos
         # The mapper reorders robot-native to IsaacLab order
-        expected_jp = bm_policy._mapper.robot_to_observation(
+        expected_jp = bm_policy._mapper.robot_to_policy(
             standing_robot_state.joint_positions
         ) - default_jp
         np.testing.assert_allclose(obs[73:102], expected_jp, atol=1e-12)

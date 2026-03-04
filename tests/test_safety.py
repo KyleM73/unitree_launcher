@@ -126,33 +126,15 @@ class TestStateTransitions:
 # ---------------------------------------------------------------------------
 
 class TestDampingCommand:
-    def test_damping_command_shape(self, safety, standing_state):
-        cmd = safety.get_damping_command(standing_state)
-        assert cmd.joint_positions.shape == (29,)
-        assert cmd.joint_velocities.shape == (29,)
-        assert cmd.joint_torques.shape == (29,)
-        assert cmd.kp.shape == (29,)
-        assert cmd.kd.shape == (29,)
-
-    def test_damping_command_zero_kp(self, safety, standing_state):
-        cmd = safety.get_damping_command(standing_state)
-        np.testing.assert_array_equal(cmd.kp, np.zeros(29))
-
-    def test_damping_command_kd_set(self, safety, standing_state):
-        cmd = safety.get_damping_command(standing_state)
-        np.testing.assert_array_equal(cmd.kd, np.full(29, 5.0))
-
-    def test_damping_command_position_is_current(self, safety, standing_state):
+    def test_damping_command_values(self, safety, standing_state):
+        """Damping command has correct shape and field values."""
         standing_state.joint_positions = np.arange(29, dtype=float) * 0.1
         cmd = safety.get_damping_command(standing_state)
+        assert cmd.joint_positions.shape == (29,)
+        np.testing.assert_array_equal(cmd.kp, np.zeros(29))
+        np.testing.assert_array_equal(cmd.kd, np.full(29, 8.0))
         np.testing.assert_array_equal(cmd.joint_positions, standing_state.joint_positions)
-
-    def test_damping_command_zero_velocity_target(self, safety, standing_state):
-        cmd = safety.get_damping_command(standing_state)
         np.testing.assert_array_equal(cmd.joint_velocities, np.zeros(29))
-
-    def test_damping_command_zero_torque(self, safety, standing_state):
-        cmd = safety.get_damping_command(standing_state)
         np.testing.assert_array_equal(cmd.joint_torques, np.zeros(29))
 
     def test_damping_command_does_not_alias_state(self, safety, standing_state):
@@ -468,82 +450,37 @@ class TestCheckStateLimits:
         assert safety.check_state_limits(state) is False
         assert safety.state == SystemState.RUNNING
 
-    def test_position_high_fault(self, config):
-        """Position at 100% of max limit triggers ESTOP."""
+    @pytest.mark.parametrize("field,value_fn", [
+        ("joint_positions", lambda: JOINT_LIMITS_29DOF["left_hip_pitch"][1]),
+        ("joint_positions", lambda: JOINT_LIMITS_29DOF["left_hip_pitch"][0]),
+        ("joint_velocities", lambda: VELOCITY_LIMITS_29DOF["left_hip_pitch"]),
+        ("joint_velocities", lambda: -VELOCITY_LIMITS_29DOF["left_hip_pitch"]),
+        ("joint_torques", lambda: TORQUE_LIMITS_29DOF["left_hip_pitch"]),
+    ], ids=["pos_high", "pos_low", "vel_high", "vel_neg", "torque"])
+    def test_limit_fault_triggers_estop(self, config, field, value_fn):
+        """Exceeding any limit on left_hip_pitch (index 0) triggers ESTOP."""
         safety = SafetyController(config, n_dof=29)
         safety.start()
         state = self._home_state()
-        # Set left_hip_pitch (index 0) to its max limit (2.88)
-        state.joint_positions[0] = JOINT_LIMITS_29DOF["left_hip_pitch"][1]
+        getattr(state, field)[0] = value_fn()
         assert safety.check_state_limits(state) is True
         assert safety.state == SystemState.ESTOP
 
-    def test_position_low_fault(self, config):
-        """Position at 100% of min limit triggers ESTOP."""
+    @pytest.mark.parametrize("flag,field,value_fn", [
+        ("joint_position_limits", "joint_positions",
+         lambda: JOINT_LIMITS_29DOF["left_hip_pitch"][1]),
+        ("joint_velocity_limits", "joint_velocities",
+         lambda: VELOCITY_LIMITS_29DOF["left_hip_pitch"]),
+        ("torque_limits", "joint_torques",
+         lambda: TORQUE_LIMITS_29DOF["left_hip_pitch"]),
+    ], ids=["pos_disabled", "vel_disabled", "torque_disabled"])
+    def test_disabled_limits_no_fault(self, config, flag, field, value_fn):
+        """When a limit check is disabled, exceeding that limit is OK."""
+        setattr(config.safety, flag, False)
         safety = SafetyController(config, n_dof=29)
         safety.start()
         state = self._home_state()
-        # Set left_hip_pitch (index 0) to its min limit (-2.53)
-        state.joint_positions[0] = JOINT_LIMITS_29DOF["left_hip_pitch"][0]
-        assert safety.check_state_limits(state) is True
-        assert safety.state == SystemState.ESTOP
-
-    def test_velocity_fault(self, config):
-        """Velocity at 100% of limit triggers ESTOP."""
-        safety = SafetyController(config, n_dof=29)
-        safety.start()
-        state = self._home_state()
-        # left_hip_pitch velocity limit is 32.0 rad/s
-        state.joint_velocities[0] = VELOCITY_LIMITS_29DOF["left_hip_pitch"]
-        assert safety.check_state_limits(state) is True
-        assert safety.state == SystemState.ESTOP
-
-    def test_torque_fault(self, config):
-        """Torque at 100% of limit triggers ESTOP."""
-        safety = SafetyController(config, n_dof=29)
-        safety.start()
-        state = self._home_state()
-        # left_hip_pitch torque limit is 88.0 Nm
-        state.joint_torques[0] = TORQUE_LIMITS_29DOF["left_hip_pitch"]
-        assert safety.check_state_limits(state) is True
-        assert safety.state == SystemState.ESTOP
-
-    def test_negative_velocity_fault(self, config):
-        """Negative velocity exceeding threshold triggers ESTOP."""
-        safety = SafetyController(config, n_dof=29)
-        safety.start()
-        state = self._home_state()
-        state.joint_velocities[0] = -VELOCITY_LIMITS_29DOF["left_hip_pitch"]
-        assert safety.check_state_limits(state) is True
-        assert safety.state == SystemState.ESTOP
-
-    def test_disabled_position_limits_no_fault(self, config):
-        """With joint_position_limits=False, exceeding position is OK."""
-        config.safety.joint_position_limits = False
-        safety = SafetyController(config, n_dof=29)
-        safety.start()
-        state = self._home_state()
-        state.joint_positions[0] = JOINT_LIMITS_29DOF["left_hip_pitch"][1]
-        assert safety.check_state_limits(state) is False
-        assert safety.state == SystemState.RUNNING
-
-    def test_disabled_velocity_limits_no_fault(self, config):
-        """With joint_velocity_limits=False, exceeding velocity is OK."""
-        config.safety.joint_velocity_limits = False
-        safety = SafetyController(config, n_dof=29)
-        safety.start()
-        state = self._home_state()
-        state.joint_velocities[0] = VELOCITY_LIMITS_29DOF["left_hip_pitch"]
-        assert safety.check_state_limits(state) is False
-        assert safety.state == SystemState.RUNNING
-
-    def test_disabled_torque_limits_no_fault(self, config):
-        """With torque_limits=False, exceeding torque is OK."""
-        config.safety.torque_limits = False
-        safety = SafetyController(config, n_dof=29)
-        safety.start()
-        state = self._home_state()
-        state.joint_torques[0] = TORQUE_LIMITS_29DOF["left_hip_pitch"]
+        getattr(state, field)[0] = value_fn()
         assert safety.check_state_limits(state) is False
         assert safety.state == SystemState.RUNNING
 
@@ -553,7 +490,6 @@ class TestCheckStateLimits:
         safety = SafetyController(config, n_dof=29)
         safety.start()
         state = self._home_state()
-        # 60% of 32.0 = 19.2, which exceeds 0.5 * 32.0 = 16.0
         state.joint_velocities[0] = 0.6 * VELOCITY_LIMITS_29DOF["left_hip_pitch"]
         assert safety.check_state_limits(state) is True
         assert safety.state == SystemState.ESTOP
@@ -563,7 +499,6 @@ class TestCheckStateLimits:
         safety = SafetyController(config, n_dof=29)
         safety.start()
         state = self._home_state()
-        # 94% of velocity limit (threshold is 95%)
         state.joint_velocities[0] = 0.94 * VELOCITY_LIMITS_29DOF["left_hip_pitch"]
         assert safety.check_state_limits(state) is False
         assert safety.state == SystemState.RUNNING
@@ -573,7 +508,6 @@ class TestCheckStateLimits:
         safety = SafetyController(config, n_dof=29)
         safety.start()
         safety.estop()
-        assert safety.state == SystemState.ESTOP
         state = self._home_state()
         state.joint_velocities[0] = VELOCITY_LIMITS_29DOF["left_hip_pitch"]
         assert safety.check_state_limits(state) is False
@@ -581,7 +515,6 @@ class TestCheckStateLimits:
     def test_idle_returns_false(self, config):
         """When in IDLE (pre-operational), check_state_limits skips."""
         safety = SafetyController(config, n_dof=29)
-        assert safety.state == SystemState.IDLE
         state = self._home_state()
         state.joint_velocities[0] = VELOCITY_LIMITS_29DOF["left_hip_pitch"]
         assert safety.check_state_limits(state) is False

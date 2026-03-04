@@ -1,8 +1,4 @@
-"""Safety controller with state machine, damping, orientation check, and limit clamping.
-
-Implements the safety system from SPEC section 7: E-stop behavior, damping mode,
-state machine transitions, and command limit enforcement.
-"""
+"""Safety controller with state machine, damping, orientation check, and limit clamping."""
 from __future__ import annotations
 
 import logging
@@ -39,6 +35,8 @@ class ControlMode(Enum):
     DEFAULT = "default"      # Default policy running (IL velocity tracking, zero vel = stance)
     ACTIVE_POLICY = "active" # Running the --policy (BM, another IL, etc.)
     DAMPING = "damping"      # Pure velocity damping (kp=0, kd=kd_damp)
+    PREPARE = "prepare"      # Linear blend from current pos to default (re-reads each step)
+    TRANSITION = "transition"    # Blending from captured command to live policy
     INTERPOLATE = "interpolate"  # Cosine-ramp position + gains over a duration
 
 
@@ -160,6 +158,70 @@ class SafetyController:
         else:
             angle_deg = np.degrees(np.arccos(np.clip(-gz, -1.0, 1.0)))
             return (False, f"Unsafe orientation: {angle_deg:.1f} deg from vertical (limit ~35 deg)")
+
+    def check_tilt(self, imu_quaternion: np.ndarray) -> bool:
+        """Check if robot has fallen beyond the tilt threshold.
+
+        Called every control tick. If tilt exceeds threshold, triggers
+        E-stop (latching). Matching RoboJuDo's safety_check() behavior.
+
+        Args:
+            imu_quaternion: (4,) wxyz quaternion from IMU.
+
+        Returns:
+            True if safe, False if fallen (E-stop triggered).
+        """
+        if not self._safety_config.tilt_check:
+            return True
+        if self._state != SystemState.RUNNING:
+            return True  # Only check during active policy execution
+
+        w, x, y, z = imu_quaternion
+        R = np.array([
+            [1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
+            [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+            [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)],
+        ])
+        gravity_body = R.T @ np.array([0.0, 0.0, -1.0])
+        gz = gravity_body[2]
+
+        angle = np.arccos(np.clip(-gz, -1.0, 1.0))
+        if angle > self._safety_config.tilt_threshold_rad:
+            logger.error(
+                "Robot tilt %.1f deg exceeds limit %.1f deg — E-stop!",
+                np.degrees(angle),
+                np.degrees(self._safety_config.tilt_threshold_rad),
+            )
+            self.estop()
+            return False
+        return True
+
+    def check_frame_drop(self, loop_time: float) -> bool:
+        """Check if a control loop iteration exceeded the time budget.
+
+        If a single step takes longer than the threshold, the robot may
+        be experiencing compute issues and should shut down for safety.
+
+        Args:
+            loop_time: Duration of the last control loop iteration in seconds.
+
+        Returns:
+            True if safe, False if frame dropped (E-stop triggered).
+        """
+        if not self._safety_config.frame_drop_check:
+            return True
+        if self._state == SystemState.ESTOP:
+            return True
+
+        if loop_time > self._safety_config.frame_drop_threshold:
+            logger.critical(
+                "Frame drop: %.0f ms > %.0f ms threshold — E-stop!",
+                loop_time * 1000,
+                self._safety_config.frame_drop_threshold * 1000,
+            )
+            self.estop()
+            return False
+        return True
 
     def clamp_command(self, cmd: RobotCommand) -> RobotCommand:
         """Enforce safety limits on a command.

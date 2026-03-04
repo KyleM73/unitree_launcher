@@ -9,16 +9,15 @@
 # This script will exit with an error on non-Linux platforms.
 #
 # Usage:
-#   ./scripts/build_cpp_backend.sh           # build and install into active venv
+#   ./scripts/build_cpp_backend.sh           # build and install into uv venv
 #   ./scripts/build_cpp_backend.sh --clean   # remove cached clone and rebuild
 #   CLONE_DIR=/path/to/dir ./scripts/...     # override clone location
 #
 # Requirements (auto-checked):
 #   - Linux (x86_64 or aarch64)
 #   - cmake, g++ (or build-essential)
-#   - pybind11 (auto-installed into venv if missing)
-#   - patchelf (auto-installed via pip if missing)
-#   - Active Python venv (checks $VIRTUAL_ENV or .venv/)
+#   - uv (Python package manager)
+#   - pybind11, patchelf (auto-installed via uv sync)
 
 set -euo pipefail
 
@@ -70,25 +69,25 @@ for arg in "$@"; do
     esac
 done
 
-# ── Find Python venv ────────────────────────────────────────────────────
-if [[ -n "${VIRTUAL_ENV:-}" ]]; then
-    VENV_DIR="$VIRTUAL_ENV"
-elif [[ -d ".venv" ]]; then
-    VENV_DIR="$(pwd)/.venv"
-else
-    error "No active Python virtual environment found."
-    error "Activate a venv or create one with: python -m venv .venv && source .venv/bin/activate"
+# ── Find Python via uv ─────────────────────────────────────────────────
+if ! command -v uv &>/dev/null; then
+    error "uv not found. Install with: curl -LsSf https://astral.sh/uv/install.sh | sh"
     exit 1
 fi
 
+# Ensure venv and dependencies exist
+info "Running uv sync..."
+uv sync --quiet
+
+VENV_DIR="$(pwd)/.venv"
 PYTHON="$VENV_DIR/bin/python"
 if [[ ! -x "$PYTHON" ]]; then
-    error "Python not found at $PYTHON"
+    error "Python not found at $PYTHON after uv sync"
     exit 1
 fi
 
 SITE_PACKAGES="$("$PYTHON" -c 'import site; print(site.getsitepackages()[0])')"
-info "Venv: $VENV_DIR"
+info "Python: $PYTHON"
 info "Site-packages: $SITE_PACKAGES"
 
 # ── Dependency checks ──────────────────────────────────────────────────
@@ -100,13 +99,12 @@ check_cmd() {
     fi
 }
 
-check_cmd cmake "apt-get install cmake"
-check_cmd g++ "apt-get install build-essential"
+check_cmd cmake "sudo apt-get install cmake"
+check_cmd g++ "sudo apt-get install build-essential"
 
-# pybind11 and patchelf are installed automatically on Linux via pyproject.toml
-# (sys_platform == 'linux' markers). Verify they're present.
+# pybind11 and patchelf are installed via uv sync (pyproject.toml linux markers)
 if ! "$PYTHON" -c "import pybind11" &>/dev/null; then
-    error "pybind11 not found. Run: uv sync (should auto-install on Linux)"
+    error "pybind11 not found after uv sync"
     exit 1
 fi
 
@@ -114,7 +112,7 @@ PATCHELF="patchelf"
 if ! command -v patchelf &>/dev/null; then
     PATCHELF="$VENV_DIR/bin/patchelf"
     if [[ ! -x "$PATCHELF" ]]; then
-        error "patchelf not found. Run: uv sync (should auto-install on Linux)"
+        error "patchelf not found after uv sync"
         exit 1
     fi
 fi
@@ -230,7 +228,7 @@ info "Verifying import..."
 if "$PYTHON" -c "import unitree_interface; print('unitree_interface loaded:', dir(unitree_interface))"; then
     echo ""
     info "SUCCESS — unitree_interface installed and importable."
-    info "Use with: python -m unitree_launcher.main real --backend cpp ..."
+    info "Run with: uv run real -c configs/g1_deploy.yaml --policy <path>"
 else
     echo ""
     error "FAILED — unitree_interface could not be imported."

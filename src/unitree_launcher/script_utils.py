@@ -1,10 +1,10 @@
-"""Shared helpers for test scripts.
+"""Shared helpers for diagnostic/test scripts in scripts/tests/.
 
 Provides:
-    build_script_parser   -- argparse with unified sim/real subcommands
-    create_robot          -- robot factory from mode + config
+    build_script_parser   -- argparse with sim/real subcommands
+    create_robot          -- robot factory (SimRobot or RealRobot)
     ScriptContext         -- context manager for viewer, gamepad, recorder, shutdown
-    phase_settle          -- shared gantry settle phase (3 scripts use this)
+    phase_settle          -- shared gantry settle phase
 """
 from __future__ import annotations
 
@@ -40,7 +40,7 @@ def build_script_parser(
 
     All scripts get: --config, --gui, --viser, --port, --gamepad, --record.
     Scripts with ``sim_only=False`` get sim/real subcommands with --interface
-    and --backend on the real parser.
+    on the real parser.
 
     Args:
         description: Script description for help text.
@@ -75,17 +75,14 @@ def build_script_parser(
         sim_parser = subparsers.add_parser("sim", help="Simulation mode (default)")
         _add_common(sim_parser)
         # Real-only args with defaults so args.interface etc. always exist.
-        sim_parser.set_defaults(interface=None, backend="python")
+        sim_parser.set_defaults(interface=None)
         if extra_args_fn:
             extra_args_fn(sim_parser)
 
-        real_parser = subparsers.add_parser("real", help="Real robot mode")
+        real_parser = subparsers.add_parser("real", help="Real robot mode (onboard)")
         _add_common(real_parser)
-        real_parser.add_argument("--interface", default="en8",
-                                 help="Network interface (default: en8)")
-        real_parser.add_argument("--backend", choices=["python", "cpp"],
-                                 default="python",
-                                 help="Real robot SDK backend")
+        real_parser.add_argument("--interface", default="eth0",
+                                 help="Network interface (default: eth0)")
         if extra_args_fn:
             extra_args_fn(real_parser)
 
@@ -96,25 +93,20 @@ def build_script_parser(
 # Robot factory
 # ============================================================================
 
-def create_robot(mode: str, config, interface: str | None = None,
-                 backend: str = "python"):
+def create_robot(mode: str, config, interface: str | None = None, **_kwargs):
     """Create and configure a SimRobot or RealRobot from mode string.
 
     Returns the robot instance (not yet connected).
     """
-    if mode == "sim":
+    if mode in ("sim", "eval"):
         from unitree_launcher.robot.sim_robot import SimRobot
         config.network.domain_id = 1
         return SimRobot(config)
     else:
+        from unitree_launcher.robot.real_robot import RealRobot
         config.network.domain_id = 0
         config.network.interface = interface
-        if backend == "cpp":
-            from unitree_launcher.robot.cpp_real_robot import CppRealRobot
-            return CppRealRobot(config)
-        else:
-            from unitree_launcher.robot.real_robot import RealRobot
-            return RealRobot(config)
+        return RealRobot(config)
 
 
 # ============================================================================

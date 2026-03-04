@@ -5,7 +5,6 @@ upload at setup, then per-frame transform updates from mj_data.
 """
 from __future__ import annotations
 
-import os
 import queue
 import threading
 from pathlib import Path
@@ -38,6 +37,7 @@ class ViserViewer:
         port: int = 8080,
         policy_paths: Optional[list[str]] = None,
         active_policy: Optional[str] = None,
+        gantry: bool = False,
     ):
         self._mj_model = mj_model
         self._port = port
@@ -51,6 +51,7 @@ class ViserViewer:
         self._active_policy_name = active_policy or (
             next(iter(self._policy_map)) if self._policy_map else "unknown"
         )
+        self._gantry = gantry
 
         self._server: viser.ViserServer | None = None
         self._body_handles: dict[int, viser._scene_handles.GlbHandle] = {}
@@ -60,6 +61,8 @@ class ViserViewer:
         self._vx_slider = None
         self._vy_slider = None
         self._yaw_slider = None
+        self._base_velocity = None
+        self._sim_time = 0.0
 
         # Follow camera: track pelvis body.
         self._pelvis_id = mujoco.mj_name2id(
@@ -131,33 +134,34 @@ class ViserViewer:
             self._follow_btn = self._server.gui.add_button("Camera: Free")
             self._follow_btn.on_click(lambda _: self._toggle_follow())
 
-        # ---- Velocity folder ----
-        with self._server.gui.add_folder("Velocity"):
-            self._vx_slider = self._server.gui.add_slider(
-                "vx", min=-1.0, max=1.0, step=0.05, initial_value=0.0
-            )
-            self._vy_slider = self._server.gui.add_slider(
-                "vy", min=-1.0, max=1.0, step=0.05, initial_value=0.0
-            )
-            self._yaw_slider = self._server.gui.add_slider(
-                "yaw", min=-1.0, max=1.0, step=0.05, initial_value=0.0
-            )
-            btn_zero = self._server.gui.add_button("Zero Velocity")
-            btn_zero.on_click(lambda _: self._zero_velocity())
-
-        # ---- Policy folder (individual buttons stack vertically) ----
-        with self._server.gui.add_folder("Policy"):
-            policy_names = list(self._policy_map.keys()) or [self._active_policy_name]
-            for name in policy_names:
-                btn = self._server.gui.add_button(name)
-                # Capture name in closure via default arg.
-                btn.on_click(lambda _ev, n=name: self._on_policy_button(n))
+        # ---- Policy folder (hidden in gantry mode) ----
+        if not self._gantry:
+            with self._server.gui.add_folder("Policy"):
+                policy_names = list(self._policy_map.keys()) or [self._active_policy_name]
+                for name in policy_names:
+                    btn = self._server.gui.add_button(name)
+                    btn.on_click(lambda _ev, n=name: self._on_policy_button(n))
 
         # ---- Status panel ----
         with self._server.gui.add_folder("Status"):
             self._status_handle = self._server.gui.add_markdown(
                 "**State:** IDLE | **Time:** 0.0s"
             )
+
+        # ---- Velocity sliders (hidden in gantry mode) ----
+        if not self._gantry:
+            with self._server.gui.add_folder("Velocity Sliders"):
+                self._vx_slider = self._server.gui.add_slider(
+                    "vx", min=-1.0, max=1.0, step=0.05, initial_value=0.0
+                )
+                self._vy_slider = self._server.gui.add_slider(
+                    "vy", min=-1.0, max=1.0, step=0.05, initial_value=0.0
+                )
+                self._yaw_slider = self._server.gui.add_slider(
+                    "yaw", min=-1.0, max=1.0, step=0.05, initial_value=0.0
+                )
+                btn_zero = self._server.gui.add_button("Zero Velocity")
+                btn_zero.on_click(lambda _: self._zero_velocity())
 
     def _toggle_follow(self) -> None:
         """Toggle between follow and free camera modes."""
@@ -273,12 +277,14 @@ class ViserViewer:
         self,
         state: str,
         policy_name: str,
+        velocity_command: object = None,
+        telemetry: dict | None = None,
     ) -> None:
         """Update the status panel in the GUI sidebar."""
         if self._status_handle is None:
             return
-        vel = getattr(self, '_base_velocity', None)
-        sim_time = getattr(self, '_sim_time', 0.0)
+        vel = self._base_velocity
+        sim_time = self._sim_time
         if vel is not None:
             vel_lines = (
                 f"&nbsp;&nbsp;&nbsp;&nbsp;vx = {vel[0]:+.2f}\n\n"
@@ -287,13 +293,32 @@ class ViserViewer:
             )
         else:
             vel_lines = "&nbsp;&nbsp;&nbsp;&nbsp;---"
+        if velocity_command is not None:
+            cmd_lines = (
+                f"&nbsp;&nbsp;&nbsp;&nbsp;vx = {velocity_command[0]:+.2f}\n\n"
+                f"&nbsp;&nbsp;&nbsp;&nbsp;vy = {velocity_command[1]:+.2f}\n\n"
+                f"&nbsp;&nbsp;&nbsp;&nbsp;yaw = {velocity_command[2]:+.2f}"
+            )
+        else:
+            cmd_lines = "&nbsp;&nbsp;&nbsp;&nbsp;---"
+
+        # Telemetry line
+        if telemetry:
+            hz = telemetry.get("loop_hz", 0.0)
+            inf = telemetry.get("inference_ms", 0.0)
+            height = telemetry.get("base_height", 0.0)
+            steps = telemetry.get("step_count", 0)
+            telem_line = f"{hz:.0f} Hz | {inf:.1f}ms inf | {height:.3f}m | step {steps}"
+        else:
+            telem_line = "---"
+
         cam_mode = "Follow" if self._follow_mode else "Free"
         self._status_handle.content = (
-            f"**Time:** {sim_time:.1f}s\n\n"
-            f"**State:** {state}\n\n"
-            f"**Policy:** {policy_name}\n\n"
-            f"**Camera:** {cam_mode}\n\n"
-            f"**Velocity:**\n\n{vel_lines}"
+            f"**State:** {state} | **Policy:** {policy_name}\n\n"
+            f"**Telemetry:** {telem_line}\n\n"
+            f"**Time:** {sim_time:.1f}s | **Camera:** {cam_mode}\n\n"
+            f"**Velocity Cmd:**\n\n{cmd_lines}\n\n"
+            f"**Base Velocity:**\n\n{vel_lines}"
         )
 
     def is_running(self) -> bool:

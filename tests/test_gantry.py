@@ -35,7 +35,7 @@ def _make_args(config_path):
         mode="sim", config=config_path,
         gui=False, viser=False, port=8080,
         gamepad=False, record=None,
-        interface=None, backend="python",
+        interface=None,
     )
 
 

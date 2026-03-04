@@ -14,18 +14,24 @@ inference.  Unlike IsaacLab, BeyondMimic:
 """
 from __future__ import annotations
 
-import ast
 from typing import Any, Dict, List, Optional
 
 import numpy as np
 import onnxruntime as ort
 
-from unitree_launcher.policy.base import PolicyInterface
+from unitree_launcher.config import (
+    BM_ACTION_SCALE_29DOF,
+    ISAACLAB_KD_29DOF,
+    ISAACLAB_KP_29DOF,
+    Q_HOME_29DOF,
+    Q_HOME_23DOF,
+)
+from unitree_launcher.policy.base import Policy
 from unitree_launcher.policy.joint_mapper import JointMapper
-from unitree_launcher.robot.base import RobotState
+from unitree_launcher.robot.base import RobotCommand, RobotState
 
 
-class BeyondMimicPolicy(PolicyInterface):
+class BeyondMimicPolicy(Policy):
     """ONNX-based BeyondMimic motion-tracking policy.
 
     Args:
@@ -39,13 +45,44 @@ class BeyondMimicPolicy(PolicyInterface):
         joint_mapper: JointMapper,
         obs_dim: int,
         use_onnx_metadata: bool = True,
+        config: Optional['Config'] = None,
     ) -> None:
-        self._mapper = joint_mapper
+        super().__init__(joint_mapper, n_dof=joint_mapper.n_robot)
         self._obs_dim = obs_dim
         self._use_onnx_metadata = use_onnx_metadata
-        self._session: ort.InferenceSession | None = None
 
-        n = joint_mapper.n_controlled
+        # Set default gains (overridden by ONNX metadata in _apply_metadata)
+        policy_joints = joint_mapper.policy_joints
+        self._kp = np.array(
+            [ISAACLAB_KP_29DOF.get(j, 40.0) for j in policy_joints],
+            dtype=np.float64,
+        )
+        self._kd = np.array(
+            [ISAACLAB_KD_29DOF.get(j, 2.0) for j in policy_joints],
+            dtype=np.float64,
+        )
+        self._action_scale = np.array(
+            [BM_ACTION_SCALE_29DOF.get(j, 0.439) for j in policy_joints],
+            dtype=np.float64,
+        )
+
+        # Home positions for full robot (for template filling)
+        if config is not None:
+            variant = config.robot.variant
+            q_home_dict = config.control.q_home or (
+                Q_HOME_29DOF if variant == "g1_29dof" else Q_HOME_23DOF
+            )
+            self._default_pos_robot = np.array(
+                [q_home_dict[j] for j in joint_mapper.robot_joints], dtype=np.float64
+            )
+            self._kd_damp = config.control.kd_damp
+
+        self._start_timestep = 0  # Overridden by ONNX metadata "start_timestep"
+        self._time_step = 0
+        self._hold_steps = 5  # Repeat first reference frame N times before advancing
+        self._hold_count = 0
+
+        n = joint_mapper.n_policy
         self._target_q: np.ndarray = np.zeros(n)
         self._target_dq: np.ndarray = np.zeros(n)
         self._prev_target_q: np.ndarray = np.zeros(n)
@@ -58,12 +95,12 @@ class BeyondMimicPolicy(PolicyInterface):
         self._metadata: Dict[str, Any] = {}
         self._obs_terms: List[str] = []
         self._default_joint_pos: np.ndarray = np.zeros(n)
-        self._stiffness: Optional[np.ndarray] = None
-        self._damping: Optional[np.ndarray] = None
-        self._action_scale: Optional[np.ndarray] = None
         self._anchor_body_name: str = ""
         self._body_names: List[str] = []
         self._anchor_body_idx: int = 0
+
+        # Robot reference for anchor body lookups (set via set_robot)
+        self._robot = None
 
         # Trajectory length (lazy detection)
         self._trajectory_length: Optional[int] = None
@@ -77,7 +114,7 @@ class BeyondMimicPolicy(PolicyInterface):
         self._body_quat_w_idx: Optional[int] = None
 
     # ------------------------------------------------------------------
-    # PolicyInterface implementation
+    # Policy implementation
     # ------------------------------------------------------------------
 
     def load(self, path: str) -> None:
@@ -124,10 +161,10 @@ class BeyondMimicPolicy(PolicyInterface):
         # Validate action dimension
         action_output = session.get_outputs()[self._action_idx]
         model_action_dim = action_output.shape[1]
-        if model_action_dim != self._mapper.n_controlled:
+        if model_action_dim != self._mapper.n_policy:
             raise ValueError(
                 f"ONNX action dim {model_action_dim} != "
-                f"n_controlled {self._mapper.n_controlled}"
+                f"n_controlled {self._mapper.n_policy}"
             )
 
         self._session = session
@@ -137,13 +174,16 @@ class BeyondMimicPolicy(PolicyInterface):
         self.reset()
 
     def reset(self) -> None:
-        """Clear cached actions, targets, and body reference outputs.
+        """Reset trajectory to start and clear cached state.
 
-        Initialises ``_prev_target_q`` to ``default_joint_pos`` so that
-        the first ``command`` observation term is reasonable (matching
-        the training environment's initial command at reset).
+        Resets ``_time_step`` to 0 so the trajectory starts from the
+        beginning on next activation. Initialises ``_prev_target_q`` to
+        ``default_joint_pos`` for reasonable first observation.
         """
-        n = self._mapper.n_controlled
+        super().reset()
+        self._time_step = self._start_timestep
+        self._hold_count = 0
+        n = self._mapper.n_policy
         self._target_q = self._default_joint_pos.copy()
         self._target_dq = np.zeros(n)
         self._prev_target_q = self._default_joint_pos.copy()
@@ -235,13 +275,73 @@ class BeyondMimicPolicy(PolicyInterface):
 
         return action
 
+    def set_robot(self, robot) -> None:
+        """Set robot reference for anchor body lookups (SimRobot only)."""
+        self._robot = robot
+
+    def warmup(self, state: RobotState, velocity_command: np.ndarray) -> None:
+        """Run a full step without advancing trajectory counters."""
+        saved_ts = self._time_step
+        saved_hc = self._hold_count
+        self.step(state, velocity_command)
+        self._time_step = saved_ts
+        self._hold_count = saved_hc
+
+    def step(self, state: RobotState, velocity_command: np.ndarray) -> RobotCommand:
+        """Full policy tick: obs -> inference -> control law -> command.
+
+        Builds observation from robot state and cached trajectory data,
+        runs ONNX inference, applies control law, returns RobotCommand.
+        """
+        # 1. Get anchor body state for observation
+        # Use SimRobot.get_body_state if available (ground-truth in sim),
+        # otherwise use state estimator / IMU values
+        if (
+            self._robot is not None
+            and hasattr(self._robot, 'get_body_state')
+            and self._anchor_body_name
+        ):
+            anchor_pos, anchor_quat = self._robot.get_body_state(
+                self._anchor_body_name
+            )
+        else:
+            anchor_pos = state.base_position
+            anchor_quat = state.imu_quaternion
+
+        # 2. Build observation
+        obs = self.build_observation(state, anchor_pos, anchor_quat)
+
+        # 3. Inference with time_step (hold at start frame for hold_steps)
+        raw_action = self.get_action(obs, time_step=self._time_step)
+        if self._hold_count < self._hold_steps:
+            self._hold_count += 1
+        else:
+            self._time_step += 1
+
+        # 4. Smooth (EMA -> clip -> scale applied by _smooth_action)
+        action = self._smooth_action(raw_action)
+
+        # 5. Control law: target_q = default_pos + action (Ka already in _action_scale)
+        target_q_policy = self._default_joint_pos + action
+        target_q_robot = self._mapper.policy_to_robot(
+            target_q_policy, template=self._default_pos_robot
+        )
+
+        # 6. Build gains in robot order
+        kp_robot = self._mapper.fit_gains(self._kp, default=0.0)
+        kd_robot = self._mapper.fit_gains(self._kd, default=self._kd_damp)
+
+        # 7. Build command
+        return self._build_command(state, target_q_robot, kp_robot, kd_robot)
+
+    @property
+    def time_step(self) -> int:
+        """Current trajectory time step."""
+        return self._time_step
+
     @property
     def observation_dim(self) -> int:
         return self._obs_dim
-
-    @property
-    def action_dim(self) -> int:
-        return self._mapper.n_controlled
 
     # ------------------------------------------------------------------
     # BeyondMimic-specific properties
@@ -261,16 +361,6 @@ class BeyondMimicPolicy(PolicyInterface):
     def metadata(self) -> Dict[str, Any]:
         """Extracted ONNX metadata dictionary."""
         return self._metadata
-
-    @property
-    def stiffness(self) -> Optional[np.ndarray]:
-        """Per-joint stiffness (Kp) from metadata, or None."""
-        return self._stiffness
-
-    @property
-    def damping(self) -> Optional[np.ndarray]:
-        """Per-joint damping (Kd) from metadata, or None."""
-        return self._damping
 
     @property
     def action_scale(self) -> Optional[np.ndarray]:
@@ -379,21 +469,27 @@ class BeyondMimicPolicy(PolicyInterface):
         """Build a single observation term."""
         if term == "command":
             return np.concatenate([self._prev_target_q, self._prev_target_dq])
+        elif term == "goal_joint_pos":
+            return self._prev_target_q.copy()
+        elif term == "goal_joint_vel":
+            return self._prev_target_dq.copy()
+        elif term == "projected_gravity":
+            R = quat_to_rotation_matrix(robot_state.imu_quaternion)
+            return R.T @ np.array([0.0, 0.0, -1.0])
         elif term == "motion_anchor_pos_b":
             return self._compute_motion_anchor_pos_b(anchor_pos_w, anchor_quat_w)
         elif term == "motion_anchor_ori_b":
             return self._compute_motion_anchor_ori_b(anchor_quat_w)
         elif term == "base_lin_vel":
-            # Transform world-frame velocity to body frame: v_body = R^T @ v_world
             R = quat_to_rotation_matrix(robot_state.imu_quaternion)
             return R.T @ robot_state.base_velocity
         elif term == "base_ang_vel":
             return robot_state.imu_angular_velocity.copy()
         elif term == "joint_pos":
-            jp = self._mapper.robot_to_observation(robot_state.joint_positions)
+            jp = self._mapper.robot_to_policy(robot_state.joint_positions)
             return jp - self._default_joint_pos
         elif term == "joint_vel":
-            return self._mapper.robot_to_observation(robot_state.joint_velocities)
+            return self._mapper.robot_to_policy(robot_state.joint_velocities)
         elif term == "actions":
             return self._prev_action.copy()
         else:
@@ -467,11 +563,17 @@ class BeyondMimicPolicy(PolicyInterface):
         if "default_joint_pos" in md:
             self._default_joint_pos = self._parse_float_csv(md["default_joint_pos"])
 
+        # Start/end timestep (skip unstable frames at trajectory edges)
+        if "start_timestep" in md:
+            self._start_timestep = int(md["start_timestep"])
+        if "end_timestep" in md:
+            self._trajectory_length = int(md["end_timestep"])
+
         if self._use_onnx_metadata:
             if "joint_stiffness" in md:
-                self._stiffness = self._parse_float_csv(md["joint_stiffness"])
+                self._kp = self._parse_float_csv(md["joint_stiffness"])
             if "joint_damping" in md:
-                self._damping = self._parse_float_csv(md["joint_damping"])
+                self._kd = self._parse_float_csv(md["joint_damping"])
             if "action_scale" in md:
                 self._action_scale = self._parse_float_csv(md["action_scale"])
 
@@ -500,18 +602,6 @@ class BeyondMimicPolicy(PolicyInterface):
     def _parse_float_csv(s: str) -> np.ndarray:
         """Parse comma-separated floats to numpy array."""
         return np.array([float(x) for x in s.split(",")], dtype=np.float64)
-
-    @staticmethod
-    def _safe_parse(s: str) -> Any:
-        """Safely parse a metadata string value using ast.literal_eval.
-
-        Raises:
-            ValueError: If the string cannot be parsed.
-        """
-        try:
-            return ast.literal_eval(s)
-        except (ValueError, SyntaxError) as exc:
-            raise ValueError(f"Failed to parse metadata value: {s!r}") from exc
 
 
 # ======================================================================

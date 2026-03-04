@@ -1,13 +1,12 @@
-"""Automated integration tests — Phase 13.
+"""Integration tests.
 
-Full-pipeline headless tests: Config → SimRobot → Policy → Controller → Logger.
+Full-runtime headless tests: Config → SimRobot → Policy → Runtime → Logger.
 These use real MuJoCo simulation with test ONNX models (zero-output).
 No manual intervention required.
 """
 from __future__ import annotations
 
 import os
-import tempfile
 import time
 from pathlib import Path
 
@@ -17,7 +16,6 @@ import pytest
 from tests.conftest import create_isaaclab_onnx, create_beyondmimic_onnx
 
 from unitree_launcher.config import (
-    Config,
     G1_23DOF_JOINTS,
     G1_29DOF_JOINTS,
     ISAACLAB_G1_29DOF_JOINTS,
@@ -26,7 +24,7 @@ from unitree_launcher.config import (
     load_config,
     resolve_joint_name,
 )
-from unitree_launcher.control.controller import Controller
+from unitree_launcher.control.runtime import Runtime
 from unitree_launcher.control.safety import SafetyController, SystemState
 from unitree_launcher.estimation.state_estimator import StateEstimator
 from unitree_launcher.datalog.logger import DataLogger
@@ -34,7 +32,6 @@ from unitree_launcher.datalog.replay import LogReplay
 from unitree_launcher.policy.beyondmimic_policy import BeyondMimicPolicy
 from unitree_launcher.policy.isaaclab_policy import IsaacLabPolicy
 from unitree_launcher.policy.joint_mapper import JointMapper
-from unitree_launcher.policy.observations import ObservationBuilder
 from unitree_launcher.robot.sim_robot import SimRobot
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -45,15 +42,13 @@ DEFAULT_CONFIG = os.path.join(PROJECT_ROOT, "configs", "default.yaml")
 # Helpers
 # ============================================================================
 
-def _build_isaaclab_pipeline(
+def _build_isaaclab_runtime(
     tmp_path: Path,
     variant: str = "g1_29dof",
     config_path: str = DEFAULT_CONFIG,
-    max_steps: int = 0,
-    max_duration: float = 0.0,
     enable_logger: bool = False,
 ) -> dict:
-    """Wire up a full IsaacLab pipeline for integration testing.
+    """Wire up a full IsaacLab runtime for integration testing.
 
     Returns dict with all components for test use.
     """
@@ -64,26 +59,21 @@ def _build_isaaclab_pipeline(
     robot_joints = G1_29DOF_JOINTS if "29" in variant else G1_23DOF_JOINTS
     n_dof = len(robot_joints)
     mapper = JointMapper(robot_joints)
-    obs_builder = ObservationBuilder(mapper, config, use_estimator=True)
-    obs_dim = obs_builder.observation_dim
-    action_dim = n_dof
-
-    onnx_path = str(tmp_path / "test_isaaclab.onnx")
-    create_isaaclab_onnx(obs_dim, action_dim, onnx_path)
 
     robot = SimRobot(config)
-    # Initialize to home position (matches real deployment; avoids state-limit
-    # faults from starting at MuJoCo default zeros)
     q_home_dict = Q_HOME_29DOF if "29" in variant else Q_HOME_23DOF
     q_home = np.array([q_home_dict[j] for j in robot_joints])
     robot.set_home_positions(q_home)
 
-    # Zero-output test policies can't stabilize the robot, causing joints
-    # to exceed limits.  Disable state-fault monitoring for integration tests
-    # (real monitoring tested in test_safety*.py and test_safety_sim.py).
+    # Zero-output test policies can't stabilize the robot.
     config.safety.fault_threshold = float("inf")
+    config.safety.tilt_check = False
+    config.control.transition_steps = 0  # Instant activation for tests
 
-    policy = IsaacLabPolicy(mapper, obs_dim)
+    policy = IsaacLabPolicy(mapper, config)
+    obs_dim = policy.observation_dim
+    onnx_path = str(tmp_path / "test_isaaclab.onnx")
+    create_isaaclab_onnx(obs_dim, n_dof, onnx_path)
     policy.load(onnx_path)
     safety = SafetyController(config, n_dof=robot.n_dof)
 
@@ -92,29 +82,37 @@ def _build_isaaclab_pipeline(
         log_dir = str(tmp_path / "logs")
         logger = DataLogger(config.logging, "integration_test", log_dir)
 
-    controller = Controller(
+    from unitree_launcher.policy.hold_policy import HoldPolicy
+    from unitree_launcher.controller.input import InputManager
+    from unitree_launcher.controller.keyboard import KeyboardInput
+    default_policy = HoldPolicy(mapper, config)
+    kb = KeyboardInput()
+    input_mgr = InputManager([kb])
+
+    rt = Runtime(
         robot=robot,
         policy=policy,
         safety=safety,
         joint_mapper=mapper,
-        obs_builder=obs_builder,
         config=config,
         logger=logger,
-        max_steps=max_steps,
-        max_duration=max_duration,
+        default_policy=default_policy,
+        default_joint_mapper=mapper,
+        input_manager=input_mgr,
     )
+    rt._keyboard = kb
 
-    return {
-        "config": config,
-        "robot": robot,
-        "policy": policy,
-        "safety": safety,
-        "mapper": mapper,
-        "obs_builder": obs_builder,
-        "controller": controller,
-        "logger": logger,
-        "onnx_path": onnx_path,
-    }
+    from types import SimpleNamespace
+    return SimpleNamespace(
+        config=config,
+        robot=robot,
+        policy=policy,
+        safety=safety,
+        mapper=mapper,
+        runtime=rt,
+        logger=logger,
+        onnx_path=onnx_path,
+    )
 
 
 # ============================================================================
@@ -123,185 +121,156 @@ def _build_isaaclab_pipeline(
 
 class TestHeadlessIsaacLab:
     def test_headless_sim_isaaclab_100_steps(self, tmp_path):
-        """Full pipeline: config → SimRobot → IsaacLabPolicy → Controller.
-        Run 100 steps in headless mode, verify no crash."""
-        p = _build_isaaclab_pipeline(tmp_path, max_steps=100)
-        ctrl = p["controller"]
-        safety = p["safety"]
+        """Full runtime: config → SimRobot → IsaacLabPolicy → Runtime.
+        Run 100 steps via step(), verify no crash."""
+        s = _build_isaaclab_runtime(tmp_path)
+        rt = s.runtime
+        safety = s.safety
 
-        ctrl.start()
+        rt.start()
         safety.start()
+        for _ in range(100):
+            rt.step()
+        rt.stop()
 
-        # Wait for control loop to finish (100 steps at 50Hz = ~2s, plus margin)
-        deadline = time.time() + 10.0
-        while ctrl.is_running and time.time() < deadline:
-            time.sleep(0.05)
-
-        ctrl.stop()
-
-        # Verify we ran to completion
-        assert not ctrl.is_running
-        telemetry = ctrl.get_telemetry()
+        telemetry = rt.get_telemetry()
         assert telemetry["step_count"] >= 100
 
     def test_headless_sim_isaaclab_with_logger(self, tmp_path):
-        """Full pipeline with logging. Verify logs contain data."""
-        p = _build_isaaclab_pipeline(
-            tmp_path, max_steps=50, enable_logger=True,
+        """Full runtime with logging. Verify logs contain data."""
+        s = _build_isaaclab_runtime(
+            tmp_path, enable_logger=True,
         )
-        ctrl = p["controller"]
-        safety = p["safety"]
-        logger = p["logger"]
+        rt = s.runtime
+        safety = s.safety
+        logger = s.logger
 
         logger.start()
-        ctrl.start()
+        rt.start()
         safety.start()
-
-        deadline = time.time() + 10.0
-        while ctrl.is_running and time.time() < deadline:
-            time.sleep(0.05)
-
-        ctrl.stop()
+        for _ in range(50):
+            rt.step()
+        rt.stop()
         logger.stop()
 
-        # Verify log directory was created and has data
         log_dir = Path(logger._log_dir)
         assert log_dir.exists()
         assert (log_dir / "metadata.yaml").exists()
-        # Data file should exist (HDF5 by default)
         assert (log_dir / "data.hdf5").exists()
 
-        # Verify logged steps
         import h5py
         with h5py.File(log_dir / "data.hdf5", "r") as f:
-            assert f["joint_pos"].shape[0] >= 40  # at least most of the 50 steps
+            assert f["joint_pos"].shape[0] >= 40
 
 
 class TestEstopRecovery:
     def test_headless_sim_estop_recovery(self, tmp_path):
-        """Start → E-stop → clear → resume → stop.
-        Verify state transitions occur correctly."""
-        p = _build_isaaclab_pipeline(tmp_path, max_steps=200)
-        ctrl = p["controller"]
-        safety = p["safety"]
+        """Start → E-stop → clear → resume → stop via step()."""
+        s = _build_isaaclab_runtime(tmp_path)
+        rt = s.runtime
+        safety = s.safety
 
-        ctrl.start()
+        rt.start()
         safety.start()
-
-        # Let it run a few steps
-        time.sleep(0.15)
+        for _ in range(5):
+            rt.step()
         assert safety.state == SystemState.RUNNING
 
-        # E-stop
-        ctrl.handle_key("backspace")
-        time.sleep(0.1)
+        rt._keyboard.push_key("backspace")
+        rt.step()
         assert safety.state == SystemState.ESTOP
 
-        # Clear E-stop → STOPPED
-        ctrl.handle_key("enter")
-        time.sleep(0.05)
+        rt._keyboard.push_key("enter")
+        rt.step()
         assert safety.state == SystemState.STOPPED
 
-        # Resume → RUNNING
-        ctrl.handle_key("space")
-        time.sleep(0.15)
+        rt._keyboard.push_key("space")
+        rt.step()
+        for _ in range(5):
+            rt.step()
         assert safety.state == SystemState.RUNNING
 
-        # Stop
-        ctrl.handle_key("space")
-        time.sleep(0.05)
+        rt._keyboard.push_key("space")
+        rt.step()
         assert safety.state == SystemState.STOPPED
 
-        ctrl.stop()
+        rt.stop()
 
 
 class TestPolicyReload:
     def test_headless_sim_policy_reload(self, tmp_path):
         """Start with one policy, reload to another mid-run."""
-        p = _build_isaaclab_pipeline(tmp_path, max_steps=200)
-        ctrl = p["controller"]
-        safety = p["safety"]
+        s = _build_isaaclab_runtime(tmp_path)
+        rt = s.runtime
+        safety = s.safety
 
-        # Create a second ONNX with same dims
         onnx_path_2 = str(tmp_path / "test_isaaclab_2.onnx")
-        obs_dim = p["obs_builder"].observation_dim
+        obs_dim = s.policy.observation_dim
         create_isaaclab_onnx(obs_dim, 29, onnx_path_2)
 
-        ctrl.start()
+        rt.start()
         safety.start()
-        time.sleep(0.15)
+        for _ in range(5):
+            rt.step()
 
-        # Stop before reload
-        ctrl.handle_key("space")
-        time.sleep(0.05)
+        rt._keyboard.push_key("space")
+        rt.step()
         assert safety.state == SystemState.STOPPED
 
-        # Reload policy
-        ctrl.reload_policy(onnx_path_2)
+        rt.reload_policy(onnx_path_2)
 
-        # Restart with new policy
-        ctrl.handle_key("space")
-        time.sleep(0.15)
+        rt._keyboard.push_key("space")
+        for _ in range(5):
+            rt.step()
         assert safety.state == SystemState.RUNNING
 
-        ctrl.stop()
+        rt.stop()
 
 
 class TestSmoke23DOF:
     def test_headless_sim_23dof_smoke(self, tmp_path):
-        """Run 10 steps with 23-DOF model. Verify no crash."""
+        """Run 10 steps with 23-DOF model via step()."""
         config_path = os.path.join(PROJECT_ROOT, "configs", "g1_23dof.yaml")
-        p = _build_isaaclab_pipeline(
+        s = _build_isaaclab_runtime(
             tmp_path, variant="g1_23dof", config_path=config_path,
-            max_steps=10,
         )
-        ctrl = p["controller"]
-        safety = p["safety"]
+        rt = s.runtime
+        safety = s.safety
 
-        assert p["robot"].n_dof == 23
+        assert s.robot.n_dof == 23
 
-        ctrl.start()
+        rt.start()
         safety.start()
+        for _ in range(10):
+            rt.step()
+        rt.stop()
 
-        deadline = time.time() + 10.0
-        while ctrl.is_running and time.time() < deadline:
-            time.sleep(0.05)
-
-        ctrl.stop()
-
-        telemetry = ctrl.get_telemetry()
+        telemetry = rt.get_telemetry()
         assert telemetry["step_count"] >= 10
 
 
 class TestPerformance:
     @pytest.mark.slow
-    def test_headless_performance_50hz(self, tmp_path):
-        """Run 200 steps, verify mean loop time is under 20ms (50 Hz target).
+    def test_headless_performance_step(self, tmp_path):
+        """Run 200 steps via step(), verify fast execution."""
+        s = _build_isaaclab_runtime(tmp_path)
+        rt = s.runtime
+        safety = s.safety
 
-        Skipped in CI unless explicitly requested: pytest -m slow
-        """
-        p = _build_isaaclab_pipeline(tmp_path, max_steps=200)
-        ctrl = p["controller"]
-        safety = p["safety"]
-
-        ctrl.start()
+        rt.start()
         safety.start()
 
-        deadline = time.time() + 15.0
-        while ctrl.is_running and time.time() < deadline:
-            time.sleep(0.05)
+        start = time.time()
+        for _ in range(200):
+            rt.step()
+        elapsed = time.time() - start
 
-        ctrl.stop()
+        rt.stop()
 
-        telemetry = ctrl.get_telemetry()
+        telemetry = rt.get_telemetry()
         assert telemetry["step_count"] >= 200
-
-        # Mean loop time should be well under 20ms on any modern machine
-        # (MuJoCo sim + ONNX inference with zero-output model is very fast)
-        policy_hz = telemetry["policy_hz"]
-        assert policy_hz > 30.0, (
-            f"Policy frequency {policy_hz:.1f} Hz is too low (target: 50 Hz)"
-        )
+        # With no sleep, 200 steps should complete in well under 10s
+        assert elapsed < 10.0, f"200 steps took {elapsed:.1f}s (too slow)"
 
 
 # ============================================================================
@@ -309,23 +278,23 @@ class TestPerformance:
 # ============================================================================
 
 class TestBeyondMimicIntegration:
-    def test_beyondmimic_pipeline(self, tmp_path):
-        """Full pipeline: Config → SimRobot → BeyondMimicPolicy → Controller.
+    def test_beyondmimic_runtime(self, tmp_path):
+        """Full runtime: Config → SimRobot → BeyondMimicPolicy → Runtime.
 
         Zero-output model has trajectory_length=1, so the BM trajectory ends
-        immediately and returns to hold. Verify the pipeline wires correctly,
+        immediately and returns to hold. Verify the runtime wires correctly,
         runs without crash, and transitions to STOPPED after trajectory end.
         """
         config = load_config(DEFAULT_CONFIG)
         config.robot.variant = "g1_29dof"
         config.safety.fault_threshold = float("inf")
+        config.control.transition_steps = 0
 
         robot_joints = G1_29DOF_JOINTS
         isaaclab_config_names = [resolve_joint_name(n, "g1_29dof") for n in ISAACLAB_G1_29DOF_JOINTS]
         mapper = JointMapper(
             robot_joints,
-            observed_joints=isaaclab_config_names,
-            controlled_joints=isaaclab_config_names,
+            policy_joints=isaaclab_config_names,
         )
 
         bm_obs_dim = 160
@@ -349,32 +318,37 @@ class TestBeyondMimicIntegration:
         q_home = np.array([Q_HOME_29DOF[j] for j in robot_joints])
         robot.set_home_positions(q_home)
 
-        policy = BeyondMimicPolicy(mapper, bm_obs_dim, use_onnx_metadata=True)
+        policy = BeyondMimicPolicy(mapper, bm_obs_dim, use_onnx_metadata=True, config=config)
         policy.load(onnx_path)
+        policy.set_robot(robot)
         safety = SafetyController(config, n_dof=29)
 
-        ctrl = Controller(
+        from unitree_launcher.policy.hold_policy import HoldPolicy
+        from unitree_launcher.controller.input import InputManager
+        rt = Runtime(
             robot=robot,
             policy=policy,
             safety=safety,
             joint_mapper=mapper,
-            obs_builder=None,
             config=config,
+            default_policy=HoldPolicy(mapper, config),
+            default_joint_mapper=mapper,
+            input_manager=InputManager(),
         )
 
-        ctrl.start()
+        rt.start()
         safety.start()
 
-        # Wait for trajectory to complete and return to hold
-        deadline = time.time() + 5.0
-        while safety.state == SystemState.RUNNING and time.time() < deadline:
-            time.sleep(0.05)
+        # Step until trajectory completes (hold_steps + trajectory_length)
+        for _ in range(30):
+            rt.step()
+            if safety.state == SystemState.STOPPED:
+                break
 
-        # BM trajectory with zero-output model ends immediately → STOPPED
         assert safety.state == SystemState.STOPPED
-        assert ctrl.get_telemetry()["step_count"] >= 1
+        assert rt.get_telemetry()["step_count"] >= 1
 
-        ctrl.stop()
+        rt.stop()
 
 
 # ============================================================================
@@ -383,12 +357,12 @@ class TestBeyondMimicIntegration:
 
 class TestEstimatorIntegration:
     def test_estimator_in_loop_100_steps(self, tmp_path):
-        """Build pipeline with estimator, run 100 steps, verify estimator called."""
-        p = _build_isaaclab_pipeline(tmp_path, max_steps=100)
-        ctrl = p["controller"]
-        safety = p["safety"]
+        """Build runtime with estimator, run 100 steps, verify estimator called."""
+        s = _build_isaaclab_runtime(tmp_path)
+        rt = s.runtime
+        safety = s.safety
 
-        estimator = StateEstimator(p["config"])
+        estimator = StateEstimator(s.config)
 
         # Spy on update calls
         update_count = [0]
@@ -400,56 +374,16 @@ class TestEstimatorIntegration:
 
         estimator.update = spy_update
 
-        ctrl.set_estimator(estimator)
-        ctrl.start()
+        rt.set_estimator(estimator)
+        rt.start()
         safety.start()
+        for _ in range(100):
+            rt.step()
+        rt.stop()
 
-        deadline = time.time() + 10.0
-        while ctrl.is_running and time.time() < deadline:
-            time.sleep(0.05)
-
-        ctrl.stop()
-
-        telemetry = ctrl.get_telemetry()
+        telemetry = rt.get_telemetry()
         assert telemetry["step_count"] >= 100
         assert update_count[0] >= 100
-
-
-# ============================================================================
-# Graceful Shutdown
-# ============================================================================
-
-class TestGracefulShutdown:
-    def test_shutdown_cleans_up(self, tmp_path):
-        """Build pipeline with logging, run 50 steps, verify clean shutdown."""
-        p = _build_isaaclab_pipeline(
-            tmp_path, max_steps=50, enable_logger=True,
-        )
-        ctrl = p["controller"]
-        safety = p["safety"]
-        logger = p["logger"]
-
-        logger.start()
-        ctrl.start()
-        safety.start()
-
-        deadline = time.time() + 10.0
-        while ctrl.is_running and time.time() < deadline:
-            time.sleep(0.05)
-
-        ctrl.stop()
-        logger.stop()
-
-        # Verify log files exist
-        log_dir = Path(logger._log_dir)
-        assert (log_dir / "metadata.yaml").exists()
-        assert (log_dir / "data.hdf5").exists()
-
-        # Controller should be stopped
-        assert ctrl.is_running is False
-
-        # No dangling threads from the controller
-        assert ctrl._thread is None
 
 
 # ============================================================================
@@ -459,22 +393,19 @@ class TestGracefulShutdown:
 class TestLogReplayRoundtrip:
     def test_log_replay_roundtrip(self, tmp_path):
         """Run 50 steps with DataLogger, stop, replay with LogReplay."""
-        p = _build_isaaclab_pipeline(
-            tmp_path, max_steps=50, enable_logger=True,
+        s = _build_isaaclab_runtime(
+            tmp_path, enable_logger=True,
         )
-        ctrl = p["controller"]
-        safety = p["safety"]
-        logger = p["logger"]
+        rt = s.runtime
+        safety = s.safety
+        logger = s.logger
 
         logger.start()
-        ctrl.start()
+        rt.start()
         safety.start()
-
-        deadline = time.time() + 10.0
-        while ctrl.is_running and time.time() < deadline:
-            time.sleep(0.05)
-
-        ctrl.stop()
+        for _ in range(50):
+            rt.step()
+        rt.stop()
         logger.stop()
 
         # Replay the log
@@ -496,3 +427,201 @@ class TestLogReplayRoundtrip:
             timestamps = f["timestamps"][:]
             diffs = np.diff(timestamps)
             assert np.all(diffs >= 0), "Timestamps should be monotonically increasing"
+
+
+# ============================================================================
+# Smooth Policy Transitions
+# ============================================================================
+
+class TestSmoothTransitions:
+    def test_stance_to_policy_interpolates(self, tmp_path):
+        """Activation interpolates to policy starting pose — no position jump."""
+        s = _build_isaaclab_runtime(tmp_path)
+        rt = s.runtime
+        safety = s.safety
+        robot = s.robot
+
+        rt.start()
+
+        # Run a few steps in default (stance) to establish baseline
+        for _ in range(5):
+            rt.step()
+        state_before = robot.get_state()
+        pos_before = state_before.joint_positions.copy()
+
+        # Spy on send_command to capture the first post-activation command
+        sent_cmds = []
+        original_send = robot.send_command
+        def capture_send(cmd):
+            sent_cmds.append(cmd)
+            return original_send(cmd)
+        robot.send_command = capture_send
+
+        # Activate policy — should enter TRANSITION, not run policy
+        safety.start()
+        rt.step()
+
+        # First transition command should be close to current position
+        assert len(sent_cmds) >= 1
+        cmd = sent_cmds[0]
+        max_jump = np.max(np.abs(cmd.joint_positions - pos_before))
+        assert max_jump < 0.5, (
+            f"Position jump {max_jump:.3f} rad on activation is too large"
+        )
+        robot.send_command = original_send
+        rt.stop()
+
+    def test_bm_end_returns_instantly(self, tmp_path):
+        """BM trajectory end returns to default immediately (no transition)."""
+        config = load_config(DEFAULT_CONFIG)
+        config.robot.variant = "g1_29dof"
+        config.safety.fault_threshold = float("inf")
+        config.safety.tilt_check = False
+        config.control.transition_steps = 0
+
+        robot_joints = G1_29DOF_JOINTS
+        isaaclab_config_names = [
+            resolve_joint_name(n, "g1_29dof") for n in ISAACLAB_G1_29DOF_JOINTS
+        ]
+        mapper = JointMapper(
+            robot_joints,
+            policy_joints=isaaclab_config_names,
+        )
+
+        bm_metadata = {
+            "joint_names": ",".join(ISAACLAB_G1_29DOF_JOINTS),
+            "joint_stiffness": ",".join(["40.0"] * 29),
+            "joint_damping": ",".join(["2.5"] * 29),
+            "action_scale": ",".join(["0.5"] * 29),
+            "default_joint_pos": ",".join(["0.0"] * 29),
+            "anchor_body_name": "torso_link",
+            "body_names": "pelvis,torso_link,left_knee_link",
+            "observation_names": "command,motion_anchor_pos_b,motion_anchor_ori_b,"
+                                 "base_lin_vel,base_ang_vel,joint_pos,joint_vel,actions",
+            "observation_history_lengths": ",".join(["1.0"] * 8),
+        }
+
+        onnx_path = str(tmp_path / "bm_test.onnx")
+        create_beyondmimic_onnx(160, 29, 29, onnx_path, metadata=bm_metadata)
+
+        robot = SimRobot(config)
+        q_home = np.array([Q_HOME_29DOF[j] for j in robot_joints])
+        robot.set_home_positions(q_home)
+
+        policy = BeyondMimicPolicy(mapper, 160, use_onnx_metadata=True, config=config)
+        policy.load(onnx_path)
+        policy.set_robot(robot)
+        safety_ctrl = SafetyController(config, n_dof=29)
+
+        from unitree_launcher.policy.hold_policy import HoldPolicy
+        from unitree_launcher.controller.input import InputManager
+        default_policy = HoldPolicy(mapper, config)
+        rt = Runtime(
+            robot=robot,
+            policy=policy,
+            safety=safety_ctrl,
+            joint_mapper=mapper,
+            config=config,
+            default_policy=default_policy,
+            default_joint_mapper=mapper,
+            input_manager=InputManager(),
+        )
+
+        rt.start()
+        safety_ctrl.start()
+
+        # Run until BM ends — should return to STOPPED instantly
+        for _ in range(20):
+            rt.step()
+            if safety_ctrl.state == SystemState.STOPPED:
+                break
+
+        assert safety_ctrl.state == SystemState.STOPPED
+        # No transition should be active (instant return)
+        assert rt._transition_active is False
+        rt.stop()
+
+
+# ============================================================================
+# Additional Integration Tests
+# ============================================================================
+
+class TestDefaultPolicyHolds:
+    def test_default_policy_holds_in_idle(self, tmp_path):
+        """Default policy in IDLE/STOPPED keeps robot near home for 100 steps."""
+        s = _build_isaaclab_runtime(tmp_path)
+        rt = s.runtime
+
+        # Run in IDLE (not RUNNING) — default policy should hold
+        rt.start()
+        for _ in range(100):
+            rt.step()
+
+        state = s.robot.get_state()
+        height = state.base_position[2]
+        assert height > 0.5, f"Robot fell in IDLE: height={height:.3f}"
+        rt.stop()
+
+
+class TestPreparePhase:
+    def test_prepare_reaches_default_pose(self, tmp_path):
+        """Prepare mode sequence interpolates robot to default standing pose."""
+        from unitree_launcher.control.safety import ControlMode
+        s = _build_isaaclab_runtime(tmp_path)
+        rt = s.runtime
+
+        # Configure a short PREPARE mode sequence (2s = 100 steps at 50Hz).
+        # Check pose at completion (before the zero-output test policy
+        # takes over and destabilizes the robot).
+        rt._mode_sequence = [(ControlMode.PREPARE, 2.0)]
+        rt._initial_mode_sequence = [(ControlMode.PREPARE, 2.0)]
+
+        rt.start()
+        s.safety.start()
+        # Run exactly through prepare (100 steps)
+        for _ in range(100):
+            rt.step()
+
+        state = s.robot.get_state()
+        q_home = np.array([Q_HOME_29DOF[j] for j in G1_29DOF_JOINTS])
+        max_err = np.max(np.abs(state.joint_positions - q_home))
+        assert max_err < 0.1, f"Prepare didn't reach default pose: max_err={max_err:.4f}"
+        rt.stop()
+
+
+class TestAllModesInstantiate:
+    def test_eval_config_loads_and_steps(self, tmp_path):
+        """Eval config (1000Hz) loads and steps without crash."""
+        config = load_config(DEFAULT_CONFIG)
+        config.control.sim_frequency = 1000
+        config.safety.fault_threshold = float("inf")
+        config.safety.tilt_check = False
+        config.control.transition_steps = 0
+
+        robot_joints = G1_29DOF_JOINTS
+        mapper = JointMapper(robot_joints)
+        robot = SimRobot(config)
+        q_home = np.array([Q_HOME_29DOF[j] for j in robot_joints])
+        robot.set_home_positions(q_home)
+
+        from unitree_launcher.policy.hold_policy import HoldPolicy
+        from unitree_launcher.controller.input import InputManager
+        policy = HoldPolicy(mapper, config)
+        safety = SafetyController(config, n_dof=robot.n_dof)
+
+        rt = Runtime(
+            robot=robot,
+            policy=policy,
+            safety=safety,
+            joint_mapper=mapper,
+            config=config,
+            default_policy=HoldPolicy(mapper, config),
+            default_joint_mapper=mapper,
+            input_manager=InputManager(),
+        )
+
+        rt.start()
+        safety.start()
+        for _ in range(5):
+            rt.step()
+        rt.stop()

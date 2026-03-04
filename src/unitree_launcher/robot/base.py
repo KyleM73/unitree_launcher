@@ -13,7 +13,7 @@ import numpy as np
 
 
 # ============================================================================
-# Dataclasses (PLAN_METAL Task 2.2)
+# Dataclasses
 # ============================================================================
 
 @dataclass
@@ -59,8 +59,8 @@ class RobotCommand:
     kd: np.ndarray                # (N_DOF,) velocity gains
 
     @staticmethod
-    def damping(n_dof: int, kd: float = 5.0) -> RobotCommand:
-        """Create a damping-mode command (zero positions, specified kd)."""
+    def damping(n_dof: int, kd: float = 8.0) -> RobotCommand:
+        """Create a damping-mode command (Kp=0, Kd=8, matching RoboJuDo)."""
         return RobotCommand(
             joint_positions=np.zeros(n_dof),
             joint_velocities=np.zeros(n_dof),
@@ -71,49 +71,46 @@ class RobotCommand:
 
 
 # ============================================================================
-# Abstract Robot Interface (PLAN_METAL Task 2.3)
+# Abstract Robot Interface
 # ============================================================================
 
 class RobotInterface(ABC):
-    """Abstract interface for robot backends (sim and real).
+    """Abstract interface for robot backends.
+
+    Three implementations:
+
+    - **SimRobot** — Pure MuJoCo simulation (sim/eval modes).
+    - **RealRobot** — Onboard C++ unitree_interface (real mode).
+    - **MirrorRobot** — Read-only Python DDS subscriber (mirror mode).
 
     The uniform control loop is::
 
+        robot.connect()
         robot.send_command(cmd)   # queue/publish command
         robot.step()              # advance physics (sim) or no-op (real)
-
-    Sim vs real behavioral differences:
 
     +-----------------------+-------------------------------+-------------------------------+
     | Method                | SimRobot                      | RealRobot                     |
     +=======================+===============================+===============================+
-    | ``connect()``         | Starts DDS state publisher    | Starts DDS sub + 500 Hz cmd   |
-    |                       | thread (domain_id=1).         | re-publish thread (domain=0). |
-    |                       |                               | Blocks until first state msg. |
+    | ``connect()``         | No-op (pure MuJoCo).          | Initializes C++ binding,      |
+    |                       |                               | verifies connection.          |
     +-----------------------+-------------------------------+-------------------------------+
-    | ``get_state()``       | Reads MuJoCo sensor data      | Returns latest DDS LowState_  |
-    |                       | (lags qpos by one substep).   | snapshot. Checks watchdog.    |
-    |                       | ``base_position/velocity``    | ``base_position/velocity``    |
-    |                       | populated from sim.           | are NaN (no world frame).     |
+    | ``get_state()``       | Reads qpos/qvel directly      | Reads state via C++ binding.  |
+    |                       | (no sensor lag). IMU from      | ``base_position/velocity``    |
+    |                       | sensordata.                   | are NaN (no world frame).     |
     +-----------------------+-------------------------------+-------------------------------+
-    | ``send_command(cmd)`` | Stores cmd; applied at next   | Builds LowCmd_ IDL message,   |
-    |                       | ``step()`` call.              | publishes immediately + marks |
-    |                       |                               | for 500 Hz re-publish.        |
+    | ``send_command(cmd)`` | Stores cmd; applied at next   | Sends via C++ binding.        |
+    |                       | ``step()`` call.              | C++ handles 500 Hz republish. |
     +-----------------------+-------------------------------+-------------------------------+
     | ``step()``            | Acquires lock, applies cmd    | **No-op.** Hardware runs its  |
-    |                       | to actuators, runs N physics  | own PD loop at ~500 Hz.       |
-    |                       | substeps (with optional       |                               |
-    |                       | substep callback).            |                               |
+    |                       | to position actuators, runs   | own PD loop.                  |
+    |                       | N physics substeps.           |                               |
     +-----------------------+-------------------------------+-------------------------------+
-    | ``reset()``           | Resets MuJoCo qpos/qvel/ctrl  | Logs warning. Cannot reset    |
-    |                       | and runs ``mj_forward()``.    | physical hardware.            |
+    | ``reset()``           | Resets MuJoCo qpos/qvel/ctrl. | Logs warning. Cannot reset    |
+    |                       |                               | physical hardware.            |
     +-----------------------+-------------------------------+-------------------------------+
-    | ``graceful_shutdown`` | Calls ``disconnect()`` (no    | Sends damping commands for    |
-    |                       | damping needed in sim).       | *damping_duration* seconds,   |
-    |                       |                               | then disconnects.             |
-    +-----------------------+-------------------------------+-------------------------------+
-    | ``set_safety()``      | No-op (safety is sim-side).   | Stores reference for watchdog |
-    |                       |                               | E-stop in ``get_state()``.    |
+    | ``graceful_shutdown`` | Calls ``disconnect()``.       | Sends damping commands        |
+    |                       |                               | (Kp=0, Kd=8), then disconns. |
     +-----------------------+-------------------------------+-------------------------------+
     """
 
@@ -141,10 +138,9 @@ class RobotInterface(ABC):
     def step(self) -> None:
         """Advance one policy timestep.
 
-        - **SimRobot**: acquires lock, applies pending command to MuJoCo
-          actuators, runs ``sim_freq // policy_freq`` physics substeps
-          (calling the substep callback before each ``mj_step`` if set).
-        - **RealRobot**: no-op — the hardware runs its own PD at ~500 Hz.
+        - **SimRobot**: acquires lock, applies pending command to position
+          actuators, runs N physics substeps.
+        - **RealRobot**: no-op — hardware runs its own PD.
         """
         ...
 
@@ -157,19 +153,13 @@ class RobotInterface(ABC):
         """Shut down safely.
 
         - **SimRobot** (default): calls ``disconnect()``.
-        - **RealRobot**: sends zero-torque damping commands for
-          *damping_duration* seconds so the robot decelerates, then
-          disconnects.
+        - **RealRobot**: sends damping commands (Kp=0, Kd=8) for
+          *damping_duration* seconds, then disconnects.
         """
         self.disconnect()
 
     def set_safety(self, safety) -> None:
-        """Attach a safety controller for watchdog/E-stop.
-
-        - **SimRobot** (default): no-op.
-        - **RealRobot**: stores a reference used by ``get_state()`` to
-          trigger E-stop if state messages go stale.
-        """
+        """Attach a safety controller for watchdog/E-stop."""
         pass
 
     @property

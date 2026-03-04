@@ -1,516 +1,341 @@
 # Unitree G1 Deployment Stack
 
-Control stack for the Unitree G1 humanoid robot. Supports both MuJoCo simulation (macOS/Linux) and real robot deployment (Linux + Ethernet). Runs ONNX neural network policies at 50 Hz with safety enforcement.
+Control stack for the Unitree G1 humanoid robot. Supports MuJoCo simulation (macOS/Linux) and onboard real robot deployment (G1 Jetson Orin). Runs ONNX neural network policies at 50 Hz with safety enforcement.
 
-## Supported Policy Formats
+## Modes
 
-- **IsaacLab** -- Standard locomotion policies trained in Isaac Lab. Velocity-commanded (arrow key controls).
-- **BeyondMimic** -- Motion-tracking policies with trajectory playback. Includes ONNX metadata for per-joint gains.
+| Mode | Command | Description |
+|------|---------|-------------|
+| **sim** | `uv run sim` | MuJoCo simulation (GUI, Viser, or headless) |
+| **eval** | `uv run eval` | Accurate evaluation (1000 Hz physics, headless) |
+| **real** | `uv run real` | Onboard G1 deployment (C++ DDS backend) |
+| **mirror** | `uv run mirror` | Read-only DDS visualization of the real robot |
+
+## Supported Policies
+
+- **IsaacLab** — Velocity-tracking locomotion (arrow key / stick controls)
+- **BeyondMimic** — Motion-tracking with trajectory playback and ONNX metadata gains
 
 ## Requirements
 
-- Python 3.10 (hard ceiling -- CycloneDDS ARM64 wheel limit)
-- macOS (Apple Silicon) or Linux (x86_64 / ARM64), or Docker
-- Real robot deployment requires Linux + Ethernet connection to the G1
+- Python 3.10
+- [uv](https://docs.astral.sh/uv/) package manager
+- macOS (Apple Silicon) or Linux (x86_64 / aarch64)
+- Real robot: Linux + C++ unitree_interface binding
 
-## Hardware Setup (Real Robot)
-
-### Network Configuration
-
-The G1 communicates over Ethernet using DDS (CycloneDDS). Connect your machine directly to the robot's Ethernet port.
-
-| Parameter | Value |
-|-----------|-------|
-| Robot IP | `192.168.123.161` |
-| Subnet | `192.168.123.x/24` |
-| Host IP | Any unused address on `192.168.123.x` (e.g., `.100`) |
-| DDS domain | `0` |
-
-Configure a static IP on your Ethernet interface:
+## Quick Start
 
 ```bash
-# Linux (replace enp3s0 with your interface name)
-sudo ip addr add 192.168.123.100/24 dev enp3s0
-sudo ip link set enp3s0 up
+# Install
+uv sync
 
-# Verify connectivity
-ping 192.168.123.161
+# Simulation with MuJoCo GUI (macOS needs mjpython)
+uv run sim --gui --policy assets/policies/stance_29dof.onnx
+
+# Simulation with web viewer
+uv run sim --viser --policy assets/policies/beyondmimic_29dof.onnx
+# Open http://localhost:8080
+
+# Headless evaluation
+uv run eval --steps 500 --policy assets/policies/stance_29dof.onnx
+
+# Run tests
+uv run pytest tests/ -x
 ```
 
-### DDS Topics
+## Gantry Arm Test (Sim2Real)
 
-| Topic | Direction | Message type | Rate |
-|-------|-----------|-------------|------|
-| `rt/lowstate` | Robot -> Host | `LowState_` | ~500 Hz |
-| `rt/lowcmd` | Host -> Robot | `LowCmd_` | 500 Hz (required) |
-
-### Protocol Fields
-
-- **`mode_machine`**: Echoed from `LowState_` into every `LowCmd_`. Must match the robot's current mode (`5` = 29-DOF).
-- **`mode_pr`**: Set to `0` in every `LowCmd_` (position control for pitch/roll ankles).
-- **Motor slots**: All 35 IDL motor slots are filled. Controlled joints (0-28) get `mode=0x01` (PMSM servo). Non-controlled slots (29-34) get `mode=0` with zeroed fields.
-
-### 500 Hz Command Publishing
-
-The robot's onboard controller expects commands at ~500 Hz. A dedicated `RecurrentThread` re-publishes the latest `LowCmd_` every 2 ms. The control loop (50 Hz) updates the command contents; between updates, the publish thread re-sends the most recent command to keep the robot's communication watchdog satisfied.
-
-### Verification
-
-Confirm DDS communication before running policies:
-
-```python
-from unitree_launcher.compat import patch_unitree_threading, resolve_network_interface
-patch_unitree_threading()
-
-from unitree_sdk2py.core.channel import ChannelFactoryInitialize, ChannelSubscriber
-from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowState_
-
-ChannelFactoryInitialize(0, "enp3s0")  # your interface
-sub = ChannelSubscriber("rt/lowstate", LowState_)
-sub.Init(handler=lambda msg: print(
-    f"mode_machine={msg.mode_machine}, "
-    f"q[0]={msg.motor_state[0].q:.3f}"
-), queueLen=1)
-
-import time; time.sleep(5)
-```
-
-You should see `mode_machine=5` and streaming joint positions.
-
-## Installation
+The `--gantry` flag runs a right shoulder pitch sinusoid while the robot hangs from a gantry. Used for sim2real comparison — the same test runs identically in sim and on real hardware.
 
 ```bash
-# Create virtual environment
-uv venv --python 3.10 .venv
-source .venv/bin/activate
+# Sim with GUI viewer
+uv run sim --gantry --gui --duration 40
 
-# Install with dev dependencies
-uv pip install -e ".[dev]"
+# Sim with viser
+uv run sim --gantry --viser --duration 40
+
+# Real robot (on G1, after deploy)
+uv run real --gantry -c configs/g1_deploy.yaml --duration 40
+
+# Compare logged data
+uv run python scripts/compare_sim2real.py logs/<sim_run>/ logs/<real_run>/
 ```
 
-**Note:** The Unitree SDK is installed from GitHub source. If you encounter an import error about a missing `b2` submodule, patch `.venv/.../unitree_sdk2py/__init__.py` to wrap the `b2` import in a try/except. See LOG.md Phase 0 for details.
+The test sequence:
+1. **Prepare** (10-20s): Smooth blend from current pose to home position
+2. **Sinusoid**: Right shoulder pitch sweeps through quarter ROM (negative direction only, 0.2 Hz)
+
+All infrastructure is active: wireless E-stop (A button), gamepad, keyboard, data logging, video recording (`--record`).
+
+## Real Robot Deployment
+
+### Network
+
+| Node | IP |
+|------|----|
+| Motor control board | `192.168.123.161` |
+| G1 PC (SSH) | `192.168.123.164` (user: `unitree`, pass: `123`) |
+| Dev machine | `192.168.123.100` (configure with `./scripts/setup_robot_network.sh`) |
+
+### Deploy to Robot
+
+```bash
+# Sync code and run preflight checks (auto-installs uv if needed)
+./scripts/deploy_to_robot.sh
+
+# SSH in and build C++ backend (first time only)
+ssh unitree@192.168.123.164
+cd ~/unitree_launcher
+./scripts/build_cpp_backend.sh
+
+# Run
+uv run real -c configs/g1_deploy.yaml --policy assets/policies/stance_29dof.onnx
+```
+
+### Wireless Controller (Real Robot)
+
+| Button | Action |
+|--------|--------|
+| **A** | E-stop (software, checked every tick) |
+| **L2+B** | Hardware damping mode (firmware-level, always works) |
+| **B** | Stop policy (return to stance) |
+| **X** | Start / re-activate policy |
+| **Y** | Reset policy (stop + reset + re-activate) |
+| **Start** | Start policy |
+| **Select** | Stop policy |
+| **Left stick** | Forward/back (Y) and strafe (X) |
+| **Right stick X** | Yaw rate |
+| **R1 + DPad Up/Down** | Next / previous policy |
+
+### Prepare Phase
+
+On real hardware, a 20-second prepare phase blends from the current pose to the default stance:
+- 300-step linear ramp (6s) from current motor positions to home pose
+- Policies warm up (ONNX session + observation history) during prepare
+- Wireless A-button E-stop is active throughout
+- At 90%, policy state is reset for clean activation
+
+## Keyboard Controls (Simulation)
+
+| Key | Action |
+|-----|--------|
+| `Space` | Toggle policy (start / stop) |
+| `Backspace` | E-stop (latching) |
+| `Enter` | Clear E-stop |
+| `Delete` | Reset robot and policy |
+| `Up` / `Down` | Forward / back velocity (±0.1) |
+| `Left` / `Right` | Strafe velocity (±0.1) |
+| `,` / `.` | Yaw rate (±0.1) |
+| `/` | Zero all velocity |
+| `=` / `-` | Next / previous policy |
+
+## Web Viewer (Viser)
+
+```bash
+uv run sim --viser --policy path/to/policy.onnx
+# Open http://localhost:8080
+```
+
+Sidebar controls: Start/Stop, E-stop, Reset, policy selector, velocity sliders, telemetry panel (Hz, inference time, height, step count).
+
+## Configuration
+
+YAML configs in `configs/`. CLI arguments override config values.
+
+| Config | Use |
+|--------|-----|
+| `default.yaml` | Base config for sim |
+| `g1_deploy.yaml` | Onboard real deployment |
+| `g1_sim_bm.yaml` | BeyondMimic simulation |
+| `g1_real_bm.yaml` | BeyondMimic on real robot |
+| `g1_29dof.yaml` | 29-DOF variant defaults |
+| `g1_23dof.yaml` | 23-DOF variant defaults |
+
+Key settings:
+```yaml
+control:
+  policy_frequency: 50    # Policy inference rate (Hz)
+  sim_frequency: 500      # MuJoCo physics rate (Hz)
+  kd_damp: 8.0            # Damping gain for safety/non-controlled joints
+  transition_steps: 5     # Steps to interpolate to policy starting pose
+
+safety:
+  tilt_check: true        # E-stop on >57° tilt
+  frame_drop_check: true  # E-stop on >200ms frame drop
+```
+
+## Policy Transitions
+
+- **Activation**: Cosine-interpolates from current position to `default_pos` over `transition_steps` (default 5). Policy `warmup()` runs during transition (ONNX + obs history).
+- **Return to stance**: Instant (stance policy needs full authority immediately).
+- **BeyondMimic**: Holds at first reference frame for 5 steps before advancing. ONNX metadata `start_timestep` / `end_timestep` trims unstable trajectory edges.
 
 ## Docker
 
-Docker provides a portable way to run simulations, evaluations, and tests without installing dependencies locally. The image supports both headless (EGL) and GUI (GLX/X11) rendering. Docker files live in `docker/`.
-
-### Build
+Build the image from the repo root:
 
 ```bash
 docker build -f docker/Dockerfile -t unitree-launcher .
 ```
 
-### Headless Simulation (Any Platform)
+Run directly:
+
+Policy files are gitignored and not baked into the image — mount them with `-v`:
 
 ```bash
-docker run --rm \
-    -v ./logs:/app/logs \
-    -v ./assets/policies:/app/assets/policies:ro \
-    unitree-launcher sim --headless --policy assets/policies/stance_29dof.onnx --duration 10
-```
+# Headless simulation
+docker run --rm -v ./assets/policies:/app/assets/policies:ro \
+    unitree-launcher sim --policy assets/policies/stance_29dof.onnx --duration 10
 
-Or with Docker Compose:
+# Headless evaluation (1000 Hz physics)
+docker run --rm -v ./assets/policies:/app/assets/policies:ro \
+    unitree-launcher eval --steps 500 --policy assets/policies/stance_29dof.onnx
 
-```bash
-docker compose -f docker/docker-compose.yml --profile headless run --rm sim-headless \
-    sim --headless --policy assets/policies/stance_29dof.onnx --duration 10
-```
+# Viser web viewer (open http://localhost:8080)
+docker run --rm -p 8080:8080 -v ./assets/policies:/app/assets/policies:ro \
+    unitree-launcher sim --viser --play
 
-### GUI via X11 (Linux Only)
+# Mirror real robot via viser (Linux, host networking for DDS)
+docker run --rm --network host unitree-launcher mirror --viser --interface eth0
 
-```bash
-# Allow Docker to connect to X11
+# Real robot (Linux, host networking for DDS, C++ backend)
+docker build -f docker/Dockerfile --build-arg BUILD_CPP_BACKEND=1 -t unitree-launcher-real .
+docker run --rm --network host -v ./assets/policies:/app/assets/policies:ro \
+    unitree-launcher-real real --policy assets/policies/stance_29dof.onnx
+
+# X11 GUI (Linux only)
 xhost +local:docker
-
-docker run --rm \
-    -e DISPLAY=$DISPLAY \
-    -e MUJOCO_GL=glx \
-    -v /tmp/.X11-unix:/tmp/.X11-unix \
-    -v ./logs:/app/logs \
-    -v ./assets/policies:/app/assets/policies:ro \
-    unitree-launcher sim --policy assets/policies/stance_29dof.onnx
+docker run --rm -e DISPLAY=$DISPLAY -e MUJOCO_GL=glx \
+    -v /tmp/.X11-unix:/tmp/.X11-unix -v ./assets/policies:/app/assets/policies:ro \
+    unitree-launcher sim --gui --policy assets/policies/stance_29dof.onnx
 ```
 
-### Real Robot in Docker (Linux Only)
+### Docker Compose Profiles
 
-Requires host networking so DDS can reach the robot:
-
-```bash
-docker run --rm --network host \
-    -v ./logs:/app/logs \
-    -v ./assets/policies:/app/assets/policies:ro \
-    unitree-launcher real --policy assets/policies/stance_29dof.onnx --interface eth0
-```
-
-### Run Tests in Docker
+| Profile | Services | Description |
+|---------|----------|-------------|
+| `headless` | `sim-headless`, `eval` | EGL rendering, no display needed |
+| `gui` | `sim-gui` | X11 forwarding (Linux only) |
+| `viser` | `sim-viser`, `mirror` | Viser web viewer on port 8080 |
+| `real` | `real-robot` | Host networking + C++ backend |
+| `test` | `test` | pytest runner |
 
 ```bash
+# Headless sim
+docker compose -f docker/docker-compose.yml --profile headless run --rm sim-headless \
+    sim --policy assets/policies/stance_29dof.onnx --duration 10
+
+# Evaluation
+docker compose -f docker/docker-compose.yml --profile headless run --rm eval \
+    eval --steps 500 --policy assets/policies/stance_29dof.onnx
+
+# Viser sim
+docker compose -f docker/docker-compose.yml --profile viser run --rm sim-viser \
+    sim --viser --policy assets/policies/stance_29dof.onnx
+
+# Tests
 docker compose -f docker/docker-compose.yml --profile test run --rm test
 ```
 
-## Web Viewer (Viser)
-
-The `--viser` flag launches a web-based 3D viewer using [viser](https://viser.studio). The robot scene streams over WebSockets to any browser -- ideal for Docker on macOS, remote servers, or headless-with-monitoring use cases.
-
-### Local Usage
-
-```bash
-python -m unitree_launcher.main sim --policy path/to/policy.onnx --viser
-# Open http://localhost:8080 in your browser
-```
-
-### Custom Port
-
-```bash
-python -m unitree_launcher.main sim --policy path/to/policy.onnx --viser 9090
-```
-
-### Docker on macOS
-
-```bash
-docker compose -f docker/docker-compose.yml --profile viser run --rm --service-ports sim-viser \
-    sim --headless --policy assets/policies/stance_29dof.onnx --viser --duration 30
-# Open http://localhost:8080 in your host browser
-```
-
-### GUI Controls
-
-The viser sidebar provides interactive controls:
-
-| Control | Action |
-|---------|--------|
-| **Start / Stop** button | Toggle policy (same as Space in GLFW) |
-| **E-STOP** button | Emergency stop (same as Backspace) |
-| **Clear E-stop** button | Clear E-stop (same as Enter) |
-| **Reset** button | Reset robot to home position |
-| **vx / vy / yaw** sliders | Continuous velocity commands |
-| **Zero Velocity** button | Zero all velocity commands |
-| **Prev / Next Policy** buttons | Cycle through `--policy-dir` |
-
-The status panel shows current system state, sim time, velocity commands, and active policy name.
-
-## Quick Start
-
-### Simulation with Viewer
-
-```bash
-# macOS requires mjpython (ships with the mujoco package)
-mjpython -m unitree_launcher.main sim --policy path/to/policy.onnx
-
-# Linux — standard python works
-python -m unitree_launcher.main sim --policy path/to/policy.onnx
-```
-
-A MuJoCo viewer window opens with the G1 robot. Use keyboard controls to operate (see [Keybindings](#keybindings) below). On macOS, `mjpython` is required because MuJoCo's passive viewer must run on the main thread.
-
-### Gantry Mode (Simulation)
-
-```bash
-# With viewer (use mjpython on macOS)
-mjpython -m unitree_launcher.main sim --gantry
-
-# Headless
-python -m unitree_launcher.main sim --gantry --headless
-```
-
-Runs a gantry hang sequence: DAMPING (5s) -> INTERPOLATE (5s) -> HOLD (5s) -> DAMPING (5s). No policy needed. The robot hangs from an elastic band, settles under gravity, smoothly interpolates to home position with IsaacLab gains, holds, then damps to rest.
-
-### Headless Simulation
-
-```bash
-python -m unitree_launcher.main sim --policy path/to/policy.onnx --headless --duration 30
-```
-
-Runs without a viewer. Prints status to stdout at 1 Hz. Auto-terminates after 30 seconds.
-
-### Real Robot
-
-```bash
-python -m unitree_launcher.main real --policy path/to/policy.onnx --interface eth0
-```
-
-Connects to the G1 over Ethernet via DDS. Runs in headless mode (no viewer). The robot must be powered on and reachable on the specified network interface.
-
-### Shell Scripts
-
-```bash
-./scripts/run_sim.sh  --policy path/to/policy.onnx            # Viewer mode
-./scripts/run_eval.sh --policy path/to/policy.onnx --steps 500 # Headless eval
-./scripts/run_real.sh --policy path/to/policy.onnx --interface eth0
-```
-
-## CLI Reference
-
-```
-python -m unitree_launcher.main {sim,real} [options]
-```
-
-### Sub-commands
-
-| Sub-command | Description |
-|-------------|-------------|
-| `sim`       | MuJoCo simulation (viewer or headless) |
-| `real`      | Real robot via DDS over Ethernet |
-
-### Common Arguments
-
-| Argument | Default | Description |
-|----------|---------|-------------|
-| `--policy PATH` | *(required unless `--gantry`)* | Path to ONNX policy file |
-| `--config PATH` | `configs/default.yaml` | YAML configuration file |
-| `--robot VARIANT` | from config | Robot variant: `g1_29dof` or `g1_23dof` |
-| `--policy-dir DIR` | none | Directory of ONNX files for runtime switching (`=`/`-` keys) |
-| `--domain-id INT` | 1 (sim) / 0 (real) | DDS domain ID |
-| `--log-dir DIR` | `logs/` | Log output directory |
-| `--no-log` | false | Disable logging |
-| `--no-est` | false | Omit base linear velocity from observations |
-| `--viser [PORT]` | none | Web viewer on PORT (default: 8080) |
-
-### Sim-only Arguments
-
-| Argument | Default | Description |
-|----------|---------|-------------|
-| `--gantry` | false | Gantry mode: damping -> interpolate -> hold (no `--policy` needed) |
-| `--headless` | false | Run without MuJoCo viewer |
-| `--duration SECS` | none | Auto-stop after N seconds (headless) |
-| `--steps N` | none | Auto-stop after N policy steps (headless) |
-
-### Real-only Arguments
-
-| Argument | Default | Description |
-|----------|---------|-------------|
-| `--interface NAME` | *(required)* | Network interface (e.g. `eth0`, `enp3s0`) |
-
-## Keybindings
-
-These work in the MuJoCo viewer window. Mouse controls (orbit, pan, zoom) work as normal. Keys are chosen to avoid conflicts with MuJoCo's built-in viewer shortcuts (which use most letter keys for rendering toggles like wireframe, shadow, etc.).
-
-| Key | Action |
-|-----|--------|
-| `Space` | Start / stop the policy (toggle) |
-| `Backspace` | Emergency stop (latching) |
-| `Enter` | Clear E-stop (transitions to STOPPED) |
-| `Delete` (Fn+Backspace on Mac) | Reset robot to home position |
-| `Up` / `Down` | Increase / decrease forward velocity (+/- 0.1) |
-| `Left` / `Right` | Increase / decrease lateral velocity (+/- 0.1) |
-| `,` / `.` | Increase / decrease yaw rate (+/- 0.1) |
-| `/` | Zero all velocity commands |
-| `=` / `-` | Next / previous policy in `--policy-dir` |
-
-### State Machine
-
-```
-IDLE --(Space)--> RUNNING --(Space)--> STOPPED --(Space)--> RUNNING
-                    |                     |
-                    +--(Backspace)--> ESTOP <--(Backspace)--+
-                                       |
-                                    (Enter)
-                                       |
-                                    STOPPED
-```
-
-## Configuration
-
-Configuration is loaded from YAML files in `configs/`. CLI arguments override config values.
-
-### `configs/default.yaml`
-
-```yaml
-robot:
-  variant: g1_29dof       # g1_29dof or g1_23dof
-
-policy:
-  use_onnx_metadata: true # Use gains from ONNX metadata (BeyondMimic)
-  use_estimator: true     # Include base_lin_vel in observations
-
-control:
-  policy_frequency: 50    # Hz -- policy inference rate
-  sim_frequency: 200      # Hz -- MuJoCo physics rate
-  kp: 100.0               # Position gain (scalar or per-joint list)
-  kd: 10.0                # Velocity gain
-  ka: 0.5                 # Action scale
-  kd_damp: 5.0            # Damping gain for non-controlled joints
-
-safety:
-  joint_position_limits: true
-  joint_velocity_limits: true
-  torque_limits: true
-
-network:
-  interface: "auto"       # "auto" resolves to loopback
-  domain_id: 1            # DDS domain (sim=1, real=0)
-
-logging:
-  format: hdf5            # hdf5 or npz
-  compression: gzip
-```
-
-### Variant Configs
-
-- `configs/g1_29dof.yaml` -- 29-DOF (full body including wrists). Includes BeyondMimic reference gains as comments.
-- `configs/g1_23dof.yaml` -- 23-DOF (no wrist pitch/yaw, no waist roll/pitch). 6 unused joints receive passive damping.
-
-## Logging
-
-Each run creates a timestamped directory under `--log-dir`:
-
-```
-logs/20260211_143022_sim_walk_policy/
-  metadata.yaml    # Full config snapshot
-  data.hdf5        # Time-series data (gzip compressed)
-  events.json      # Discrete events (start, stop, estop)
-```
-
-### Logged Data
-
-18 channels at policy frequency: joint positions, velocities, torques, IMU quaternion/gyro/accel, base position/velocity, observations, actions, commanded positions, gains, system state, velocity commands, and timing.
-
-### Replay and Export
-
-```bash
-# Print summary
-python scripts/replay_log.py logs/<run>/
-
-# Export to CSV
-python scripts/replay_log.py logs/<run>/ --format csv --output data.csv
-```
+**Note:** X11 GUI forwarding requires Linux with an X server. macOS does not support X11 forwarding to Docker containers natively — use `--viser` instead.
 
 ## Project Structure
 
 ```
-unitree_launcher/
-  src/unitree_launcher/           # Installable Python package
-    main.py                       # CLI entry point, viewer, headless runner
-    config.py                     # Constants, dataclasses, YAML loading
-    compat.py                     # macOS compatibility (RecurrentThread shim)
-    gantry.py                     # Gantry harness utilities (elastic band)
-    mirror.py                     # Real robot state mirroring
-    robot/
-      base.py                     # RobotState, RobotCommand, RobotInterface ABC
-      sim_robot.py                # MuJoCo simulation backend
-      real_robot.py               # DDS communication with physical robot
-    policy/
-      base.py                     # PolicyInterface ABC, format auto-detection
-      joint_mapper.py             # Joint ordering between robot/policy/MuJoCo
-      observations.py             # IsaacLab observation vector construction
-      isaaclab_policy.py          # IsaacLab ONNX policy wrapper
-      beyondmimic_policy.py       # BeyondMimic ONNX policy wrapper
-    control/
-      controller.py               # Main control loop (50 Hz), command building
-      safety.py                   # State machine, E-stop, command clamping
-    datalog/
-      logger.py                   # HDF5/NPZ time-series logging
-      replay.py                   # Log loading, CSV export, summary
-    viz/
-      viser_viewer.py             # Viser web-based 3D viewer
-      conversions.py              # MuJoCo geom to trimesh conversion
-  configs/
-    default.yaml                  # Default configuration
-    g1_29dof.yaml                 # 29-DOF variant
-    g1_23dof.yaml                 # 23-DOF variant
-  assets/robots/g1/
-    g1_29dof.xml                  # MuJoCo robot model (29 actuators)
-    g1_23dof.xml                  # MuJoCo robot model (23 controlled)
-    scene_29dof.xml               # Scene with ground plane and lighting
-    scene_23dof.xml
-    meshes/                       # 64 STL mesh files
-  scripts/
-    run_sim.sh                    # Simulation launcher
-    run_real.sh                   # Real robot launcher
-    run_eval.sh                   # Headless evaluation launcher
-    replay_log.py                 # Log replay CLI
-    gantry_sim.py                 # Gantry hang test (sim & real)
-    wrist_validation.py           # Wrist sinusoid tracking test
-    mirror_real_robot.py          # Mirror real robot state in MuJoCo
-  tests/                          # 393 tests
-    conftest.py                   # Shared fixtures, ONNX model helpers
-    test_config.py                # Constants, config loading, validation
-    test_compat.py                # RecurrentThread, SDK patching
-    test_gantry.py                # Gantry harness hanging test
-    test_joint_mapper.py          # Joint ordering, reordering roundtrips
-    test_observations.py          # Gravity projection, velocity transforms
-    test_safety.py                # State machine, clamping, thread safety
-    test_isaaclab_policy.py       # Load, inference, dimension validation
-    test_beyondmimic_policy.py    # Geometry helpers, observation construction
-    test_sim_robot.py             # Impedance control, sensor mapping, DDS
-    test_controller.py            # Command building, key handling, lifecycle
-    test_real_robot.py            # DDS command/state, watchdog, CRC
-    test_logger.py                # HDF5/NPZ roundtrip, events, replay
-    test_viewer.py                # GLFW key map, viewer/headless runners
-    test_main.py                  # CLI parsing, config integration, wiring
-    test_integration.py           # End-to-end headless pipeline tests
-    test_scaffolding.py           # Testing utilities
+src/unitree_launcher/
+  main.py                     # CLI entry point, viewer/headless runners
+  config.py                   # Joint constants, dataclasses, YAML loading
+  mirror.py                   # Mirror mode entry point (DDS → MuJoCo viewer)
+  gantry.py                   # Elastic band + gantry simulation utilities
+  trajectory.py               # Collision-aware IK trajectory planning
+  recording.py                # MuJoCo video recording (MP4)
+  compat.py                   # unitree_sdk2py patches, cross-platform helpers
+  script_utils.py             # Shared helpers for diagnostic scripts
+  control/
+    runtime.py                # Step-based control loop, transitions, state machine
+    safety.py                 # Safety controller, E-stop, command clamping
+    gamepad.py                # Gamepad monitor (E-stop via USB HID)
+  policy/
+    base.py                   # Policy ABC, action smoothing, warmup()
+    isaaclab_policy.py        # IsaacLab velocity-tracking policy
+    beyondmimic_policy.py     # BeyondMimic motion-tracking policy
+    hold_policy.py            # Static PD hold at home pose
+    sinusoid_policy.py        # Joint sinusoid for gantry testing
+    joint_mapper.py           # Robot ↔ policy joint ordering
+    factory.py                # Policy loading, gain overrides, preloading
+  robot/
+    base.py                   # RobotState, RobotCommand, RobotInterface ABC
+    sim_robot.py              # MuJoCo simulation backend
+    real_robot.py             # C++ unitree_interface backend (onboard)
+    mirror_robot.py           # Read-only Python DDS backend
+  controller/
+    input.py                  # InputManager (merges all controllers)
+    keyboard.py               # Keyboard input (GLFW keys)
+    wireless.py               # Unitree wireless gamepad (real robot)
+    gamepad_input.py          # USB HID gamepad (sim/real)
+    viser_input.py            # Viser web UI input
+  estimation/
+    state_estimator.py        # InEKF + contact detection + FK
+    inekf.py                  # Invariant Extended Kalman Filter
+    contact.py                # Contact detection (GRF thresholding)
+    kinematics.py             # Leg forward kinematics (Jacobian)
+    lie_group.py              # SO(3)/SE(3) Lie group operations
+  datalog/
+    logger.py                 # HDF5/NPZ time-series logging
+    replay.py                 # Log loading, CSV export
+  viz/
+    viser_viewer.py           # Web-based 3D viewer
+    conversions.py            # MuJoCo geom → trimesh
+
+configs/                      # YAML configuration presets
+assets/robots/g1/             # MuJoCo XML models + meshes
+assets/policies/              # ONNX policy files
+scripts/                      # Shell helpers (deploy, build, network setup)
+tests/                        # 505 automated tests
 ```
 
 ## Testing
 
 ```bash
-# Run all tests
-pytest tests/ -v
-
-# Run with coverage
-pytest tests/ --cov=src/unitree_launcher --cov-report=term-missing
-
-# Skip slow tests
-pytest tests/ -m "not slow"
-
-# Run a specific phase
-pytest tests/test_controller.py -v
+uv run pytest tests/ -x              # All tests
+uv run pytest tests/ -k transition   # Specific tests
+uv run pytest tests/ -m "not slow"   # Skip slow tests
 ```
 
-## Architecture
+## State Estimator
 
+An InEKF state estimator fuses IMU predictions with contact-foot kinematics (leg Jacobian).
+
+- **Real mode**: Always on — the estimator is the only source of base state.
+- **Sim mode**: Opt-in with `--estimator` to validate estimator-in-the-loop before hardware.
+- **Tuning**: Add `--estimator-verbose` for diagnostic output. See [`docs/estimator_tuning.md`](docs/estimator_tuning.md).
+
+Two estimation modes:
+
+| Mode | Flag | Estimates | Default for |
+|------|------|-----------|-------------|
+| **pos+vel** | _(default)_ | `base_position`, `base_velocity` | Real and sim |
+| **pos+vel+imu** | `--estimate-imu` | Above + smoothed `imu_quaternion`, bias-corrected `imu_angular_velocity` | Policies trained with filtered IMU |
+
+Most policies are trained with raw IMU in Isaac Lab — use the default mode. Only add `--estimate-imu` for policies explicitly trained with filtered IMU inputs.
+
+```bash
+# Sim: test estimator against MuJoCo ground truth
+uv run sim --estimator --policy assets/policies/beyondmimic_29dof.onnx
+
+# Real: estimator is automatic, verbose for tuning
+uv run real --estimator-verbose --policy assets/policies/stance_29dof.onnx
+
+# Full estimation (pos+vel+imu) for policies that expect filtered IMU
+uv run real --estimate-imu --policy assets/policies/filtered_imu_policy.onnx
 ```
-                    +-----------+
-  Keyboard ------->| Controller|-------> DataLogger
-  (GLFW/Viser)     |  (50 Hz)  |         (HDF5/NPZ)
-                    +-----+-----+
-                          |
-              +-----------+-----------+
-              |                       |
-        +-----+------+        +------+------+
-        |   Policy   |        |   Safety    |
-        | (ONNX inf) |        | (clamp/estop)|
-        +-----+------+        +------+------+
-              |                       |
-              +-----------+-----------+
-                          |
-                    +-----+-----+
-                    |   Robot   |
-                    | (sim/real)|
-                    +-----------+
-                          |
-              +-----------+-----------+
-              |                       |
-        MuJoCo (sim)           DDS (real)
-              |
-     +--------+--------+
-     |                  |
-  GLFW viewer    Viser (web)
-```
-
-### Threading Model
-
-Three threads cooperate when the viewer is active:
-
-| Thread | Role | Frequency |
-|--------|------|-----------|
-| **Main** | Drain key queue, `viewer.sync()` under lock | ~60 Hz |
-| **Control** | Read state, policy inference, PD command, `mj_step()` under lock | 50 Hz |
-| **Viewer** | GLFW rendering, fires key callback into queue | vsync |
-
-A `threading.Lock` on `SimRobot` protects `mjData` — held only during `mj_step()` (control thread) and `viewer.sync()` (main thread). The key callback fires on the viewer thread and must never acquire the lock; instead it enqueues key names into a `queue.SimpleQueue`, which the main thread drains outside the lock to avoid cross-thread deadlocks.
-
-For BeyondMimic policies, the joint ordering is automatically extracted from the ONNX model's embedded metadata at startup, ensuring correct mapping between the policy's joint order and the robot's native order.
 
 ## Safety
 
-- **Joint position limits** -- Commands clamped to physical joint ranges
-- **Joint velocity limits** -- Velocity targets clamped per motor specification
-- **Torque limits** -- Torque commands clamped per motor rating
-- **Orientation check** -- Detects if robot has fallen (gravity vector > 35 deg from vertical)
-- **Watchdog (real robot)** -- E-stops if no state message received within 100ms
-- **Exception handling** -- Any control loop exception triggers immediate E-stop
-- **E-stop latching** -- E-stop state persists until explicitly cleared
-
-All safety limits are sourced from the Unitree RL Lab motor specifications and MuJoCo model files.
+- **Joint limits**: Commands clamped to physical joint position/velocity/torque ranges
+- **Tilt detection**: E-stop on >57° tilt from vertical (every tick)
+- **Frame drop**: E-stop on >200ms control loop stall
+- **Wireless E-stop**: A-button checked in `get_state()` (tightest Python loop)
+- **Hardware fallback**: L2+B on wireless controller triggers firmware-level damping
+- **Exception handling**: Any control loop exception triggers immediate E-stop
+- **E-stop latching**: Persists until explicitly cleared

@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass, field, fields
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -21,7 +20,7 @@ import yaml
 
 
 # ============================================================================
-# Section 1: Robot Joint Constants (from SPEC sections 2.2–2.4)
+# Section 1: Robot Joint Constants
 # ============================================================================
 
 # ---------------------------------------------------------------------------
@@ -232,7 +231,7 @@ ISAACLAB_TO_NATIVE_INDICES: List[int] = [
 ]
 
 # ---------------------------------------------------------------------------
-# Home positions (SPEC section 2.4)
+# Home positions
 # ---------------------------------------------------------------------------
 Q_HOME_29DOF: Dict[str, float] = {
     "left_hip_pitch": -0.312,
@@ -293,7 +292,7 @@ Q_HOME_23DOF: Dict[str, float] = {
 }
 
 # ---------------------------------------------------------------------------
-# Joint position limits: config-name -> (min, max) in radians (SPEC 2.2)
+# Joint position limits: config-name -> (min, max) in radians
 # ---------------------------------------------------------------------------
 JOINT_LIMITS_29DOF: Dict[str, Tuple[float, float]] = {
     "left_hip_pitch": (-2.53, 2.88),
@@ -480,7 +479,7 @@ BM_ACTION_SCALE_29DOF: Dict[str, float] = {
     "right_wrist_roll": 0.439, "right_wrist_pitch": 0.075, "right_wrist_yaw": 0.075,
 }
 
-# Torque limits: config-name -> max torque in Nm (SPEC 2.2)
+# Torque limits: config-name -> max torque in Nm
 # ---------------------------------------------------------------------------
 TORQUE_LIMITS_29DOF: Dict[str, float] = {
     "left_hip_pitch": 88.0,
@@ -607,8 +606,92 @@ VELOCITY_LIMITS_23DOF: Dict[str, float] = {
     "right_elbow_roll": 37.0,
 }
 
+
 # ---------------------------------------------------------------------------
-# DDS/IDL name <-> config name mappings (SPEC section 2.2, 2.3)
+# DoFConfig: per-joint gains, limits, and defaults bundled together
+# ---------------------------------------------------------------------------
+@dataclass
+class DoFConfig:
+    """Per-joint gains, limits, and defaults for a set of DOFs."""
+
+    joint_names: List[str]
+    default_pos: np.ndarray          # (n,) home positions
+    stiffness: np.ndarray            # (n,) Kp
+    damping: np.ndarray              # (n,) Kd
+    action_scale: np.ndarray         # (n,) Ka
+    torque_limits: np.ndarray        # (n,) max |tau|
+    position_limits: np.ndarray      # (n, 2) [lower, upper]
+    velocity_limits: np.ndarray      # (n,) max |dq|
+
+    @property
+    def n_dof(self) -> int:
+        return len(self.joint_names)
+
+    def for_joints(self, joints: List[str]) -> 'DoFConfig':
+        """Slice to a subset of joints in the given order."""
+        indices = [self.joint_names.index(j) for j in joints]
+        return DoFConfig(
+            joint_names=joints,
+            default_pos=self.default_pos[indices],
+            stiffness=self.stiffness[indices],
+            damping=self.damping[indices],
+            action_scale=self.action_scale[indices],
+            torque_limits=self.torque_limits[indices],
+            position_limits=self.position_limits[indices],
+            velocity_limits=self.velocity_limits[indices],
+        )
+
+
+def _build_dof_config(
+    joints: List[str],
+    q_home: Dict[str, float],
+    kp: Dict[str, float],
+    kd: Dict[str, float],
+    ka: Dict[str, float],
+    torque: Dict[str, float],
+    pos_limits: Dict[str, Tuple[float, float]],
+    vel_limits: Dict[str, float],
+) -> DoFConfig:
+    """Build a DoFConfig from the module-level dicts."""
+    return DoFConfig(
+        joint_names=joints,
+        default_pos=np.array([q_home[j] for j in joints], dtype=np.float64),
+        stiffness=np.array([kp[j] for j in joints], dtype=np.float64),
+        damping=np.array([kd[j] for j in joints], dtype=np.float64),
+        action_scale=np.array([ka[j] for j in joints], dtype=np.float64),
+        torque_limits=np.array([torque[j] for j in joints], dtype=np.float64),
+        position_limits=np.array([pos_limits[j] for j in joints], dtype=np.float64),
+        velocity_limits=np.array([vel_limits[j] for j in joints], dtype=np.float64),
+    )
+
+
+DOF_ISAACLAB_29: DoFConfig = _build_dof_config(
+    G1_29DOF_JOINTS, Q_HOME_29DOF, ISAACLAB_KP_29DOF, ISAACLAB_KD_29DOF,
+    BM_ACTION_SCALE_29DOF, TORQUE_LIMITS_29DOF, JOINT_LIMITS_29DOF,
+    VELOCITY_LIMITS_29DOF,
+)
+
+DOF_STANDBY_29: DoFConfig = _build_dof_config(
+    G1_29DOF_JOINTS, Q_HOME_29DOF, STANDBY_KP_29DOF, STANDBY_KD_29DOF,
+    BM_ACTION_SCALE_29DOF, TORQUE_LIMITS_29DOF, JOINT_LIMITS_29DOF,
+    VELOCITY_LIMITS_29DOF,
+)
+
+DOF_UNITREE_29: DoFConfig = _build_dof_config(
+    G1_29DOF_JOINTS, Q_HOME_29DOF, UNITREE_KP_29DOF, UNITREE_KD_29DOF,
+    BM_ACTION_SCALE_29DOF, TORQUE_LIMITS_29DOF, JOINT_LIMITS_29DOF,
+    VELOCITY_LIMITS_29DOF,
+)
+
+DOF_CONFIGS: Dict[str, DoFConfig] = {
+    "isaaclab_29": DOF_ISAACLAB_29,
+    "standby_29": DOF_STANDBY_29,
+    "unitree_29": DOF_UNITREE_29,
+}
+
+
+# ---------------------------------------------------------------------------
+# DDS/IDL name <-> config name mappings
 # ---------------------------------------------------------------------------
 _DDS_TO_CONFIG_29DOF: Dict[str, str] = {
     "L_LEG_HIP_PITCH": "left_hip_pitch",
@@ -716,7 +799,7 @@ def resolve_joint_name(name: str, variant: str = "g1_29dof") -> str:
 
 
 # ============================================================================
-# Section 2: Configuration Dataclasses (PLAN_METAL Task 2.5)
+# Section 2: Configuration Dataclasses
 # ============================================================================
 
 @dataclass
@@ -734,16 +817,19 @@ class PolicyConfig:
     controlled_joints: Optional[List[str]] = None
     use_onnx_metadata: bool = True
     use_estimator: bool = True
+    policy_dir: Optional[str] = None     # Directory of ONNX files for switching
+    active_policy: Optional[str] = None  # Initial active policy path
 
 
 @dataclass
 class ControlConfig:
     policy_frequency: int = 50
-    sim_frequency: int = 200
-    kp: Union[float, List[float]] = 100.0
-    kd: Union[float, List[float]] = 10.0
-    ka: Union[float, List[float]] = 0.5
-    kd_damp: float = 5.0
+    sim_frequency: int = 500
+    kp: Optional[Union[float, List[float]]] = None  # Debug override (trumps ONNX)
+    kd: Optional[Union[float, List[float]]] = None  # Debug override (trumps ONNX)
+    ka: Optional[Union[float, List[float]]] = None  # Debug override (trumps ONNX)
+    kd_damp: float = 8.0
+    transition_steps: int = 5  # Steps for policy transition blend (0 = instant)
     q_home: Optional[Dict[str, float]] = None
 
 
@@ -753,6 +839,10 @@ class SafetyConfig:
     joint_velocity_limits: bool = True
     torque_limits: bool = True
     fault_threshold: float = 0.95
+    tilt_check: bool = True
+    tilt_threshold_rad: float = 1.0  # ~57 degrees (matching RoboJuDo)
+    frame_drop_check: bool = True
+    frame_drop_threshold: float = 0.2  # 200ms
 
 
 @dataclass
@@ -836,11 +926,11 @@ def _validate_config(cfg: Config) -> None:
             resolve_joint_name(n, variant) for n in cfg.policy.observed_joints
         ]
 
-    # Gain list length validation
+    # Gain list length validation (skip when None — policies use own defaults)
     n_controlled = len(cfg.policy.controlled_joints) if cfg.policy.controlled_joints else len(joints)
     for gain_name in ("kp", "kd", "ka"):
         val = getattr(cfg.control, gain_name)
-        if isinstance(val, list) and len(val) != n_controlled:
+        if val is not None and isinstance(val, list) and len(val) != n_controlled:
             raise ValueError(
                 f"Length of {gain_name} list ({len(val)}) does not match "
                 f"number of controlled joints ({n_controlled})."
@@ -891,9 +981,33 @@ def apply_cli_overrides(config: Config, args) -> None:
     """Apply CLI argument overrides to a loaded Config (in-place).
 
     Supported overrides:
-        --robot   -> config.robot.variant
+        --robot       -> config.robot.variant
+        --policy      -> config.policy.active_policy
+        --policy-dir  -> config.policy.policy_dir
+        --no-est      -> config.policy.use_estimator = False
+        --estimator   -> config.policy.use_estimator = True
+        --interface   -> config.network.interface
+        --no-log      -> config.logging.enabled = False
     """
     robot_variant = getattr(args, "robot", None)
     if robot_variant is not None:
         config.robot.variant = robot_variant
-        _validate_config(config)
+
+    if getattr(args, "policy", None) is not None:
+        config.policy.active_policy = args.policy
+
+    if getattr(args, "policy_dir", None) is not None:
+        config.policy.policy_dir = args.policy_dir
+
+    if getattr(args, "no_est", False):
+        config.policy.use_estimator = False
+    elif getattr(args, "estimator", False):
+        config.policy.use_estimator = True
+
+    if getattr(args, "interface", None) is not None:
+        config.network.interface = args.interface
+
+    if getattr(args, "no_log", False):
+        config.logging.enabled = False
+
+    _validate_config(config)

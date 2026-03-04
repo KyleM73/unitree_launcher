@@ -1,15 +1,11 @@
-"""Tests for SimRobot (Phase 7).
+"""Tests for SimRobot (pure MuJoCo simulation backend).
 
 Tests cover: init, n_dof, get_state shape, reset, step, gravity,
 damping holds, send_command, IMU upright, connect/disconnect,
-Metal-specific viewer properties, impedance control values,
-sensor mapping correctness, 23-DOF variant, substep count,
-base position, reset with custom state, and DDS publish mock.
+viewer properties, impedance control values, sensor mapping
+(qpos/qvel direct reads), 23-DOF variant, substep count,
+base position, and reset with custom state.
 """
-import threading
-import time
-from unittest.mock import MagicMock, patch
-
 import mujoco
 import numpy as np
 import pytest
@@ -50,17 +46,6 @@ def robot(default_config):
 def robot_23dof(config_23dof):
     """SimRobot with 23-DOF config (no DDS)."""
     return SimRobot(config_23dof)
-
-
-# ---------------------------------------------------------------------------
-# Test: init
-# ---------------------------------------------------------------------------
-
-def test_sim_robot_init(robot):
-    """SimRobot initializes without errors."""
-    assert robot is not None
-    assert robot.mj_model is not None
-    assert robot.mj_data is not None
 
 
 # ---------------------------------------------------------------------------
@@ -200,39 +185,6 @@ def test_sim_robot_imu_upright(robot):
 
 
 # ---------------------------------------------------------------------------
-# Test: connect/disconnect
-# ---------------------------------------------------------------------------
-
-def test_sim_robot_connect_disconnect(robot):
-    """connect() and disconnect() run without errors (mocked DDS)."""
-    with patch("unitree_launcher.robot.sim_robot.patch_unitree_threading"):
-        with patch.dict("sys.modules", {
-            "unitree_sdk2py.core.channel": MagicMock(),
-            "unitree_sdk2py.idl.unitree_hg.msg.dds_": MagicMock(),
-            "unitree_sdk2py.idl.default": MagicMock(),
-        }):
-            robot.connect()
-            assert robot._dds_initialized is True
-            robot.disconnect()
-            assert robot._dds_initialized is False
-
-
-# ---------------------------------------------------------------------------
-# Test: Metal-specific viewer properties
-# ---------------------------------------------------------------------------
-
-def test_sim_robot_exposes_mj_model(robot):
-    """mj_model property exposes MuJoCo model."""
-    assert isinstance(robot.mj_model, mujoco.MjModel)
-    assert robot.mj_model.nu == 29
-
-
-def test_sim_robot_exposes_lock(robot):
-    """lock property exposes threading.Lock."""
-    assert isinstance(robot.lock, type(threading.Lock()))
-
-
-# ---------------------------------------------------------------------------
 # Test: impedance control values (safety-critical, value-level)
 # ---------------------------------------------------------------------------
 
@@ -300,31 +252,44 @@ def test_sim_robot_impedance_control_values(robot):
 # ---------------------------------------------------------------------------
 
 def test_sim_robot_sensor_mapping_correctness(robot):
-    """get_state() matches raw sensordata layout for 29-DOF."""
+    """get_state() reads qpos/qvel/actuator_force directly + sensordata for IMU."""
     robot.reset()
     mujoco.mj_forward(robot.mj_model, robot.mj_data)
 
     state = robot.get_state()
     sd = robot.mj_data.sensordata
-    nm = 29
-    dms = 3 * nm
 
-    # Joint positions = sensordata[0:29] (identity mapping for 29-DOF)
-    np.testing.assert_array_equal(state.joint_positions, sd[0:29])
-    # Joint velocities = sensordata[29:58]
-    np.testing.assert_array_equal(state.joint_velocities, sd[29:58])
-    # Joint torques = sensordata[58:87]
-    np.testing.assert_array_equal(state.joint_torques, sd[58:87])
-    # IMU quaternion = sensordata[87:91]
-    np.testing.assert_array_equal(state.imu_quaternion, sd[87:91])
-    # IMU gyro = sensordata[91:94]
-    np.testing.assert_array_equal(state.imu_angular_velocity, sd[91:94])
-    # IMU accel = sensordata[94:97]
-    np.testing.assert_array_equal(state.imu_linear_acceleration, sd[94:97])
-    # Base position = sensordata[97:100]
-    np.testing.assert_array_equal(state.base_position, sd[97:100])
-    # Base velocity = sensordata[100:103]
-    np.testing.assert_array_equal(state.base_velocity, sd[100:103])
+    # Joint positions from qpos (indexed by _qpos_addr)
+    for cfg_i in range(29):
+        qpos_addr = robot._qpos_addr[cfg_i]
+        np.testing.assert_equal(
+            state.joint_positions[cfg_i], robot.mj_data.qpos[qpos_addr],
+            err_msg=f"joint_positions mismatch at index {cfg_i}"
+        )
+
+    # Joint velocities from qvel (indexed by _dof_addr)
+    for cfg_i in range(29):
+        dof_addr = robot._dof_addr[cfg_i]
+        np.testing.assert_equal(
+            state.joint_velocities[cfg_i], robot.mj_data.qvel[dof_addr],
+            err_msg=f"joint_velocities mismatch at index {cfg_i}"
+        )
+
+    # Joint torques from actuator_force (indexed by _cfg_to_mj)
+    for cfg_i in range(29):
+        mj_i = robot._cfg_to_mj[cfg_i]
+        np.testing.assert_equal(
+            state.joint_torques[cfg_i], robot.mj_data.actuator_force[mj_i],
+            err_msg=f"joint_torques mismatch at index {cfg_i}"
+        )
+
+    # IMU from sensordata (new layout: no joint sensors, starts at index 0)
+    # Sensor layout: quat[0:4], gyro[4:7], accel[7:10], pos[10:13], vel[13:16]
+    np.testing.assert_array_equal(state.imu_quaternion, sd[0:4])
+    np.testing.assert_array_equal(state.imu_angular_velocity, sd[4:7])
+    np.testing.assert_array_equal(state.imu_linear_acceleration, sd[7:10])
+    np.testing.assert_array_equal(state.base_position, sd[10:13])
+    np.testing.assert_array_equal(state.base_velocity, sd[13:16])
 
 
 # ---------------------------------------------------------------------------
@@ -400,36 +365,6 @@ def test_sim_robot_reset_custom_state(robot):
 
     state = robot.get_state()
     np.testing.assert_allclose(state.joint_positions, custom_pos, atol=1e-10)
-
-
-# ---------------------------------------------------------------------------
-# Test: DDS publish mock
-# ---------------------------------------------------------------------------
-
-def test_sim_robot_dds_publish_mock(robot):
-    """DDS publish thread calls Write() with motor states populated."""
-    # Create a mock LowState message
-    mock_msg = MagicMock()
-    mock_msg.motor_state = [MagicMock() for _ in range(35)]
-    mock_msg.imu_state = MagicMock()
-    mock_msg.imu_state.quaternion = [0.0] * 4
-    mock_msg.imu_state.gyroscope = [0.0] * 3
-    mock_msg.imu_state.accelerometer = [0.0] * 3
-
-    mock_pub = MagicMock()
-
-    robot._low_state_msg = mock_msg
-    robot._low_state_pub = mock_pub
-
-    # Call the publish method directly
-    robot._publish_low_state()
-
-    # Verify Write was called
-    mock_pub.Write.assert_called_once_with(mock_msg)
-
-    # Verify motor states were populated
-    for i in range(29):
-        assert mock_msg.motor_state[i].q == float(robot.mj_data.sensordata[i])
 
 
 # ---------------------------------------------------------------------------

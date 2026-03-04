@@ -1,0 +1,48 @@
+# G1 onboard deployment config.
+#
+# Wireless controller buttons:
+#   A       = E-stop (software, checked every get_state() call)
+#   B       = Motion fade out (stop policy, return to stance)
+#   X       = Motion fade in (re-activate policy)
+#   Y       = Motion reset (stop + reset + re-activate)
+#   Start   = Start policy
+#   Select  = Stop policy
+#   R1+DUp  = Next policy
+#   R1+DDn  = Previous policy
+#   L2+B    = HARDWARE damping mode (firmware-level, always works even if Python hangs)
+#
+robot:
+  variant: g1_29dof
+  idl_mode: 0
+
+policy:
+  default_policy: "assets/policies/stance_29dof.onnx"
+  default_ka: 0.3
+  use_onnx_metadata: true
+  use_estimator: false
+
+control:
+  policy_frequency: 50
+  sim_frequency: 1000
+  kd_damp: 8.0
+
+safety:
+  joint_position_limits: true
+  joint_velocity_limits: true
+  torque_limits: true
+  tilt_check: true
+  frame_drop_check: true
+
+network:
+  interface: "eth0"
+  domain_id: 0
+
+viewer:
+  enabled: false
+  sync: false
+
+logging:
+  enabled: true
+  format: npz
+  compression: none
+  log_frequency: 10

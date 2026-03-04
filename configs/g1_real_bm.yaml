@@ -1,0 +1,27 @@
+robot:
+  variant: g1_29dof
+
+policy:
+  format: beyondmimic
+  use_onnx_metadata: true
+  use_estimator: false
+
+control:
+  policy_frequency: 50
+  sim_frequency: 1000
+  kd_damp: 8.0
+
+safety:
+  tilt_check: true
+  frame_drop_check: true
+
+network:
+  interface: "eth0"
+  domain_id: 0
+
+viewer:
+  enabled: false
+
+logging:
+  enabled: true
+  format: npz

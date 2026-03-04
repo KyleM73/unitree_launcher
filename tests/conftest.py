@@ -26,7 +26,7 @@ def tmp_log_dir(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# ONNX model creation helpers (used by Phase 6 policy tests)
+# ONNX model creation helpers
 # ---------------------------------------------------------------------------
 
 def create_isaaclab_onnx(obs_dim, action_dim, path):

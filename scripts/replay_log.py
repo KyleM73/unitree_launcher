@@ -2,14 +2,10 @@
 """Replay and inspect logged robot data.
 
 Usage:
-    python scripts/replay_log.py logs/<run>/ [--format csv] [--output file]
+    uv run python scripts/replay_log.py logs/<run>/ [--format csv] [--output file]
 """
 import argparse
-import sys
 from pathlib import Path
-
-# Add project root to path
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from unitree_launcher.datalog.replay import LogReplay
 

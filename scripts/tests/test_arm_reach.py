@@ -245,7 +245,6 @@ def run_test(args) -> dict:
     robot = create_robot(
         mode, config,
         interface=args.interface,
-        backend=args.backend,
     )
 
     gain_kind = "isaaclab"

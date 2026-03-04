@@ -6,9 +6,12 @@ control loop can call each tick.
 """
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, Optional
 
 import numpy as np
+
+log = logging.getLogger(__name__)
 
 from unitree_launcher.estimation.contact import ContactDetector
 from unitree_launcher.estimation.inekf import RightInvariantEKF
@@ -51,8 +54,8 @@ _BLEND_TICKS = 25  # 0.5 s linear ramp
 
 # Sanity bounds: if the estimated state exceeds these, fall back to
 # the raw robot state to prevent NaN/Inf from reaching the policy.
-_MAX_VELOCITY = 5.0    # m/s
-_MAX_POS_DELTA = 1.0   # m from initial position
+_MAX_VELOCITY = 3.0    # m/s (G1 max walk speed ~1.5 m/s, 2× margin)
+_MAX_POS_DELTA = 2.0   # m from initial position
 
 
 class StateEstimator:
@@ -70,11 +73,19 @@ class StateEstimator:
         noise_params: Override noise parameters for the InEKF.
     """
 
-    def __init__(self, config: Any, noise_params: Optional[Dict[str, float]] = None):
+    def __init__(
+        self,
+        config: Any,
+        noise_params: Optional[Dict[str, float]] = None,
+        verbose: bool = False,
+        estimate_imu: bool = False,
+    ):
         self._noise_params = {**_DEFAULT_NOISE, **(noise_params or {})}
         self._ekf = RightInvariantEKF(**self._noise_params)
         self._contacts = ContactDetector()
         self._fk = G1Kinematics()
+        self._verbose = verbose
+        self._estimate_imu = estimate_imu
 
         self._dt = 1.0 / config.control.policy_frequency
         self._initialized = False
@@ -89,6 +100,13 @@ class StateEstimator:
         self._leg_velocity: np.ndarray = np.zeros(3)  # smoothed leg-derived velocity
         self._leg_vel_alpha: float = 0.3  # EMA smoothing factor (0..1, lower = smoother)
         self._leg_vel_outlier: float = 1.0  # reject samples deviating more than this (m/s)
+
+        # Gyro bias calibration: accumulate readings during warmup
+        self._gyro_warmup_sum: np.ndarray = np.zeros(3)
+        self._gyro_warmup_count: int = 0
+
+        # Diagnostic counters
+        self._sensor_nan_count: int = 0
 
     def _init_ekf(self, robot_state: RobotState) -> None:
         """(Re-)initialize the EKF and augment both feet as contacts.
@@ -118,8 +136,20 @@ class StateEstimator:
         if not np.all(np.isfinite(ba0)):
             ba0 = np.zeros(3)
 
+        # Gyro bias: use warmup average if available, else zeros.
+        bg0 = np.zeros(3)
+        if self._gyro_warmup_count > 0:
+            bg0 = self._gyro_warmup_sum / self._gyro_warmup_count
+            if self._verbose:
+                log.info("Gyro bias calibrated from %d warmup samples: "
+                         "[%.5f, %.5f, %.5f] rad/s",
+                         self._gyro_warmup_count, *bg0)
+
+        if self._verbose:
+            log.info("Accel bias calibrated: [%.4f, %.4f, %.4f] m/s²", *ba0)
+
         self._p0 = p0.copy()
-        self._ekf.initialize(R0, v0, p0, ba0=ba0)
+        self._ekf.initialize(R0, v0, p0, bg0=bg0, ba0=ba0)
 
         q = robot_state.joint_positions
         left_body = self._fk.left_foot_position(q)
@@ -129,6 +159,24 @@ class StateEstimator:
         self._right_contact_id = self._ekf.augment_state(right_body)
         self._prev_left = True
         self._prev_right = True
+
+    @staticmethod
+    def _validate_sensors(state: RobotState) -> bool:
+        """Return False if any sensor reading is NaN/Inf."""
+        return (
+            np.all(np.isfinite(state.imu_quaternion))
+            and np.all(np.isfinite(state.imu_angular_velocity))
+            and np.all(np.isfinite(state.imu_linear_acceleration))
+            and np.all(np.isfinite(state.joint_positions))
+            and np.all(np.isfinite(state.joint_velocities))
+            and np.all(np.isfinite(state.joint_torques))
+        )
+
+    def reset(self) -> None:
+        """Clear all state so the next update() reinitializes from scratch."""
+        self._initialized = False
+        self._tick = 0
+        self._leg_velocity = np.zeros(3)
 
     def initialize(self, robot_state: RobotState) -> None:
         """Initialize from first robot state reading."""
@@ -162,9 +210,20 @@ class StateEstimator:
         dt = dt or self._dt
         self._tick += 1
 
+        # --- Sensor validation: reject corrupt readings early ---
+        if not self._validate_sensors(robot_state):
+            self._sensor_nan_count += 1
+            if self._verbose and self._sensor_nan_count % 50 == 1:
+                log.warning("Corrupt sensor data (NaN/Inf) — skipping tick "
+                            "(total: %d)", self._sensor_nan_count)
+            return
+
         # --- Warmup phase: let the robot settle, keep contact detector warm ---
         if self._tick < _WARMUP_TICKS:
             self._contacts.update(robot_state.joint_torques, dt)
+            # Accumulate gyro readings for bias calibration.
+            self._gyro_warmup_sum += robot_state.imu_angular_velocity
+            self._gyro_warmup_count += 1
             return
 
         # --- Re-initialize exactly at warmup end, then fall through to normal ---
@@ -260,6 +319,21 @@ class StateEstimator:
             self._leg_velocity = a * v_raw + (1.0 - a) * self._leg_velocity
         # else: keep previous _leg_velocity (brief single-support phase)
 
+        # --- Periodic diagnostics (every 5s = 250 ticks at 50Hz) ---
+        if self._verbose and self._tick % 250 == 0:
+            pos = self._ekf.position
+            vel_norm = np.linalg.norm(self._leg_velocity)
+            bg = self._ekf.gyro_bias
+            ba = self._ekf.accel_bias
+            log.info(
+                "tick=%d  pos=[%.3f,%.3f,%.3f]  |vel|=%.3f  "
+                "contacts=L%d/R%d  bg=[%.4f,%.4f,%.4f]  ba=[%.3f,%.3f,%.3f]  "
+                "nan_skips=%d",
+                self._tick, *pos, vel_norm,
+                int(left_contact), int(right_contact),
+                *bg, *ba, self._sensor_nan_count,
+            )
+
     @property
     def settled(self) -> bool:
         """True once warmup is complete and EKF is running."""
@@ -338,17 +412,20 @@ class StateEstimator:
         state.base_position = (1.0 - alpha) * raw_pos + alpha * ekf_pos
         state.base_velocity = (1.0 - alpha) * raw_vel + alpha * ekf_vel
 
-        # Smoothed orientation from fused EKF rotation (IMU + kinematics).
-        ekf_quat = rotation_matrix_to_quat(self._ekf.rotation)
-        raw_quat = robot_state.imu_quaternion
-        state.imu_quaternion = (1.0 - alpha) * raw_quat + alpha * ekf_quat
-        # Re-normalize after linear blend (SLERP not needed for small alpha steps).
-        state.imu_quaternion /= np.linalg.norm(state.imu_quaternion)
+        # Optional: smoothed IMU orientation and bias-corrected angular
+        # velocity from the EKF.  Off by default because policies trained
+        # with raw IMU in Isaac Lab can destabilize when fed filtered values
+        # (confirmed: proj_g_angvel policy falls with this enabled).
+        # Enable with --estimate-imu for policies trained with filtered IMU.
+        if self._estimate_imu:
+            ekf_quat = rotation_matrix_to_quat(self._ekf.rotation)
+            raw_quat = robot_state.imu_quaternion
+            state.imu_quaternion = (1.0 - alpha) * raw_quat + alpha * ekf_quat
+            state.imu_quaternion /= np.linalg.norm(state.imu_quaternion)
 
-        # Bias-corrected angular velocity.
-        state.imu_angular_velocity = (
-            robot_state.imu_angular_velocity - alpha * self._ekf.gyro_bias
-        )
+            state.imu_angular_velocity = (
+                robot_state.imu_angular_velocity - alpha * self._ekf.gyro_bias
+            )
 
         return state
 

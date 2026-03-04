@@ -2,7 +2,13 @@
 #
 # Run from repo root:
 #   docker compose -f docker/docker-compose.yml --profile headless run --rm sim-headless \
-#       sim --headless --policy assets/policies/stance_29dof.onnx --duration 10
+#       sim --policy assets/policies/stance_29dof.onnx --duration 10
+#   docker compose -f docker/docker-compose.yml --profile headless run --rm eval \
+#       eval --steps 500 --policy assets/policies/stance_29dof.onnx
+#   docker compose -f docker/docker-compose.yml --profile viser run --rm sim-viser \
+#       sim --viser --policy assets/policies/stance_29dof.onnx
+#   docker compose -f docker/docker-compose.yml --profile viser run --rm mirror \
+#       mirror --viser --interface eth0
 #   docker compose -f docker/docker-compose.yml --profile gui run --rm sim-gui \
 #       sim --policy assets/policies/stance_29dof.onnx
 #   docker compose -f docker/docker-compose.yml --profile real run --rm real-robot \
@@ -12,6 +18,18 @@
 services:
   # ── Headless simulation (macOS + Linux) ────────────────────────────
   sim-headless:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    profiles: [headless]
+    environment:
+      - MUJOCO_GL=egl
+    volumes:
+      - ../logs:/app/logs
+      - ../assets/policies:/app/assets/policies:ro
+
+  # ── Headless evaluation at 1000 Hz (macOS + Linux) ────────────────
+  eval:
     build:
       context: ..
       dockerfile: docker/Dockerfile
@@ -64,6 +82,16 @@ services:
     volumes:
       - ../logs:/app/logs
       - ../assets/policies:/app/assets/policies:ro
+
+  # ── Mirror real robot via viser (Linux, host networking for DDS) ──
+  mirror:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    profiles: [viser]
+    network_mode: host
+    environment:
+      - MUJOCO_GL=egl
 
   # ── Test runner ────────────────────────────────────────────────────
   test:

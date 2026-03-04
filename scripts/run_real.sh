@@ -1,4 +1,4 @@
 #!/bin/bash
-# Launch on real robot via DDS.
-# Usage: ./scripts/run_real.sh --policy path/to/policy.onnx --interface eth0 [options]
-python -m unitree_launcher.main real "$@"
+# Launch on real robot (onboard G1 only).
+# Usage: ./scripts/run_real.sh -c configs/g1_deploy.yaml --policy path/to/policy.onnx [options]
+uv run real "$@"

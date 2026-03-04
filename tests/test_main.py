@@ -1,12 +1,16 @@
-"""Tests for src/main.py CLI — Phase 12.
+"""Tests for main.py CLI (sim/eval/real/mirror modes).
 
-Covers argument parsing, config integration, component wiring, and
-apply_cli_overrides.
+Covers argument parsing, config integration, component wiring,
+apply_cli_overrides, GLFW key map, key callback dispatch,
+run_with_viewer, and run_headless.
 """
 from __future__ import annotations
 
 import os
+import queue
 import tempfile
+import threading
+import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -17,10 +21,15 @@ from unitree_launcher.config import (
     Config,
     G1_23DOF_JOINTS,
     G1_29DOF_JOINTS,
+    Q_HOME_29DOF,
     apply_cli_overrides,
     load_config,
 )
-from unitree_launcher.main import build_parser, main
+from unitree_launcher.control.runtime import Runtime
+from unitree_launcher.control.safety import SafetyController, SystemState
+from unitree_launcher.main import GLFW_KEY_MAP, build_parser, main, run_headless, run_with_viewer
+from unitree_launcher.policy.joint_mapper import JointMapper
+from unitree_launcher.robot.base import RobotCommand, RobotState
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_CONFIG = os.path.join(PROJECT_ROOT, "configs", "default.yaml")
@@ -38,7 +47,7 @@ def _parse(argv: list):
 def _make_isaaclab_onnx(path: str, obs_dim: int = 99, action_dim: int = 29):
     """Create a minimal IsaacLab ONNX model at *path*.
 
-    Default obs_dim=99 matches ObservationBuilder for 29-DOF with estimator:
+    Default obs_dim=99 matches IsaacLabPolicy observation dimension for 29-DOF with estimator:
     2*29 (pos+vel) + 29 (actions) + 12 (ang_vel+gravity+vel_cmd+lin_vel) = 99.
     """
     from tests.conftest import create_isaaclab_onnx
@@ -107,14 +116,24 @@ class TestParseRealArgs:
         assert args.mode == "real"
         assert args.interface == "eth0"
 
-    def test_real_requires_interface(self):
-        with pytest.raises(SystemExit):
-            _parse(["real", "--policy", "test.onnx"])
+    def test_real_defaults_interface_eth0(self):
+        args = _parse(["real", "--policy", "test.onnx"])
+        assert args.interface == "eth0"
 
 
 # ============================================================================
 # Argument Parsing — flags
 # ============================================================================
+
+class TestParsePreset:
+    def test_preset_flag_parsed(self):
+        args = _parse(["sim", "--preset", "g1_sim_bm", "--policy", "p.onnx"])
+        assert args.preset == "g1_sim_bm"
+
+    def test_preset_default_none(self):
+        args = _parse(["sim", "--policy", "p.onnx"])
+        assert args.preset is None
+
 
 class TestParseFlags:
     def test_no_est_flag(self):
@@ -168,62 +187,10 @@ class TestApplyCLIOverrides:
 
 
 # ============================================================================
-# Config Integration (domain ID, interface)
-# ============================================================================
-
-class TestConfigIntegration:
-    def test_sim_default_domain_id(self):
-        """Sim mode without --domain-id keeps config default (1)."""
-        config = load_config(DEFAULT_CONFIG)
-        args = _parse(["sim", "--policy", "p.onnx"])
-        # Simulate what main() does
-        if args.domain_id is not None:
-            config.network.domain_id = args.domain_id
-        elif args.mode == "real":
-            config.network.domain_id = 0
-        assert config.network.domain_id == 1
-
-    def test_real_default_domain_id(self):
-        """Real mode without --domain-id sets domain_id=0."""
-        config = load_config(DEFAULT_CONFIG)
-        args = _parse(["real", "--policy", "p.onnx", "--interface", "eth0"])
-        if args.domain_id is not None:
-            config.network.domain_id = args.domain_id
-        elif args.mode == "real":
-            config.network.domain_id = 0
-        assert config.network.domain_id == 0
-
-    def test_explicit_domain_id_override(self):
-        """--domain-id 5 overrides both sim and real defaults."""
-        config = load_config(DEFAULT_CONFIG)
-        args = _parse(["sim", "--policy", "p.onnx", "--domain-id", "5"])
-        if args.domain_id is not None:
-            config.network.domain_id = args.domain_id
-        assert config.network.domain_id == 5
-
-    def test_real_interface_set(self):
-        """Real mode sets config.network.interface from --interface."""
-        config = load_config(DEFAULT_CONFIG)
-        args = _parse(["real", "--policy", "p.onnx", "--interface", "enp3s0"])
-        config.network.interface = args.interface
-        assert config.network.interface == "enp3s0"
-
-
-# ============================================================================
 # Component Wiring
 # ============================================================================
 
 class TestComponentWiring:
-    def test_variant_resolution_29dof(self):
-        variant = "g1_29dof"
-        joints = G1_29DOF_JOINTS if "29" in variant else G1_23DOF_JOINTS
-        assert len(joints) == 29
-
-    def test_variant_resolution_23dof(self):
-        variant = "g1_23dof"
-        joints = G1_29DOF_JOINTS if "29" in variant else G1_23DOF_JOINTS
-        assert len(joints) == 23
-
     def test_policy_format_auto_detection(self):
         """When config.policy.format is None, detect_policy_format is called."""
         config = load_config(DEFAULT_CONFIG)
@@ -233,8 +200,8 @@ class TestComponentWiring:
             onnx_path = f.name
         try:
             _make_isaaclab_onnx(onnx_path)
-            with patch("unitree_launcher.main.detect_policy_format", return_value="isaaclab") as mock_detect:
-                # We test the logic that main() uses
+            with patch("unitree_launcher.policy.factory.detect_policy_format", return_value="isaaclab") as mock_detect:
+                # Factory uses detect_policy_format when config.policy.format is None
                 fmt = config.policy.format or mock_detect(onnx_path)
                 assert fmt == "isaaclab"
                 mock_detect.assert_called_once_with(onnx_path)
@@ -272,7 +239,7 @@ class TestMainIntegration:
         onnx_path = str(tmp_path / "test_policy.onnx")
         _make_isaaclab_onnx(onnx_path)
 
-        with patch("unitree_launcher.main.SimRobot") as MockSimRobot, \
+        with patch("unitree_launcher.robot.sim_robot.SimRobot") as MockSimRobot, \
              patch("unitree_launcher.main.run_headless") as mock_run, \
              patch("unitree_launcher.main.DataLogger") as MockLogger:
 
@@ -301,9 +268,11 @@ class TestMainIntegration:
         onnx_path = str(tmp_path / "test_policy.onnx")
         _make_isaaclab_onnx(onnx_path)
 
-        with patch("unitree_launcher.main.SimRobot") as MockSimRobot, \
-             patch("unitree_launcher.main.run_with_viewer") as mock_run:
+        with patch("unitree_launcher.robot.sim_robot.SimRobot") as MockSimRobot, \
+             patch("unitree_launcher.main.run_with_viewer") as mock_run, \
+             patch("unitree_launcher.main.platform") as mock_platform:
 
+            mock_platform.system.return_value = "Linux"  # Skip macOS mjpython check
             mock_robot = MagicMock()
             mock_robot.n_dof = 29
             MockSimRobot.return_value = mock_robot
@@ -317,24 +286,27 @@ class TestMainIntegration:
 
     def test_main_real_mode_wiring(self, tmp_path):
         """main() in real mode creates RealRobot and sets domain_id=0."""
+        import unitree_launcher.robot.real_robot as rr_mod
+        from unitree_launcher.robot.base import RobotState
         onnx_path = str(tmp_path / "test_policy.onnx")
         _make_isaaclab_onnx(onnx_path)
 
-        with patch("unitree_launcher.main.RealRobot") as MockRealRobot, \
-             patch("unitree_launcher.main.run_headless") as mock_run:
+        mock_robot = MagicMock()
+        mock_robot.n_dof = 29
+        # prepare() calls get_state() — return a valid RobotState
+        mock_robot.get_state.return_value = RobotState.zeros(29)
 
-            mock_robot = MagicMock()
-            mock_robot.n_dof = 29
-            MockRealRobot.return_value = mock_robot
+        with patch.object(rr_mod, "RealRobot", return_value=mock_robot) as MockReal, \
+             patch("unitree_launcher.main.run_headless") as mock_run:
 
             main([
                 "real", "--policy", onnx_path, "--interface", "eth0",
                 "--config", DEFAULT_CONFIG, "--no-log",
             ])
 
-            MockRealRobot.assert_called_once()
-            # Verify the config passed to RealRobot has domain_id=0
-            call_config = MockRealRobot.call_args[0][0]
+            MockReal.assert_called_once()
+            # Verify the config passed has domain_id=0
+            call_config = MockReal.call_args[0][0]
             assert call_config.network.domain_id == 0
             assert call_config.network.interface == "eth0"
 
@@ -344,7 +316,7 @@ class TestMainIntegration:
         _make_isaaclab_onnx(onnx_path)
         log_dir = str(tmp_path / "logs")
 
-        with patch("unitree_launcher.main.SimRobot") as MockSimRobot, \
+        with patch("unitree_launcher.robot.sim_robot.SimRobot") as MockSimRobot, \
              patch("unitree_launcher.main.run_headless"), \
              patch("unitree_launcher.main.DataLogger") as MockLogger:
 
@@ -368,7 +340,7 @@ class TestMainIntegration:
         onnx_path = str(tmp_path / "test_policy.onnx")
         _make_isaaclab_onnx(onnx_path)
 
-        with patch("unitree_launcher.main.SimRobot") as MockSimRobot, \
+        with patch("unitree_launcher.robot.sim_robot.SimRobot") as MockSimRobot, \
              patch("unitree_launcher.main.run_headless"), \
              patch("unitree_launcher.main.DataLogger") as MockLogger:
 
@@ -384,7 +356,7 @@ class TestMainIntegration:
 
     def test_main_policy_not_found(self, tmp_path):
         """Nonexistent policy file raises error during load."""
-        with patch("unitree_launcher.main.SimRobot") as MockSimRobot:
+        with patch("unitree_launcher.robot.sim_robot.SimRobot") as MockSimRobot:
             mock_robot = MagicMock()
             mock_robot.n_dof = 29
             MockSimRobot.return_value = mock_robot
@@ -397,10 +369,9 @@ class TestMainIntegration:
     def test_run_headless_keyboard_interrupt(self, tmp_path):
         """KeyboardInterrupt during run_headless should call controller.stop()."""
         from unitree_launcher.main import run_headless
-        from unitree_launcher.control.controller import Controller
+        from unitree_launcher.control.runtime import Runtime
         from unitree_launcher.control.safety import SafetyController
         from unitree_launcher.policy.joint_mapper import JointMapper
-        from unitree_launcher.policy.observations import ObservationBuilder
 
         onnx_path = str(tmp_path / "test_policy.onnx")
         _make_isaaclab_onnx(onnx_path)
@@ -409,34 +380,33 @@ class TestMainIntegration:
         robot = MagicMock()
         robot.n_dof = 29
 
-        ctrl = MagicMock()
-        ctrl.is_running = True
-        ctrl.safety = MagicMock()
+        rt = MagicMock()
+        rt.safety = MagicMock()
+        rt.safety.state = SystemState.RUNNING
 
-        # Make ctrl.is_running raise KeyboardInterrupt on second access
+        # Make step() raise KeyboardInterrupt on second call
         call_count = [0]
-        original_is_running = True
 
-        def is_running_side_effect():
+        def step_side_effect():
             call_count[0] += 1
             if call_count[0] >= 2:
                 raise KeyboardInterrupt()
             return True
 
-        type(ctrl).is_running = property(lambda self: is_running_side_effect())
+        rt.step = step_side_effect
 
-        run_headless(robot, ctrl)
-        ctrl.stop.assert_called_once()
+        run_headless(rt)
+        rt.stop.assert_called_once()
 
     def test_main_policy_dir_passed_to_controller(self, tmp_path):
-        """--policy-dir is forwarded to Controller."""
+        """--policy-dir is forwarded to Runtime."""
         onnx_path = str(tmp_path / "test_policy.onnx")
         _make_isaaclab_onnx(onnx_path)
         pol_dir = str(tmp_path / "policies")
 
-        with patch("unitree_launcher.main.SimRobot") as MockSimRobot, \
+        with patch("unitree_launcher.robot.sim_robot.SimRobot") as MockSimRobot, \
              patch("unitree_launcher.main.run_headless"), \
-             patch("unitree_launcher.main.Controller") as MockController:
+             patch("unitree_launcher.main.Runtime") as MockController:
 
             mock_robot = MagicMock()
             mock_robot.n_dof = 29
@@ -450,3 +420,255 @@ class TestMainIntegration:
 
             _, kwargs = MockController.call_args
             assert kwargs["policy_dir"] == pol_dir
+
+
+# ============================================================================
+# Helpers for viewer / run_headless tests
+# ============================================================================
+
+def _make_viewer_config() -> Config:
+    cfg = load_config(DEFAULT_CONFIG)
+    cfg.control.transition_steps = 0
+    return cfg
+
+
+def _make_mock_robot(n_dof: int = 29) -> MagicMock:
+    from unitree_launcher.robot.base import RobotInterface
+    robot = MagicMock(spec=RobotInterface)
+    robot.n_dof = n_dof
+    home = np.array([Q_HOME_29DOF[j] for j in G1_29DOF_JOINTS])
+    robot.get_state.return_value = RobotState(
+        timestamp=0.0,
+        joint_positions=home.copy(),
+        joint_velocities=np.zeros(n_dof),
+        joint_torques=np.zeros(n_dof),
+        imu_quaternion=np.array([1.0, 0.0, 0.0, 0.0]),
+        imu_angular_velocity=np.zeros(3),
+        imu_linear_acceleration=np.array([0.0, 0.0, 9.81]),
+        base_position=np.array([0.0, 0.0, 0.793]),
+        base_velocity=np.zeros(3),
+    )
+    robot.mj_model = MagicMock()
+    robot.mj_data = MagicMock()
+    robot.lock = threading.Lock()
+    return robot
+
+
+def _make_mock_policy(n_dof: int = 29) -> MagicMock:
+    policy = MagicMock()
+    policy.step.return_value = RobotCommand(
+        joint_positions=np.zeros(n_dof),
+        joint_velocities=np.zeros(n_dof),
+        joint_torques=np.zeros(n_dof),
+        kp=np.full(n_dof, 100.0),
+        kd=np.full(n_dof, 10.0),
+    )
+    policy.last_action = np.zeros(n_dof)
+    policy.observation_dim = 70
+    policy.action_dim = n_dof
+    policy.stiffness = np.full(n_dof, 100.0)
+    policy.damping = np.full(n_dof, 10.0)
+    policy.default_pos = np.zeros(n_dof)
+    policy.starting_pos = np.zeros(n_dof)
+    return policy
+
+
+def _make_runtime(**kwargs) -> Runtime:
+    config = kwargs.pop("config", _make_viewer_config())
+    robot = kwargs.pop("robot", _make_mock_robot())
+    policy = kwargs.pop("policy", _make_mock_policy())
+    mapper = JointMapper(G1_29DOF_JOINTS)
+    safety = SafetyController(config, n_dof=29)
+    return Runtime(
+        robot=robot,
+        policy=policy,
+        safety=safety,
+        joint_mapper=mapper,
+        config=config,
+        default_policy=_make_mock_policy(),
+        default_joint_mapper=mapper,
+        **kwargs,
+    )
+
+
+# ============================================================================
+# GLFW Key Map
+# ============================================================================
+
+class TestGLFWKeyMap:
+    def test_glfw_key_map_all_values_are_strings(self):
+        for keycode, name in GLFW_KEY_MAP.items():
+            assert isinstance(keycode, int)
+            assert isinstance(name, str)
+
+    def test_glfw_key_map_no_letter_keys(self):
+        """No single ASCII letter keys (65-90) — they conflict with MuJoCo viewer."""
+        for keycode in GLFW_KEY_MAP:
+            assert not (65 <= keycode <= 90), (
+                f"Letter key {chr(keycode)} (code {keycode}) conflicts with MuJoCo viewer"
+            )
+
+
+# ============================================================================
+# Key Callback Dispatch (queue-based)
+# ============================================================================
+
+class TestKeyCallback:
+    def test_key_callback_enqueues_mapped_key(self):
+        """Pressing space (keycode 32) enqueues 'space'."""
+        key_queue = queue.SimpleQueue()
+
+        def key_callback(keycode: int) -> None:
+            key = GLFW_KEY_MAP.get(keycode)
+            if key:
+                key_queue.put(key)
+
+        key_callback(32)
+        assert key_queue.get_nowait() == "space"
+
+    def test_key_callback_unmapped_ignored(self):
+        """An unmapped keycode should NOT enqueue anything."""
+        key_queue = queue.SimpleQueue()
+
+        def key_callback(keycode: int) -> None:
+            key = GLFW_KEY_MAP.get(keycode)
+            if key:
+                key_queue.put(key)
+
+        key_callback(999)
+        assert key_queue.empty()
+
+    def test_key_callback_all_mapped_keys(self):
+        """Every mapped keycode enqueues the correct name."""
+        key_queue = queue.SimpleQueue()
+
+        def key_callback(keycode: int) -> None:
+            key = GLFW_KEY_MAP.get(keycode)
+            if key:
+                key_queue.put(key)
+
+        for keycode, expected_name in GLFW_KEY_MAP.items():
+            key_callback(keycode)
+            assert key_queue.get_nowait() == expected_name
+
+
+# ============================================================================
+# Viser CLI Arguments
+# ============================================================================
+
+class TestViserCLIArgs:
+    def test_parse_viser_default_port(self):
+        """--viser uses default port 8080."""
+        args = _parse(["sim", "--policy", "p.onnx", "--viser"])
+        assert args.viser is True
+        assert args.port == 8080
+
+    def test_parse_viser_custom_port(self):
+        """--viser --port 9090 sets port to 9090."""
+        args = _parse(["sim", "--policy", "p.onnx", "--viser", "--port", "9090"])
+        assert args.viser is True
+        assert args.port == 9090
+
+    def test_parse_gui_and_viser_together(self):
+        """--gui and --viser can both be set."""
+        args = _parse(["sim", "--policy", "p.onnx", "--gui", "--viser"])
+        assert args.gui is True
+        assert args.viser is True
+
+    def test_parse_viser_real_mode(self):
+        """--viser works in real mode."""
+        args = _parse(["real", "--policy", "p.onnx", "--interface", "eth0", "--viser"])
+        assert args.viser is True
+        assert args.port == 8080
+
+
+# ============================================================================
+# run_with_viewer (mocked MuJoCo viewer)
+# ============================================================================
+
+class TestRunWithViewer:
+    def test_run_with_viewer_starts_and_stops_controller(self):
+        """Viewer loop starts the controller and stops it on exit."""
+        rt = _make_runtime()
+        call_count = 0
+
+        class FakeViewer:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                pass
+
+            def is_running(self_inner):
+                nonlocal call_count
+                call_count += 1
+                return call_count <= 2
+
+            def sync(self):
+                pass
+
+        with patch("mujoco.viewer.launch_passive", return_value=FakeViewer()):
+            with patch.object(rt, "start_threaded") as mock_start, \
+                 patch.object(rt, "stop") as mock_stop:
+                run_with_viewer(rt)
+                mock_start.assert_called_once()
+                mock_stop.assert_called_once()
+
+    def test_run_with_viewer_sync_under_lock(self):
+        """viewer.sync() must be called while holding sim_robot.lock."""
+        rt = _make_runtime()
+        lock = rt.robot.lock
+
+        sync_held_lock = None
+        call_count = 0
+
+        class FakeViewer:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                pass
+
+            def is_running(self_inner):
+                nonlocal call_count
+                call_count += 1
+                return call_count <= 1
+
+            def sync(self_inner):
+                nonlocal sync_held_lock
+                sync_held_lock = lock.locked()
+
+        with patch("mujoco.viewer.launch_passive", return_value=FakeViewer()):
+            with patch.object(rt, "start_threaded"), patch.object(rt, "stop"):
+                run_with_viewer(rt)
+
+        assert sync_held_lock is True, "viewer.sync() must run under sim_robot.lock"
+
+
+# ============================================================================
+# run_headless
+# ============================================================================
+
+class TestRunHeadless:
+    def test_run_headless_max_steps(self):
+        """run_headless with max_steps stops after exactly N steps."""
+        rt = _make_runtime()
+        run_headless(rt, max_steps=5)
+
+        telem = rt.get_telemetry()
+        assert telem["step_count"] == 5
+
+    def test_run_headless_duration_termination(self):
+        """With duration, run completes within a reasonable time window."""
+        rt = _make_runtime()
+        start = time.time()
+        run_headless(rt, duration=0.3)
+        elapsed = time.time() - start
+        assert elapsed < 1.0
+
+    def test_run_headless_stop_called(self):
+        """Pipeline.stop() is always called in finally block."""
+        rt = _make_runtime()
+        with patch.object(rt, "stop") as mock_stop:
+            run_headless(rt, max_steps=1)
+        mock_stop.assert_called_once()
