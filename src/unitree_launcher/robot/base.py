@@ -80,7 +80,7 @@ class RobotInterface(ABC):
     Three implementations:
 
     - **SimRobot** — Pure MuJoCo simulation (sim/eval modes).
-    - **RealRobot** — Onboard C++ unitree_interface (real mode).
+    - **RealRobot** — Onboard C++ unitree_cpp (real mode).
     - **MirrorRobot** — Read-only Python DDS subscriber (mirror mode).
 
     The uniform control loop is::

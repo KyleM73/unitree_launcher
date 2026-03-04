@@ -3,7 +3,7 @@
 Modes:
     sim    -- development simulation (500Hz physics, gui/viser/headless)
     eval   -- accurate evaluation (1000Hz physics, headless)
-    real   -- onboard robot deployment (C++ unitree_interface)
+    real   -- onboard robot deployment (C++ unitree_cpp)
     mirror -- read-only DDS visualization of real robot (gui/viser)
 
 Entry points (via ``uv run``):
@@ -40,7 +40,7 @@ from unitree_launcher.policy.factory import load_policy, load_default_policy, pr
 
 # Robot backends imported lazily in main():
 #   SimRobot (mujoco) for sim/eval modes
-#   RealRobot (C++ unitree_interface) for real mode
+#   RealRobot (C++ unitree_cpp) for real mode
 #   MirrorRobot (Python DDS subscriber) for mirror mode — imported in mirror.py
 
 # GLFW key constants.
@@ -142,11 +142,13 @@ def run_headless(
     max_steps: Optional[int] = None,
     auto_start_policy: bool = True,
     recorder=None,
+    rate_limit: bool = False,
 ) -> None:
-    """Run runtime at maximum speed — no sleep, no viewer.
+    """Run runtime in a headless loop (no viewer).
 
-    Calls ``runtime.step()`` in a tight loop. Physics runs as fast as
-    compute allows. Use for headless sim, eval, and batch evaluation.
+    In sim/eval mode (rate_limit=False), runs as fast as compute allows —
+    physics stepping is the rate limiter. On real hardware (rate_limit=True),
+    sleeps to maintain policy_frequency.
 
     Termination conditions (first one wins):
         1. Ctrl+C (KeyboardInterrupt)
@@ -162,9 +164,14 @@ def run_headless(
     start_time = time.time()
     step_count = 0
     policy_freq = runtime.config.control.policy_frequency
+    dt = 1.0 / policy_freq
     telemetry_interval = policy_freq  # Print every ~1 second
     try:
-        while runtime.step():
+        while True:
+            step_start = time.time()
+
+            if not runtime.step():
+                break
             step_count += 1
 
             if recorder and hasattr(runtime.robot, 'mj_data'):
@@ -189,6 +196,12 @@ def run_headless(
             if runtime.safety.state == SystemState.STOPPED:
                 print("[headless] Active policy completed")
                 break
+
+            # Per-step rate limiting (real hardware only)
+            if rate_limit:
+                remaining = dt - (time.time() - step_start)
+                if remaining > 0:
+                    time.sleep(remaining)
 
     except KeyboardInterrupt:
         print("\n[headless] Ctrl+C, triggering E-stop")
@@ -467,7 +480,7 @@ def main(argv: Optional[list] = None) -> None:
         from unitree_launcher.robot.sim_robot import SimRobot
         robot = SimRobot(config)
     else:
-        # real mode: onboard via C++ unitree_interface
+        # real mode: onboard via C++ unitree_cpp
         from unitree_launcher.robot.real_robot import RealRobot
         robot = RealRobot(config)
 
@@ -479,9 +492,12 @@ def main(argv: Optional[list] = None) -> None:
         from unitree_launcher.policy.hold_policy import HoldPolicy
         from unitree_launcher.policy.joint_mapper import JointMapper
 
-        # Gantry: disable joint position limit E-stop (robot hangs,
-        # gravity pulls joints past limits during damping/E-stop).
+        # Gantry: disable state-limit E-stops (robot hangs on harness,
+        # gravity pulls joints past limits and causes torque/velocity
+        # readings that exceed normal thresholds).
         config.safety.joint_position_limits = False
+        config.safety.joint_velocity_limits = False
+        config.safety.torque_limits = False
         safety = SafetyController(config, n_dof=robot.n_dof)
         mapper = JointMapper(robot_joints)
         sinusoid = SinusoidPolicy(mapper, config)
@@ -529,6 +545,8 @@ def main(argv: Optional[list] = None) -> None:
         )
 
         robot.connect()
+        if hasattr(robot, 'set_safety'):
+            robot.set_safety(safety)
         if wireless is not None and hasattr(robot, 'set_wireless_handler'):
             robot.set_wireless_handler(wireless.parse)
 
@@ -576,6 +594,7 @@ def main(argv: Optional[list] = None) -> None:
                     runtime, duration=args.duration,
                     max_steps=getattr(args, 'steps', None),
                     recorder=recorder,
+                    rate_limit=(args.mode == "real"),
                 )
         finally:
             if gamepad is not None:
@@ -783,6 +802,7 @@ def main(argv: Optional[list] = None) -> None:
                 duration=args.duration,
                 max_steps=args.steps,
                 recorder=recorder,
+                rate_limit=(args.mode == "real"),
             )
     finally:
         # Restore original signal handlers to avoid double-shutdown

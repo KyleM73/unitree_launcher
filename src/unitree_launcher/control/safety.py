@@ -223,12 +223,20 @@ class SafetyController:
             return False
         return True
 
-    def clamp_command(self, cmd: RobotCommand) -> RobotCommand:
+    def clamp_command(
+        self, cmd: RobotCommand, state: Optional[RobotState] = None,
+    ) -> RobotCommand:
         """Enforce safety limits on a command.
 
         Clips joint positions, velocities, and torques when the corresponding
         SafetyConfig booleans are enabled. Returns a new command (does not
         modify the input).
+
+        When *state* is provided and torque_limits is enabled, also clamps
+        the commanded position so the implied PD torque
+        ``Kp * (q_target - q_actual)`` cannot exceed the motor torque limit.
+        This prevents the motor firmware's over-torque protection from
+        tripping.
         """
         result = RobotCommand(
             joint_positions=cmd.joint_positions.copy(),
@@ -252,6 +260,20 @@ class SafetyController:
             result.joint_torques = np.clip(
                 result.joint_torques, -self._torque_max, self._torque_max
             )
+
+            # Torque-aware position clamping: limit q_target so the
+            # implied PD torque Kp*(q_target - q_actual) stays within
+            # the motor's torque limit.  This prevents the firmware's
+            # over-torque protection from tripping.
+            if state is not None:
+                kp = result.kp
+                q_actual = state.joint_positions
+                safe = np.where(kp > 0, self._torque_max / kp, np.inf)
+                result.joint_positions = np.clip(
+                    result.joint_positions,
+                    q_actual - safe,
+                    q_actual + safe,
+                )
 
         return result
 

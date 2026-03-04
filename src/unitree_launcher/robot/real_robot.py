@@ -1,27 +1,19 @@
-"""Real robot backend — runs onboard the G1 via C++ unitree_interface binding.
+"""Real robot backend — runs onboard the G1 via unitree_cpp binding.
 
-Wraps the ``unitree_interface`` pybind11 module (from unitree_sdk2) which
-handles DDS communication with the motor control board over the internal
-Ethernet bus, 500 Hz command re-publishing, CRC computation, and motor
-mode management entirely in C++ — eliminating Python GIL jitter.
+Wraps ``unitree_cpp.UnitreeController`` (from HansZ8/unitree_cpp) which
+handles DDS communication, CRC computation, motor mode management, and
+background command re-publishing at control_dt (20ms) entirely in C++.
 
-Mirror mode uses a separate DDS backend for read-only visualization.
+The C++ layer has a RecurrentThread that keeps publishing the last command
+even if Python hiccups — ensuring the robot always receives fresh commands.
 
 Safety note:
     The software E-stop (wireless A-button parsed in ``get_state()``)
     only works while the Python control loop is running.  If Python
-    hangs, the robot continues executing its last command (re-published
-    at 500 Hz by the C++ binding).  The **hardware-level fallback** is
-    the wireless controller's **L2+B** combination, which the motor
-    control board acts on independently of any software.
-
-Usage:
-    from unitree_launcher.robot.real_robot import RealRobot
-    robot = RealRobot(config)
-    robot.connect()
-    state = robot.get_state()
-    robot.send_command(cmd)
-    robot.graceful_shutdown()
+    hangs, the C++ layer continues re-publishing its last command.
+    The **hardware-level fallback** is the wireless controller's
+    **L2+B** combination, which the motor control board acts on
+    independently of any software.
 """
 from __future__ import annotations
 
@@ -39,115 +31,100 @@ logger = logging.getLogger(__name__)
 
 
 class RealRobot(RobotInterface):
-    """Real robot backend — runs onboard via C++ unitree_interface binding.
+    """Real robot backend using unitree_cpp (RoboJuDo's C++ binding).
 
     The C++ layer handles:
-    - 500 Hz command re-publishing (OS-level timer precision)
+    - Background command re-publishing at control_dt (20ms)
     - CRC32 computation
     - Motor mode / mode_machine echo
+    - MotionSwitcher service release
     - DDS channel initialization
-
-    Python only needs to call ``send_command()`` at the policy rate (50 Hz).
     """
 
     def __init__(self, config: Config):
         variant = config.robot.variant
 
         self._n_dof = len(_get_joints_for_variant(variant))
-
-        # Network interface name (e.g. "en8", "eth0")
         self._iface_name = config.network.interface
-
-        # C++ interface handle (lazy init in connect())
         self._connected = False
-        self._interface = None
-
-        # Optional safety controller reference (for watchdog E-stop)
+        self._controller = None
         self._safety = None
-
-        # Wireless controller callback (set via set_wireless_handler)
         self._wireless_handler: Optional[Callable[[bytes], None]] = None
-
 
     def set_safety(self, safety) -> None:
         """Set safety controller reference for watchdog E-stop."""
         self._safety = safety
 
     def set_wireless_handler(self, handler: Callable[[bytes], None]) -> None:
-        """Register a callback to receive wireless controller bytes each tick.
-
-        Called from ``get_state()`` with the raw ``wireless_remote`` bytes
-        from the C++ binding's LowState.  Typically wired to
-        ``WirelessInput.parse()``.
-        """
+        """Register a callback to receive wireless controller bytes each tick."""
         self._wireless_handler = handler
 
-    # ---- RobotInterface implementation ----
-
     def connect(self) -> None:
-        """Initialize C++ binding and verify connection."""
+        """Initialize unitree_cpp controller and verify connection."""
         if self._connected:
             return
 
         try:
-            import unitree_interface
+            from unitree_cpp import UnitreeController
         except ImportError as exc:
             raise ImportError(
-                "unitree_interface (C++ pybind11 binding) is not installed.\n"
+                "unitree_cpp is not installed.\n"
                 "On the G1 robot, build from source:\n"
                 "  ./scripts/build_cpp_backend.sh\n"
-                "See reference/RoboJuDo/docs/g1_onboard_deploy.md for setup."
             ) from exc
 
-        self._interface = unitree_interface.create_robot(
-            self._iface_name,
-            unitree_interface.RobotType.G1,
-            unitree_interface.MessageType.HG,
-        )
-        self._interface.set_control_mode(unitree_interface.ControlMode.PR)
+        config_dict = {
+            "net_if": self._iface_name,
+            "control_dt": 0.02,
+            "msg_type": "hg",
+            "control_mode": "position",
+            "hand_type": "NONE",
+            "lowcmd_topic": "rt/lowcmd",
+            "lowstate_topic": "rt/lowstate",
+            "enable_odometry": False,
+            "sport_state_topic": "rt/odommodestate",
+            "stiffness": [0.0] * self._n_dof,
+            "damping": [0.0] * self._n_dof,
+            "num_dofs": self._n_dof,
+        }
+        self._controller = UnitreeController(config_dict)
 
-        # Verify connection by reading first state
-        state = self._interface.read_low_state()
+        # Wait for state data (matching RoboJuDo's self_check pattern)
+        for _ in range(30):
+            time.sleep(0.1)
+            if self._controller.self_check():
+                break
+        if not self._controller.self_check():
+            raise RuntimeError(
+                "unitree_cpp self-check failed: no data from robot. "
+                "Check Ethernet cable and robot power."
+            )
+
         self._connected = True
+        logger.info("RealRobot connected via unitree_cpp on %s", self._iface_name)
 
-        logger.info(
-            "RealRobot connected on interface %s (C++ binding) — "
-            "mode_machine=%d",
-            self._iface_name,
-            getattr(state, 'mode_machine', 0),
-        )
-
-        # Print startup orientation check
-        imu_quat = np.array(state.imu.quat[:4])
-        logger.info("IMU quaternion: [%.3f, %.3f, %.3f, %.3f]", *imu_quat)
+        # Print startup orientation
+        state = self._controller.get_robot_state()
+        quat = state.imu_state.quaternion
+        logger.info("IMU quaternion: [%.3f, %.3f, %.3f, %.3f]", *quat)
 
     def graceful_shutdown(self, damping_duration: float = 0.5) -> None:
-        """Send damping commands then disconnect.
-
-        The C++ binding continues re-publishing the damping command at 500 Hz
-        during the sleep, so the robot sees a smooth deceleration.
-        """
-        if not self._connected:
+        """Send damping command via C++ shutdown, then wait."""
+        if not self._connected or self._controller is None:
             return
 
-        logger.info(
-            "Graceful shutdown: sending damping commands for %.1fs",
-            damping_duration,
-        )
-
+        logger.info("Graceful shutdown: damping for %.1fs", damping_duration)
         try:
-            cmd = RobotCommand.damping(self._n_dof)
-            self.send_command(cmd)
-            # C++ re-publishes during sleep
+            self._controller.shutdown()
             time.sleep(damping_duration)
         except Exception:
-            logger.exception("Error during graceful shutdown damping")
+            logger.exception("Error during graceful shutdown")
 
-        self.disconnect()
+        self._connected = False
 
     def disconnect(self) -> None:
-        """Mark as disconnected. C++ binding cleans up on garbage collection."""
-        self._interface = None
+        """Mark as disconnected."""
+        self._controller = None
         self._connected = False
         logger.info("RealRobot disconnected")
 
@@ -158,62 +135,54 @@ class RealRobot(RobotInterface):
         1. Passes them to the registered wireless handler (for button/stick parsing)
         2. Checks the A-button directly for immediate E-stop (tightest loop)
         """
-        if self._interface is None:
+        if self._controller is None:
             return RobotState.zeros(self._n_dof)
 
-        state = self._interface.read_low_state()
+        state = self._controller.get_robot_state()
 
         # Extract and process wireless controller data
-        remote = getattr(state, 'wireless_remote', None)
+        remote = state.wireless_remote
         if remote is not None and len(remote) >= 24:
-            # Tight A-button check: parse button field and trigger E-stop
-            # immediately, before any policy inference runs.
-            # A-button is bit 8 in the 16-bit field at bytes 2-3.
-            keys = struct.unpack("H", bytes(remote[2:4]))[0]
+            keys = struct.unpack("H", remote[2:4])[0]
             if keys & (1 << 8) and self._safety is not None:
                 logger.critical("Wireless A-button E-stop!")
                 self._safety.estop()
-                self.send_command(RobotCommand.damping(self._n_dof))
+                # Send damping via set_gains + step
+                self._controller.set_gains(
+                    [0.0] * self._n_dof, [8.0] * self._n_dof
+                )
+                self._controller.step([0.0] * self._n_dof)
 
-            # Forward full bytes to the wireless input controller
             if self._wireless_handler is not None:
-                self._wireless_handler(bytes(remote))
+                self._wireless_handler(remote)
 
         return RobotState(
             timestamp=time.time(),
-            joint_positions=np.array(state.motor.q[:self._n_dof], dtype=np.float64),
-            joint_velocities=np.array(state.motor.dq[:self._n_dof], dtype=np.float64),
-            joint_torques=np.array(state.motor.tau_est[:self._n_dof], dtype=np.float64),
-            imu_quaternion=np.array(state.imu.quat[:4], dtype=np.float64),
-            imu_angular_velocity=np.array(state.imu.omega[:3], dtype=np.float64),
-            imu_linear_acceleration=np.array(state.imu.accel[:3], dtype=np.float64),
-            # Real robot has no world-frame base pose
+            joint_positions=np.array(state.motor_state.q[:self._n_dof], dtype=np.float64),
+            joint_velocities=np.array(state.motor_state.dq[:self._n_dof], dtype=np.float64),
+            joint_torques=np.array(state.motor_state.tau_est[:self._n_dof], dtype=np.float64),
+            imu_quaternion=np.array(state.imu_state.quaternion[:4], dtype=np.float64),
+            imu_angular_velocity=np.array(state.imu_state.gyroscope[:3], dtype=np.float64),
+            imu_linear_acceleration=np.array(state.imu_state.accelerometer[:3], dtype=np.float64),
             base_position=np.full(3, np.nan),
             base_velocity=np.full(3, np.nan),
         )
 
     def send_command(self, cmd: RobotCommand) -> None:
-        """Send command via C++ binding. No CRC, no mode echo needed."""
-        if self._interface is None:
+        """Send command via unitree_cpp: set gains then step with positions."""
+        if self._controller is None:
             return
 
-        motor_cmd = self._interface.create_zero_command()
-        motor_cmd.q_target = cmd.joint_positions.tolist()
-        motor_cmd.dq_target = cmd.joint_velocities.tolist()
-        motor_cmd.tau_ff = cmd.joint_torques.tolist()
-        motor_cmd.kp = cmd.kp.tolist()
-        motor_cmd.kd = cmd.kd.tolist()
-        self._interface.write_low_command(motor_cmd)
+        self._controller.set_gains(cmd.kp.tolist(), cmd.kd.tolist())
+        self._controller.step(cmd.joint_positions.tolist())
 
     def step(self) -> None:
-        """No-op for real robot (hardware runs PD at ~500 Hz)."""
+        """No-op for real robot (C++ handles re-publishing)."""
         pass
 
     def reset(self, initial_state: Optional[RobotState] = None) -> None:
         """Log warning -- cannot reset a physical robot."""
-        logger.warning(
-            "reset() called on RealRobot -- cannot reset physical robot. Ignoring."
-        )
+        logger.warning("reset() called on RealRobot -- ignoring.")
 
     @property
     def n_dof(self) -> int:

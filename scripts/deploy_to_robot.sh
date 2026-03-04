@@ -7,7 +7,7 @@
 #
 # After deploy, SSH in and run:
 #   ssh unitree@192.168.123.164
-#   cd ~/unitree_launcher && uv run real -c configs/g1_deploy.yaml
+#   cd ~/unitree_launcher && uv run real --gantry
 #
 # To build the C++ backend on the robot (first time only):
 #   ./scripts/build_cpp_backend.sh
@@ -40,22 +40,37 @@ ssh "$ROBOT_USER@$ROBOT_IP" bash -s "$ROBOT_DIR" <<'PREFLIGHT'
     ROBOT_DIR="$1"
     cd "$ROBOT_DIR"
 
-    # Check uv — install if missing
-    if ! command -v uv &>/dev/null; then
+    # Always include ~/.local/bin (where uv installs itself)
+    export PATH="$HOME/.local/bin:$PATH"
+
+    # Check uv
+    if command -v uv &>/dev/null; then
+        echo "OK: uv $(uv --version 2>/dev/null || echo '(version unknown)')"
+    else
         echo "uv not found — installing..."
         curl -LsSf https://astral.sh/uv/install.sh | sh
         export PATH="$HOME/.local/bin:$PATH"
-    fi
-    echo "OK: uv $(uv --version 2>/dev/null || echo '(version unknown)')"
 
-    # Sync dependencies
-    uv sync --quiet 2>/dev/null && echo "OK: uv sync" || echo "WARN: uv sync failed"
+        # Ensure ~/.local/bin is on PATH for future bash sessions
+        PROFILE="$HOME/.bashrc"
+        if ! grep -q 'local/bin' "$PROFILE" 2>/dev/null; then
+            echo '' >> "$PROFILE"
+            echo '# Added by unitree_launcher deploy script' >> "$PROFILE"
+            echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$PROFILE"
+            echo "  Added ~/.local/bin to $PROFILE"
+        fi
+
+        echo "OK: uv $(uv --version 2>/dev/null || echo '(version unknown)')"
+    fi
+
+    # Sync dependencies (--inexact preserves manually installed packages like unitree_cpp)
+    uv sync --inexact --quiet 2>/dev/null && echo "OK: uv sync" || echo "WARN: uv sync failed"
 
     # Check C++ backend
-    if uv run python -c "import unitree_interface" 2>/dev/null; then
-        echo "OK: unitree_interface"
+    if uv run python -c "from unitree_cpp import UnitreeController" 2>/dev/null; then
+        echo "OK: unitree_cpp"
     else
-        echo "WARN: unitree_interface not installed"
+        echo "WARN: unitree_cpp not installed"
         echo "  Run on robot: cd $ROBOT_DIR && ./scripts/build_cpp_backend.sh"
     fi
 PREFLIGHT
@@ -64,4 +79,5 @@ echo ""
 echo "Deploy complete. To run on robot:"
 echo "  ssh $ROBOT_USER@$ROBOT_IP"
 echo "  cd $ROBOT_DIR"
-echo "  uv run real -c configs/g1_deploy.yaml"
+echo "  uv run real --gantry                    # gantry arm test"
+echo "  uv run real --policy assets/policies/beyondmimic_29dof.onnx  # BeyondMimic"

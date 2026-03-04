@@ -1,6 +1,6 @@
-"""Tests for RealRobot (onboard C++ unitree_interface).
+"""Tests for RealRobot (onboard C++ unitree_cpp).
 
-All tests mock ``unitree_interface`` so they run without the wheel installed.
+All tests mock ``unitree_cpp`` so they run without the binding installed.
 """
 from __future__ import annotations
 
@@ -16,69 +16,52 @@ from unitree_launcher.robot.base import RobotCommand, RobotState
 
 
 # ---------------------------------------------------------------------------
-# Helpers: build a fake ``unitree_interface`` module
+# Helpers: build a fake ``unitree_cpp`` module
 # ---------------------------------------------------------------------------
 
-def _make_fake_unitree_interface():
-    """Create a mock unitree_interface module with correct structure."""
-    mod = types.ModuleType("unitree_interface")
+def _make_fake_unitree_cpp():
+    """Create a mock unitree_cpp module matching the real API."""
+    mod = types.ModuleType("unitree_cpp")
 
-    # Enums
-    mod.RobotType = mock.MagicMock()
-    mod.RobotType.G1 = "G1"
-    mod.MessageType = mock.MagicMock()
-    mod.MessageType.HG = "HG"
-    mod.ControlMode = mock.MagicMock()
-    mod.ControlMode.PR = "PR"
+    # RobotState returned by get_robot_state()
+    motor_state = mock.MagicMock()
+    motor_state.q = [float(i) * 0.01 for i in range(29)]
+    motor_state.dq = [float(i) * 0.001 for i in range(29)]
+    motor_state.tau_est = [float(i) * 0.1 for i in range(29)]
 
-    # IMU state
-    imu = mock.MagicMock()
-    imu.quat = [1.0, 0.0, 0.0, 0.0]
-    imu.omega = [0.1, 0.2, 0.3]
-    imu.accel = [0.0, 0.0, 9.81]
+    imu_state = mock.MagicMock()
+    imu_state.quaternion = [1.0, 0.0, 0.0, 0.0]
+    imu_state.gyroscope = [0.1, 0.2, 0.3]
+    imu_state.accelerometer = [0.0, 0.0, 9.81]
 
-    # Motor state
-    motor = mock.MagicMock()
-    motor.q = [float(i) * 0.01 for i in range(29)]
-    motor.dq = [float(i) * 0.001 for i in range(29)]
-    motor.tau_est = [float(i) * 0.1 for i in range(29)]
+    robot_state = mock.MagicMock()
+    robot_state.motor_state = motor_state
+    robot_state.imu_state = imu_state
+    robot_state.wireless_remote = b"\x00" * 40
+    robot_state.tick = 1
 
-    # LowState
-    low_state = mock.MagicMock()
-    low_state.imu = imu
-    low_state.motor = motor
-    low_state.mode_machine = 0
+    # UnitreeController instance
+    controller = mock.MagicMock()
+    controller.get_robot_state.return_value = robot_state
+    controller.self_check.return_value = True
+    controller.step = mock.MagicMock()
+    controller.set_gains = mock.MagicMock()
+    controller.shutdown = mock.MagicMock()
 
-    # Motor command (returned by create_zero_command)
-    motor_cmd = mock.MagicMock()
-    motor_cmd.q_target = [0.0] * 29
-    motor_cmd.dq_target = [0.0] * 29
-    motor_cmd.tau_ff = [0.0] * 29
-    motor_cmd.kp = [0.0] * 29
-    motor_cmd.kd = [0.0] * 29
+    mod.UnitreeController = mock.MagicMock(return_value=controller)
 
-    # UnitreeInterface instance
-    interface = mock.MagicMock()
-    interface.read_low_state.return_value = low_state
-    interface.create_zero_command.return_value = motor_cmd
-    interface.write_low_command = mock.MagicMock()
-    interface.set_control_mode = mock.MagicMock()
-
-    mod.create_robot = mock.MagicMock(return_value=interface)
-
-    return mod, interface, low_state, motor_cmd
+    return mod, controller, robot_state
 
 
 @pytest.fixture
 def fake_unitree():
-    """Install fake unitree_interface in sys.modules for the test."""
-    mod, interface, low_state, motor_cmd = _make_fake_unitree_interface()
-    with mock.patch.dict(sys.modules, {"unitree_interface": mod}):
+    """Install fake unitree_cpp in sys.modules for the test."""
+    mod, controller, robot_state = _make_fake_unitree_cpp()
+    with mock.patch.dict(sys.modules, {"unitree_cpp": mod}):
         yield {
             "module": mod,
-            "interface": interface,
-            "low_state": low_state,
-            "motor_cmd": motor_cmd,
+            "controller": controller,
+            "robot_state": robot_state,
         }
 
 
@@ -87,7 +70,7 @@ def config():
     """Minimal Config for RealRobot."""
     cfg = Config()
     cfg.robot.variant = "g1_29dof"
-    cfg.network.interface = "en8"
+    cfg.network.interface = "eth0"
     return cfg
 
 
@@ -97,45 +80,43 @@ def config():
 
 class TestImportError:
     def test_import_error_message(self, config):
-        """Verify clear error when unitree_interface is missing."""
-        # Ensure unitree_interface is NOT importable
-        with mock.patch.dict(sys.modules, {"unitree_interface": None}):
+        """Verify clear error when unitree_cpp is missing."""
+        with mock.patch.dict(sys.modules, {"unitree_cpp": None}):
             from unitree_launcher.robot.real_robot import RealRobot
             robot = RealRobot(config)
-            with pytest.raises(ImportError, match="unitree_interface"):
+            with pytest.raises(ImportError, match="unitree_cpp"):
                 robot.connect()
 
 
 class TestConnect:
     def test_connect(self, config, fake_unitree):
-        """Mock create_robot, verify set_control_mode(PR) called."""
+        """Verify UnitreeController constructed with correct config."""
         from unitree_launcher.robot.real_robot import RealRobot
 
         robot = RealRobot(config)
         robot.connect()
 
         mod = fake_unitree["module"]
-        mod.create_robot.assert_called_once_with(
-            "en8", mod.RobotType.G1, mod.MessageType.HG,
-        )
-        fake_unitree["interface"].set_control_mode.assert_called_once_with(
-            mod.ControlMode.PR,
-        )
+        mod.UnitreeController.assert_called_once()
+        call_args = mod.UnitreeController.call_args[0][0]
+        assert call_args["net_if"] == "eth0"
+        assert call_args["msg_type"] == "hg"
+        assert call_args["num_dofs"] == 29
         assert robot._connected is True
 
     def test_connect_idempotent(self, config, fake_unitree):
-        """Calling connect() twice only creates one interface."""
+        """Calling connect() twice only creates one controller."""
         from unitree_launcher.robot.real_robot import RealRobot
 
         robot = RealRobot(config)
         robot.connect()
-        robot.connect()  # should not create a second interface
-        assert fake_unitree["module"].create_robot.call_count == 1
+        robot.connect()
+        assert fake_unitree["module"].UnitreeController.call_count == 1
 
 
 class TestGetState:
     def test_get_state_mapping(self, config, fake_unitree):
-        """Verify RobotState fields match mock LowState."""
+        """Verify RobotState fields match mock state."""
         from unitree_launcher.robot.real_robot import RealRobot
 
         robot = RealRobot(config)
@@ -150,14 +131,12 @@ class TestGetState:
         assert state.imu_angular_velocity.shape == (3,)
         assert state.imu_linear_acceleration.shape == (3,)
 
-        # Check values
         np.testing.assert_allclose(state.imu_quaternion, [1.0, 0.0, 0.0, 0.0])
         np.testing.assert_allclose(state.imu_angular_velocity, [0.1, 0.2, 0.3])
         np.testing.assert_allclose(state.imu_linear_acceleration, [0.0, 0.0, 9.81])
         assert state.joint_positions[0] == pytest.approx(0.0)
         assert state.joint_positions[1] == pytest.approx(0.01)
 
-        # Base position/velocity should be NaN (real robot)
         assert np.all(np.isnan(state.base_position))
         assert np.all(np.isnan(state.base_velocity))
 
@@ -172,8 +151,8 @@ class TestGetState:
 
 
 class TestSendCommand:
-    def test_send_command_mapping(self, config, fake_unitree):
-        """Verify q_target/kp/kd filled from RobotCommand."""
+    def test_send_command_calls_set_gains_and_step(self, config, fake_unitree):
+        """Verify set_gains then step called with correct values."""
         from unitree_launcher.robot.real_robot import RealRobot
 
         robot = RealRobot(config)
@@ -188,19 +167,12 @@ class TestSendCommand:
         )
         robot.send_command(cmd)
 
-        motor_cmd = fake_unitree["motor_cmd"]
-        # Verify the fields were set via attribute assignment
-        assert motor_cmd.q_target == [0.5] * 29
-        assert motor_cmd.dq_target == [0.1] * 29
-        assert motor_cmd.tau_ff == [0.2] * 29
-        assert motor_cmd.kp == [100.0] * 29
-        assert motor_cmd.kd == [10.0] * 29
-
-        # Verify write_low_command was called
-        fake_unitree["interface"].write_low_command.assert_called_once_with(motor_cmd)
+        ctrl = fake_unitree["controller"]
+        ctrl.set_gains.assert_called_once_with([100.0] * 29, [10.0] * 29)
+        ctrl.step.assert_called_once_with([0.5] * 29)
 
     def test_send_command_disconnected(self, config, fake_unitree):
-        """send_command before connect is a no-op (no crash)."""
+        """send_command before connect is a no-op."""
         from unitree_launcher.robot.real_robot import RealRobot
 
         robot = RealRobot(config)
@@ -210,7 +182,7 @@ class TestSendCommand:
 
 class TestGracefulShutdown:
     def test_graceful_shutdown(self, config, fake_unitree):
-        """Verify damping command sent, sleep called, disconnect called."""
+        """Verify shutdown called, sleep called, disconnected."""
         from unitree_launcher.robot.real_robot import RealRobot
 
         robot = RealRobot(config)
@@ -219,12 +191,9 @@ class TestGracefulShutdown:
         with mock.patch("unitree_launcher.robot.real_robot.time.sleep") as mock_sleep:
             robot.graceful_shutdown(damping_duration=0.3)
 
-        # Should have slept for the damping duration
+        fake_unitree["controller"].shutdown.assert_called_once()
         mock_sleep.assert_called_once_with(0.3)
-
-        # Should be disconnected
         assert robot._connected is False
-        assert robot._interface is None
 
     def test_graceful_shutdown_idempotent(self, config, fake_unitree):
         """Calling graceful_shutdown when not connected is a no-op."""
@@ -241,42 +210,34 @@ class TestStep:
 
         robot = RealRobot(config)
         robot.connect()
-        robot.step()  # should not raise, should not call anything on interface
+        robot.step()
 
 
 class TestNDof:
     def test_n_dof_29(self, config, fake_unitree):
-        """Verify returns 29 for g1_29dof variant."""
         from unitree_launcher.robot.real_robot import RealRobot
-
         robot = RealRobot(config)
         assert robot.n_dof == 29
 
     def test_n_dof_23(self, fake_unitree):
-        """Verify returns 23 for g1_23dof variant."""
         from unitree_launcher.robot.real_robot import RealRobot
-
         cfg = Config()
         cfg.robot.variant = "g1_23dof"
-        cfg.network.interface = "en8"
+        cfg.network.interface = "eth0"
         robot = RealRobot(cfg)
         assert robot.n_dof == 23
 
 
 class TestReset:
     def test_reset_warns(self, config, fake_unitree):
-        """Verify reset logs a warning."""
         from unitree_launcher.robot.real_robot import RealRobot
-
         robot = RealRobot(config)
-        robot.reset()  # should not raise
+        robot.reset()
 
 
 class TestSafety:
     def test_set_safety(self, config, fake_unitree):
-        """Verify set_safety stores the reference."""
         from unitree_launcher.robot.real_robot import RealRobot
-
         robot = RealRobot(config)
         safety = mock.MagicMock()
         robot.set_safety(safety)

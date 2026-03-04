@@ -568,9 +568,9 @@ class TestControlLoopLifecycle:
         original_clamp = safety.clamp_command
         clamp_calls = []
 
-        def spy_clamp(cmd):
+        def spy_clamp(cmd, state=None):
             clamp_calls.append(cmd)
-            return original_clamp(cmd)
+            return original_clamp(cmd, state)
 
         safety.clamp_command = spy_clamp
 
@@ -707,10 +707,12 @@ class TestTransition:
         config = _make_config()
         config.control.transition_steps = 10
         config.safety.tilt_check = False
+        config.safety.torque_limits = False
 
         policy = _make_mock_policy()
-        # Use small target values within joint limits
-        target = np.ones(29) * 0.1
+        # Use small target so implied torque (Kp * target) stays within
+        # the smallest torque limit (5 Nm for wrist): 0.01 * 100 = 1 Nm
+        target = np.ones(29) * 0.01
         policy.default_pos = target.copy()
         policy.starting_pos = target.copy()
         policy.stiffness = np.full(29, 100.0)

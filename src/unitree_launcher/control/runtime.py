@@ -733,7 +733,7 @@ class Runtime:
                     cmd = self._build_damping_command(state)
 
                 cmd = self._smooth_command(cmd)
-                cmd = self.safety.clamp_command(cmd)
+                cmd = self.safety.clamp_command(cmd, state)
                 self.robot.send_command(cmd)
                 self.robot.step()
                 self.sim_step_count += 1
@@ -791,7 +791,7 @@ class Runtime:
                 else:
                     self._control_mode = ControlMode.HOLD
                     cmd = self._build_damping_command(state)
-                cmd = self.safety.clamp_command(cmd)
+                cmd = self.safety.clamp_command(cmd, state)
 
                 self.robot.send_command(cmd)
                 self.robot.step()
@@ -859,7 +859,7 @@ class Runtime:
 
                 self.policy.warmup(state, np.zeros(3))
                 cmd = self._transition_step_command()
-                cmd = self.safety.clamp_command(cmd)
+                cmd = self.safety.clamp_command(cmd, state)
                 self.robot.send_command(cmd)
                 self.robot.step()
                 self.sim_step_count += 1
@@ -899,7 +899,7 @@ class Runtime:
                     self.safety.stop()
 
             # 8. Clamp and send
-            cmd = self.safety.clamp_command(cmd)
+            cmd = self.safety.clamp_command(cmd, state)
             self.robot.send_command(cmd)
 
             # 9. Step simulation

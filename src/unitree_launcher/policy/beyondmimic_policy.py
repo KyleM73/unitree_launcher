@@ -318,6 +318,19 @@ class BeyondMimicPolicy(Policy):
         else:
             self._time_step += 1
 
+        # 3b. Zero reference XY and yaw to robot's current pose.
+        # The ONNX model outputs absolute world-frame body positions/quats.
+        # On real hardware the state estimator drifts, so we re-anchor the
+        # reference to the robot's current XY and heading each step.
+        if self._prev_body_pos_w is not None and self._anchor_body_idx is not None:
+            _zero_reference_xy_yaw(
+                self._prev_body_pos_w,
+                self._prev_body_quat_w,
+                self._anchor_body_idx,
+                anchor_pos,
+                anchor_quat,
+            )
+
         # 4. Smooth (EMA -> clip -> scale applied by _smooth_action)
         action = self._smooth_action(raw_action)
 
@@ -652,6 +665,66 @@ def quat_multiply(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
         w1*y2 - x1*z2 + y1*w2 + z1*x2,
         w1*z2 + x1*y2 - y1*x2 + z1*w2,
     ])
+
+
+def _yaw_from_quat_wxyz(q: np.ndarray) -> float:
+    """Extract yaw angle from a wxyz quaternion."""
+    w, x, y, z = q
+    return np.arctan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+
+
+def _quat_from_yaw(yaw: float) -> np.ndarray:
+    """Create a wxyz quaternion from a yaw angle (rotation about Z)."""
+    return np.array([np.cos(yaw / 2), 0.0, 0.0, np.sin(yaw / 2)])
+
+
+def _zero_reference_xy_yaw(
+    body_pos_w: np.ndarray,
+    body_quat_w: Optional[np.ndarray],
+    anchor_idx: int,
+    robot_pos: np.ndarray,
+    robot_quat_wxyz: np.ndarray,
+) -> None:
+    """Shift reference body positions/quats so the anchor matches the robot.
+
+    Zeroes the anchor body's XY position and yaw to the robot's current
+    values, applying the same rigid transform to all bodies.  Height (Z)
+    and roll/pitch are left unchanged.
+
+    Operates **in-place** on body_pos_w and body_quat_w.
+    """
+    bodies = body_pos_w.reshape(-1, 3)
+    ref_xy = bodies[anchor_idx, :2].copy()
+    robot_xy = robot_pos[:2]
+
+    # XY offset: shift all bodies so anchor XY == robot XY
+    xy_delta = robot_xy - ref_xy
+    bodies[:, 0] += xy_delta[0]
+    bodies[:, 1] += xy_delta[1]
+
+    # Yaw offset: rotate all bodies around Z so anchor yaw == robot yaw
+    if body_quat_w is not None:
+        quats = body_quat_w.reshape(-1, 4)
+        ref_yaw = _yaw_from_quat_wxyz(quats[anchor_idx])
+        robot_yaw = _yaw_from_quat_wxyz(robot_quat_wxyz)
+        yaw_delta = robot_yaw - ref_yaw
+
+        if abs(yaw_delta) > 1e-6:
+            # Rotation matrix for yaw_delta about Z
+            c, s = np.cos(yaw_delta), np.sin(yaw_delta)
+            pivot = bodies[anchor_idx, :2].copy()
+
+            # Rotate all body XY positions around the anchor
+            for i in range(len(bodies)):
+                dx = bodies[i, 0] - pivot[0]
+                dy = bodies[i, 1] - pivot[1]
+                bodies[i, 0] = pivot[0] + c * dx - s * dy
+                bodies[i, 1] = pivot[1] + s * dx + c * dy
+
+            # Rotate all body quaternions
+            dq = _quat_from_yaw(yaw_delta)
+            for i in range(len(quats)):
+                quats[i] = quat_multiply(dq, quats[i])
 
 
 def compute_body_relative_position(

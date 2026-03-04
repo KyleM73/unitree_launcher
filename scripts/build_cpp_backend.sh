@@ -1,23 +1,22 @@
 #!/usr/bin/env bash
-# Build the unitree_interface C++ pybind11 module from source.
+# Build the unitree_cpp Python binding for real robot deployment.
 #
-# The C++ backend wraps amazon-far/unitree_sdk2 and provides jitter-free
-# 500 Hz DDS command publishing for real robot deployment.
+# Two-step process:
+#   1. Install unitree_sdk2 C++ library (headers + static lib to /usr/local)
+#   2. Build unitree_cpp pybind11 module (from HansZ8/unitree_cpp)
 #
-# NOTE: libunitree_sdk2.a is closed-source and only available as pre-compiled
-# static libraries for Linux x86_64 and aarch64. There is no macOS binary.
-# This script will exit with an error on non-Linux platforms.
+# unitree_cpp provides a high-performance Python binding for the Unitree SDK2
+# with a background command re-publishing thread, CRC handling, and wireless
+# controller data — matching the RoboJuDo deployment stack.
 #
 # Usage:
-#   ./scripts/build_cpp_backend.sh           # build and install into uv venv
-#   ./scripts/build_cpp_backend.sh --clean   # remove cached clone and rebuild
-#   CLONE_DIR=/path/to/dir ./scripts/...     # override clone location
+#   ./scripts/build_cpp_backend.sh           # build and install
+#   ./scripts/build_cpp_backend.sh --clean   # remove caches and rebuild
 #
 # Requirements (auto-checked):
 #   - Linux (x86_64 or aarch64)
 #   - cmake, g++ (or build-essential)
 #   - uv (Python package manager)
-#   - pybind11, patchelf (auto-installed via uv sync)
 
 set -euo pipefail
 
@@ -25,7 +24,7 @@ set -euo pipefail
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
 info()  { echo -e "${GREEN}[build]${NC} $*"; }
 warn()  { echo -e "${YELLOW}[build]${NC} $*"; }
@@ -33,24 +32,18 @@ error() { echo -e "${RED}[build]${NC} $*" >&2; }
 
 # ── Platform check ──────────────────────────────────────────────────────
 if [[ "$(uname -s)" != "Linux" ]]; then
-    error "This script only works on Linux."
-    error "libunitree_sdk2.a is closed-source and only distributed for Linux x86_64/aarch64."
-    error "macOS users: use --backend python for the pure-Python DDS backend,"
-    error "or run sim-only (no real robot backend needed)."
+    error "This script only works on Linux (the C++ SDK is Linux-only)."
     exit 1
 fi
 
-# ── Architecture detection ──────────────────────────────────────────────
 MACHINE="$(uname -m)"
 case "$MACHINE" in
-    x86_64)  ARCH="x86_64" ;;
-    aarch64) ARCH="aarch64" ;;
+    x86_64|aarch64) info "Architecture: $MACHINE" ;;
     *)
         error "Unsupported architecture: $MACHINE (need x86_64 or aarch64)"
         exit 1
         ;;
 esac
-info "Architecture: $ARCH"
 
 # ── Parse flags ─────────────────────────────────────────────────────────
 CLEAN=0
@@ -59,7 +52,7 @@ for arg in "$@"; do
         --clean) CLEAN=1 ;;
         --help|-h)
             echo "Usage: $0 [--clean]"
-            echo "  --clean   Remove cached clone and rebuild from scratch"
+            echo "  --clean   Remove cached clones and rebuild from scratch"
             exit 0
             ;;
         *)
@@ -69,26 +62,11 @@ for arg in "$@"; do
     esac
 done
 
-# ── Find Python via uv ─────────────────────────────────────────────────
+# ── Check uv ────────────────────────────────────────────────────────────
 if ! command -v uv &>/dev/null; then
     error "uv not found. Install with: curl -LsSf https://astral.sh/uv/install.sh | sh"
     exit 1
 fi
-
-# Ensure venv and dependencies exist
-info "Running uv sync..."
-uv sync --quiet
-
-VENV_DIR="$(pwd)/.venv"
-PYTHON="$VENV_DIR/bin/python"
-if [[ ! -x "$PYTHON" ]]; then
-    error "Python not found at $PYTHON after uv sync"
-    exit 1
-fi
-
-SITE_PACKAGES="$("$PYTHON" -c 'import site; print(site.getsitepackages()[0])')"
-info "Python: $PYTHON"
-info "Site-packages: $SITE_PACKAGES"
 
 # ── Dependency checks ──────────────────────────────────────────────────
 check_cmd() {
@@ -102,137 +80,84 @@ check_cmd() {
 check_cmd cmake "sudo apt-get install cmake"
 check_cmd g++ "sudo apt-get install build-essential"
 
-# pybind11 and patchelf are installed via uv sync (pyproject.toml linux markers)
-if ! "$PYTHON" -c "import pybind11" &>/dev/null; then
-    error "pybind11 not found after uv sync"
-    exit 1
+# ── Cache directories ──────────────────────────────────────────────────
+SDK2_DIR="${SDK2_DIR:-/tmp/unitree_sdk2_build}"
+UCPP_DIR="${UCPP_DIR:-/tmp/unitree_cpp_build}"
+
+if [[ "$CLEAN" -eq 1 ]]; then
+    info "Cleaning previous builds..."
+    rm -rf "$SDK2_DIR" "$UCPP_DIR"
 fi
 
-PATCHELF="patchelf"
-if ! command -v patchelf &>/dev/null; then
-    PATCHELF="$VENV_DIR/bin/patchelf"
-    if [[ ! -x "$PATCHELF" ]]; then
-        error "patchelf not found after uv sync"
-        exit 1
-    fi
-fi
+# ═══════════════════════════════════════════════════════════════════════
+# Step 1: Install unitree_sdk2 C++ library
+# ═══════════════════════════════════════════════════════════════════════
 
-# ── Clone source ────────────────────────────────────────────────────────
-CLONE_DIR="${CLONE_DIR:-/tmp/unitree_sdk2_build}"
-
-if [[ "$CLEAN" -eq 1 ]] && [[ -d "$CLONE_DIR" ]]; then
-    info "Cleaning previous build at $CLONE_DIR"
-    rm -rf "$CLONE_DIR"
-fi
-
-if [[ ! -d "$CLONE_DIR" ]]; then
-    info "Cloning amazon-far/unitree_sdk2 (dev branch)..."
-    git clone --depth 1 --branch dev \
-        https://github.com/amazon-far/unitree_sdk2.git \
-        "$CLONE_DIR"
+# Check if already installed
+if [[ -f /usr/local/lib/libunitree_sdk2.a ]] && \
+   [[ -d /usr/local/include/unitree ]]; then
+    info "unitree_sdk2 already installed in /usr/local (skipping)"
 else
-    info "Using cached clone at $CLONE_DIR"
-fi
+    info "=== Step 1: Install unitree_sdk2 C++ library ==="
 
-# ── Verify expected files exist ─────────────────────────────────────────
-SDK_LIB="$CLONE_DIR/lib/$ARCH/libunitree_sdk2.a"
-DDS_LIB_DIR="$CLONE_DIR/thirdparty/lib/$ARCH"
-BINDING_DIR="$CLONE_DIR/python_binding"
-
-if [[ ! -f "$SDK_LIB" ]]; then
-    error "Static library not found: $SDK_LIB"
-    error "The clone may be incomplete or the architecture ($ARCH) is not supported."
-    exit 1
-fi
-
-if [[ ! -d "$BINDING_DIR" ]]; then
-    error "Python binding source not found: $BINDING_DIR"
-    exit 1
-fi
-
-# ── CMake configure + build ─────────────────────────────────────────────
-BUILD_DIR="$CLONE_DIR/build"
-mkdir -p "$BUILD_DIR"
-
-info "Configuring CMake..."
-cmake -S "$CLONE_DIR" -B "$BUILD_DIR" \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DBUILD_PYTHON_BINDING=ON \
-    -DBUILD_EXAMPLES=OFF \
-    -DPYTHON_EXECUTABLE="$PYTHON" \
-    -DPython_EXECUTABLE="$PYTHON" \
-    -DPython3_EXECUTABLE="$PYTHON" \
-    -DPYBIND11_FINDPYTHON=ON \
-    -Dpybind11_DIR="$("$PYTHON" -c 'import pybind11; print(pybind11.get_cmake_dir())')"
-
-info "Building unitree_interface..."
-cmake --build "$BUILD_DIR" --target unitree_interface --parallel "$(nproc)"
-
-# ── Find built .so ──────────────────────────────────────────────────────
-SO_FILE="$(find "$BUILD_DIR" -name 'unitree_interface*.so' -type f | head -1)"
-if [[ -z "$SO_FILE" ]]; then
-    error "Build succeeded but unitree_interface*.so not found in $BUILD_DIR"
-    exit 1
-fi
-info "Built: $SO_FILE"
-
-# ── Install .so into site-packages ──────────────────────────────────────
-info "Installing to $SITE_PACKAGES"
-cp "$SO_FILE" "$SITE_PACKAGES/"
-
-# ── Install DDS shared libraries alongside ──────────────────────────────
-# Copy all versioned variants and create symlinks so the dynamic linker
-# can resolve both libddsc.so and libddsc.so.0 (the SONAME).
-DDS_LIBS=(libddsc libddscxx)
-for base in "${DDS_LIBS[@]}"; do
-    # Find all files matching this lib (e.g. libddsc.so, libddsc.so.0, libddsc.so.0.10.2)
-    FOUND=()
-    while IFS= read -r f; do
-        FOUND+=("$f")
-    done < <(find "$DDS_LIB_DIR" -name "${base}.so*" | sort)
-
-    if [[ ${#FOUND[@]} -eq 0 ]]; then
-        warn "  DDS library not found: ${base}.so in $DDS_LIB_DIR (may be statically linked)"
-        continue
+    if [[ ! -d "$SDK2_DIR" ]]; then
+        info "Cloning unitreerobotics/unitree_sdk2..."
+        git clone --depth 1 \
+            https://github.com/unitreerobotics/unitree_sdk2.git \
+            "$SDK2_DIR"
+    else
+        info "Using cached clone at $SDK2_DIR"
     fi
 
-    # Copy all files/symlinks preserving the link structure
-    for f in "${FOUND[@]}"; do
-        fname="$(basename "$f")"
-        if [[ -L "$f" ]]; then
-            # Recreate symlink
-            target="$(readlink "$f")"
-            ln -sf "$target" "$SITE_PACKAGES/$fname"
-        else
-            cp "$f" "$SITE_PACKAGES/$fname"
-        fi
-    done
-    info "  Installed ${base}.so ($(printf '%s ' "${FOUND[@]##*/}"))"
-done
+    mkdir -p "$SDK2_DIR/build"
+    info "Configuring unitree_sdk2..."
+    cmake -S "$SDK2_DIR" -B "$SDK2_DIR/build" -DCMAKE_BUILD_TYPE=Release
 
-# ── Set RPATH so .so finds DDS libs without LD_LIBRARY_PATH ─────────────
-INSTALLED_SO="$SITE_PACKAGES/$(basename "$SO_FILE")"
-"$PATCHELF" --set-rpath '$ORIGIN' "$INSTALLED_SO"
-info "Set RPATH to \$ORIGIN on $(basename "$SO_FILE")"
+    info "Building unitree_sdk2..."
+    cmake --build "$SDK2_DIR/build" --parallel "$(nproc)"
 
-# ── Patch unitree_sdk2py: remove broken 'b2' import ─────────────────────
-SDK2PY_INIT="$SITE_PACKAGES/unitree_sdk2py/__init__.py"
-if [[ -f "$SDK2PY_INIT" ]] && grep -q 'b2' "$SDK2PY_INIT"; then
-    info "Patching unitree_sdk2py (removing broken 'b2' import)..."
-    sed -i 's/from \. import idl, utils, core, rpc, go2, b2/from . import idl, utils, core, rpc, go2/' "$SDK2PY_INIT"
-    sed -i '/"b2",/d' "$SDK2PY_INIT"
+    info "Installing unitree_sdk2 to /usr/local (requires sudo)..."
+    sudo cmake --install "$SDK2_DIR/build"
+
+    info "unitree_sdk2 installed to /usr/local"
 fi
+
+# ═══════════════════════════════════════════════════════════════════════
+# Step 2: Build and install unitree_cpp Python binding
+# ═══════════════════════════════════════════════════════════════════════
+
+info "=== Step 2: Build unitree_cpp Python binding ==="
+
+if [[ ! -d "$UCPP_DIR" ]]; then
+    info "Cloning HansZ8/unitree_cpp..."
+    git clone --depth 1 \
+        https://github.com/HansZ8/unitree_cpp.git \
+        "$UCPP_DIR"
+else
+    info "Using cached clone at $UCPP_DIR"
+fi
+
+# Patch out verbose "Gains set:" print that fires every tick
+CTRL_CPP="$UCPP_DIR/src/unitree_controller.cpp"
+if grep -q 'std::cout << "Gains set:' "$CTRL_CPP" 2>/dev/null; then
+    info "Patching out verbose gains logging..."
+    sed -i '/std::cout << "Gains set:/,/std::endl;/d' "$CTRL_CPP"
+fi
+
+info "Installing unitree_cpp via uv pip install..."
+cd "$UCPP_DIR"
+uv pip install --project /home/unitree/unitree_launcher .
 
 # ── Verify ──────────────────────────────────────────────────────────────
 info "Verifying import..."
-if "$PYTHON" -c "import unitree_interface; print('unitree_interface loaded:', dir(unitree_interface))"; then
+cd /home/unitree/unitree_launcher
+if uv run python -c "from unitree_cpp import UnitreeController; print('unitree_cpp OK')"; then
     echo ""
-    info "SUCCESS — unitree_interface installed and importable."
-    info "Run with: uv run real -c configs/g1_deploy.yaml --policy <path>"
+    info "SUCCESS — unitree_cpp installed and importable."
+    info "Run with: uv run real --gantry"
 else
     echo ""
-    error "FAILED — unitree_interface could not be imported."
-    error "Check that DDS libraries are available. You may need:"
-    error "  export LD_LIBRARY_PATH=$SITE_PACKAGES:\$LD_LIBRARY_PATH"
+    error "FAILED — unitree_cpp could not be imported."
+    error "Check that unitree_sdk2 is installed: ls /usr/local/lib/libunitree_sdk2.a"
     exit 1
 fi

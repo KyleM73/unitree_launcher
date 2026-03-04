@@ -51,7 +51,7 @@ What it does:
     3. Removes stale robot-subnet IPs from other interfaces (fixes routing conflicts)
     4. Assigns static IP 192.168.123.100/24
     5. Pings the robot at 192.168.123.161
-    6. Prints example commands to run (including Docker on Linux)
+    6. Configures robot gateway + DNS for internet access via SSH
 
 Network layout:
     Host:  192.168.123.100
@@ -417,6 +417,86 @@ else
     echo "  Try the DDS verification command below to check."
 fi
 
+# ── Internet sharing (NAT) ────────────────────────────────────────────
+# The robot needs internet access (via your Mac) to install uv, Python
+# packages, and the C++ SDK. This sets up NAT so traffic from the robot
+# subnet is forwarded through your Mac's internet connection (Wi-Fi).
+header "Internet sharing (NAT forwarding)"
+
+ROBOT_PC="${SUBNET}.164"
+
+if [[ "$PLATFORM" == "macos" ]]; then
+    # Find the Wi-Fi interface
+    WIFI_IFACE=""
+    while IFS= read -r line; do
+        if [[ "$line" == "Hardware Port: Wi-Fi" ]]; then
+            IFS= read -r next_line
+            if [[ "$next_line" == "Device: "* ]]; then
+                WIFI_IFACE="${next_line#Device: }"
+            fi
+        fi
+    done < <(networksetup -listallhardwareports 2>/dev/null)
+
+    if [[ -z "$WIFI_IFACE" ]]; then
+        warn "Could not detect Wi-Fi interface — skipping NAT setup"
+        warn "The robot won't have internet access for package installs."
+        echo ""
+        echo "  To set up manually:"
+        echo "    sudo sysctl -w net.inet.ip.forwarding=1"
+        echo "    echo 'nat on <wifi_iface> from ${SUBNET}.0/24 to any -> (<wifi_iface>)' | sudo pfctl -ef -"
+    else
+        info "Enabling IP forwarding on macOS..."
+        sudo sysctl -w net.inet.ip.forwarding=1 >/dev/null 2>&1
+
+        info "Setting up NAT: ${SUBNET}.0/24 → $WIFI_IFACE (Wi-Fi)"
+        echo "nat on $WIFI_IFACE from ${SUBNET}.0/24 to any -> ($WIFI_IFACE)" | sudo pfctl -ef - 2>/dev/null
+
+        ok "NAT enabled: robot traffic forwarded through $WIFI_IFACE"
+    fi
+elif [[ "$PLATFORM" == "linux" ]]; then
+    info "Enabling IP forwarding on Linux..."
+    sudo sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
+
+    info "Setting up NAT via iptables..."
+    sudo iptables -t nat -A POSTROUTING -s "${SUBNET}.0/24" ! -o "$IFACE" -j MASQUERADE 2>/dev/null
+
+    ok "NAT enabled: robot traffic forwarded to default route"
+fi
+
+# ── Configure robot gateway + DNS via SSH ─────────────────────────────
+header "Configuring robot internet access (via SSH)"
+
+ROBOT_USER="unitree"
+ROBOT_SSH="$ROBOT_USER@$ROBOT_PC"
+
+info "Setting default gateway and DNS on robot ($ROBOT_PC)..."
+if ssh -o ConnectTimeout=5 -o BatchMode=yes "$ROBOT_SSH" bash -s "$HOST_IP" <<'ROBOT_NET' 2>/dev/null
+    HOST_IP="$1"
+    sudo ip route replace default via "$HOST_IP" 2>/dev/null
+    echo "nameserver 8.8.8.8" | sudo tee /etc/resolv.conf >/dev/null
+ROBOT_NET
+then
+    ok "Robot gateway set to $HOST_IP, DNS set to 8.8.8.8"
+
+    # Verify internet access
+    info "Verifying robot internet access..."
+    if ssh -o ConnectTimeout=5 "$ROBOT_SSH" "ping -c 1 -W 3 8.8.8.8" &>/dev/null; then
+        ok "Robot can reach the internet"
+    else
+        warn "Robot cannot reach 8.8.8.8 — NAT may not be working"
+        echo "  Check that your Mac has an active internet connection (Wi-Fi)"
+    fi
+else
+    warn "Could not SSH into robot at $ROBOT_PC"
+    echo "  You may need to configure the robot manually:"
+    echo "    ssh $ROBOT_SSH"
+    echo "    sudo ip route replace default via $HOST_IP"
+    echo "    echo 'nameserver 8.8.8.8' | sudo tee /etc/resolv.conf"
+    echo ""
+    echo "  If SSH asks for a password, add your key first:"
+    echo "    ssh-copy-id $ROBOT_SSH   # password: 123"
+fi
+
 # ── Summary ────────────────────────────────────────────────────────────
 header "Network Configuration Summary"
 echo ""
@@ -427,12 +507,16 @@ echo "  Subnet:     ${SUBNET}.0/24"
 echo "  DDS domain: 0"
 echo ""
 
-# ── Example commands ───────────────────────────────────────────────────
-header "Example Commands"
+# ── Next steps ─────────────────────────────────────────────────────────
+header "Next Steps"
 echo ""
-echo -e "  ${BOLD}# Run a policy on the real robot${NC}"
-echo "  uv run real -c configs/g1_deploy.yaml --policy assets/policies/stance_29dof.onnx --interface $IFACE"
+echo -e "  ${BOLD}# Deploy code to the robot${NC}"
+echo "  ./scripts/deploy_to_robot.sh"
 echo ""
-echo -e "  ${BOLD}# Mirror real robot state in MuJoCo viewer${NC}"
+echo -e "  ${BOLD}# SSH into the robot and run${NC}"
+echo "  ssh unitree@${SUBNET}.164"
+echo "  cd ~/unitree_launcher && uv run real --gantry"
+echo ""
+echo -e "  ${BOLD}# Mirror real robot state from this Mac${NC}"
 echo "  uv run mirror --gui --interface $IFACE"
 echo ""
