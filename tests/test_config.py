@@ -196,7 +196,7 @@ class TestJointNameResolution:
 
 class TestConfigLoading:
     def test_load_default_config(self):
-        cfg = load_config(str(PROJECT_ROOT / "configs" / "default.yaml"))
+        cfg = load_config(str(PROJECT_ROOT / "configs" / "sim.yaml"))
         assert cfg.robot.variant == "g1_29dof"
         assert cfg.control.policy_frequency == 50
         assert cfg.control.sim_frequency == 500
@@ -207,18 +207,19 @@ class TestConfigLoading:
         assert cfg.logging.format == "hdf5"
 
     def test_load_robot_specific_config(self):
-        base = load_config(str(PROJECT_ROOT / "configs" / "default.yaml"))
-        override = load_config(str(PROJECT_ROOT / "configs" / "g1_29dof.yaml"))
+        base = load_config(str(PROJECT_ROOT / "configs" / "sim.yaml"))
+        override = load_config(str(PROJECT_ROOT / "configs" / "real.yaml"))
         merged = merge_configs(base, override)
         assert merged.robot.variant == "g1_29dof"
-        # Base values preserved where override doesn't set them
-        assert merged.control.kp is None
+        # Override values applied
+        assert merged.network.domain_id == 0
 
-    def test_load_23dof_config(self):
-        base = load_config(str(PROJECT_ROOT / "configs" / "default.yaml"))
-        override = load_config(str(PROJECT_ROOT / "configs" / "g1_23dof.yaml"))
+    def test_merge_real_into_sim(self):
+        base = load_config(str(PROJECT_ROOT / "configs" / "sim.yaml"))
+        override = load_config(str(PROJECT_ROOT / "configs" / "real.yaml"))
         merged = merge_configs(base, override)
-        assert merged.robot.variant == "g1_23dof"
+        assert merged.network.domain_id == 0
+        assert merged.network.interface == "eth0"
 
 
 class TestConfigValidation:
@@ -283,7 +284,7 @@ class TestConfigValidation:
             load_config(path)
 
     def test_default_gains_are_none(self):
-        cfg = load_config(str(PROJECT_ROOT / "configs" / "default.yaml"))
+        cfg = load_config(str(PROJECT_ROOT / "configs" / "sim.yaml"))
         assert cfg.control.kp is None
         assert cfg.control.kd is None
         assert cfg.control.ka is None

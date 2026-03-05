@@ -51,7 +51,7 @@ def build_script_parser(
     parser = argparse.ArgumentParser(description=description)
 
     def _add_common(p):
-        p.add_argument("--config", default="configs/default.yaml",
+        p.add_argument("--config", default="configs/sim.yaml",
                         help="Path to YAML configuration file")
         p.add_argument("--gui", action="store_true",
                         help="Launch MuJoCo GLFW viewer (use mjpython on macOS)")

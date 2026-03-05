@@ -1,0 +1,5 @@
+# Disables tilt check and joint position limits.
+# Use with --preset g1_unsafe for BeyondMimic testing on sim or real.
+safety:
+  tilt_check: false
+  joint_position_limits: false

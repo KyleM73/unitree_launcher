@@ -11,7 +11,7 @@ from unitree_launcher.policy.joint_mapper import JointMapper
 from unitree_launcher.robot.base import RobotState
 from tests.conftest import PROJECT_ROOT, create_isaaclab_onnx
 
-_DEFAULT_CONFIG = os.path.join(PROJECT_ROOT, "configs", "default.yaml")
+_DEFAULT_CONFIG = os.path.join(PROJECT_ROOT, "configs", "sim.yaml")
 
 def _make_config():
     return load_config(_DEFAULT_CONFIG)

@@ -449,9 +449,22 @@ if [[ "$PLATFORM" == "macos" ]]; then
         sudo sysctl -w net.inet.ip.forwarding=1 >/dev/null 2>&1
 
         info "Setting up NAT: ${SUBNET}.0/24 → $WIFI_IFACE (Wi-Fi)"
-        echo "nat on $WIFI_IFACE from ${SUBNET}.0/24 to any -> ($WIFI_IFACE)" | sudo pfctl -ef - 2>/dev/null
+        # Write a pf.conf with the NAT rule, then load it.
+        # Using a file avoids pipe/stdin issues and gives clearer error output.
+        NAT_CONF="/tmp/unitree_nat.conf"
+        echo "nat on $WIFI_IFACE from ${SUBNET}.0/24 to any -> ($WIFI_IFACE)" > "$NAT_CONF"
 
-        ok "NAT enabled: robot traffic forwarded through $WIFI_IFACE"
+        if sudo pfctl -ef "$NAT_CONF" 2>&1 | grep -v "^No ALTQ"; then
+            true  # pfctl prints status to stderr even on success
+        fi
+
+        # Verify the rule was loaded
+        if sudo pfctl -s nat 2>/dev/null | grep -q "nat on"; then
+            ok "NAT enabled: robot traffic forwarded through $WIFI_IFACE"
+        else
+            err "Failed to load NAT rule. Try manually:"
+            echo "  echo 'nat on $WIFI_IFACE from ${SUBNET}.0/24 to any -> ($WIFI_IFACE)' | sudo pfctl -ef -"
+        fi
     fi
 elif [[ "$PLATFORM" == "linux" ]]; then
     info "Enabling IP forwarding on Linux..."
@@ -470,17 +483,15 @@ ROBOT_USER="unitree"
 ROBOT_SSH="$ROBOT_USER@$ROBOT_PC"
 
 info "Setting default gateway and DNS on robot ($ROBOT_PC)..."
-if ssh -o ConnectTimeout=5 -o BatchMode=yes "$ROBOT_SSH" bash -s "$HOST_IP" <<'ROBOT_NET' 2>/dev/null
-    HOST_IP="$1"
-    sudo ip route replace default via "$HOST_IP" 2>/dev/null
-    echo "nameserver 8.8.8.8" | sudo tee /etc/resolv.conf >/dev/null
-ROBOT_NET
+info "If prompted, enter the robot password (default: 123)"
+if ssh -t -o ConnectTimeout=5 -o StrictHostKeyChecking=no "$ROBOT_SSH" \
+    "sudo ip route replace default via $HOST_IP && echo 'nameserver 8.8.8.8' | sudo tee /etc/resolv.conf >/dev/null"
 then
     ok "Robot gateway set to $HOST_IP, DNS set to 8.8.8.8"
 
     # Verify internet access
     info "Verifying robot internet access..."
-    if ssh -o ConnectTimeout=5 "$ROBOT_SSH" "ping -c 1 -W 3 8.8.8.8" &>/dev/null; then
+    if ssh -o ConnectTimeout=5 "$ROBOT_SSH" "ping -c 1 -W 3 8.8.8.8" 2>/dev/null; then
         ok "Robot can reach the internet"
     else
         warn "Robot cannot reach 8.8.8.8 — NAT may not be working"
@@ -492,9 +503,6 @@ else
     echo "    ssh $ROBOT_SSH"
     echo "    sudo ip route replace default via $HOST_IP"
     echo "    echo 'nameserver 8.8.8.8' | sudo tee /etc/resolv.conf"
-    echo ""
-    echo "  If SSH asks for a password, add your key first:"
-    echo "    ssh-copy-id $ROBOT_SSH   # password: 123"
 fi
 
 # ── Summary ────────────────────────────────────────────────────────────

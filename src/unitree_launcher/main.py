@@ -9,7 +9,7 @@ Modes:
 Entry points (via ``uv run``):
     uv run sim --gui --policy stance.onnx
     uv run eval --steps 500 --policy stance.onnx
-    uv run real -c configs/g1_deploy.yaml
+    uv run real --policy assets/policies/beyondmimic_29dof.onnx
     uv run mirror --gui --interface en8
 """
 from __future__ import annotations
@@ -311,12 +311,12 @@ def run_with_viser(
 # CLI
 # ============================================================================
 
-def _add_common_args(parser: argparse.ArgumentParser) -> None:
-    """Add arguments shared between sim and real sub-commands."""
-    parser.add_argument("-c", "--config", default="configs/default.yaml",
-                        help="Path to YAML configuration file")
+def _add_base_args(parser: argparse.ArgumentParser, default_config: str) -> None:
+    """Add arguments shared by all modes."""
+    parser.add_argument("-c", "--config", default=default_config,
+                        help=f"Path to YAML config (default: {default_config})")
     parser.add_argument("--preset", default=None,
-                        help="Named config preset (e.g., default, g1_real, g1_sim_bm)")
+                        help="Named config preset (e.g., unsafe)")
     parser.add_argument("--policy", default=None,
                         help="Path to ONNX policy file")
     parser.add_argument("--default-policy", default=None,
@@ -329,27 +329,23 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--robot", default=None,
                         help="Robot variant override (g1_29dof or g1_23dof)")
     parser.add_argument("--domain-id", type=int, default=None,
-                        help="DDS domain ID (default: 1 for sim, 0 for real)")
-    parser.add_argument("--log-dir", default="logs/",
-                        help="Log output directory")
+                        help="DDS domain ID override")
     parser.add_argument("--no-log", action="store_true",
                         help="Disable logging")
+    parser.add_argument("--log-dir", default="logs/",
+                        help="Log output directory")
     parser.add_argument("--no-est", action="store_true",
                         help="Override policy.use_estimator to false")
     parser.add_argument("--estimator", action="store_true",
-                        help="Enable InEKF state estimator (auto-enabled for real)")
+                        help="Enable InEKF state estimator")
     parser.add_argument("--estimator-verbose", action="store_true",
-                        help="Enable estimator diagnostic logging (tuning mode)")
+                        help="Enable estimator diagnostic logging")
     parser.add_argument("--estimate-imu", action="store_true",
-                        help="Also estimate IMU orientation and angular velocity "
-                             "(default: only base position and velocity)")
-    parser.add_argument("--record", nargs="?", const="sim.mp4", default=None,
-                        metavar="PATH",
-                        help="Record video to MP4 (default: recording.mp4)")
-    parser.add_argument("--gamepad", action="store_true",
-                        help="Enable gamepad e-stop (Logitech F310)")
-    parser.add_argument("--gamepad-debug", action="store_true",
-                        help="Log raw HID reports on change (for button mapping)")
+                        help="Also estimate IMU orientation and angular velocity")
+
+
+def _add_viewer_args(parser: argparse.ArgumentParser) -> None:
+    """Add viewer flags (sim and mirror only)."""
     parser.add_argument("--gui", action="store_true",
                         help="Launch MuJoCo GLFW viewer (use mjpython on macOS)")
     parser.add_argument("--viser", action="store_true",
@@ -365,52 +361,69 @@ def build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="mode", required=True)
 
-    # Shared sim args (used by sim and eval)
-    def _add_sim_args(p):
-        p.add_argument("--gantry", action="store_true",
-                        help="Gantry mode: damping -> interpolate -> hold (no policy needed)")
-        p.add_argument("--duration", type=float, default=None,
-                        help="Auto-stop after N seconds")
-        p.add_argument("--steps", type=int, default=None,
-                        help="Auto-stop after N policy steps")
-        p.add_argument("--play", action="store_true",
-                        help="Loop forever: don't exit when trajectory ends (viser only)")
-        p.set_defaults(interface=None)
-
     # -- sim: development simulation (500Hz, any viewer) --
     sim_parser = subparsers.add_parser("sim", help="Simulation (dev, 500Hz physics, gui/viser/headless)")
-    _add_common_args(sim_parser)
-    _add_sim_args(sim_parser)
+    _add_base_args(sim_parser, "configs/sim.yaml")
+    _add_viewer_args(sim_parser)
+    sim_parser.add_argument("--gantry", action="store_true",
+                            help="Gantry mode: elastic band + sinusoid (no policy needed)")
+    sim_parser.add_argument("--duration", type=float, default=None,
+                            help="Auto-stop after N seconds")
+    sim_parser.add_argument("--steps", type=int, default=None,
+                            help="Auto-stop after N policy steps")
+    sim_parser.add_argument("--play", action="store_true",
+                            help="Loop forever: don't exit when trajectory ends (viser only)")
+    sim_parser.add_argument("--record", nargs="?", const="sim.mp4", default=None,
+                            metavar="PATH", help="Record video to MP4")
+    sim_parser.add_argument("--gamepad", action="store_true",
+                            help="Enable gamepad e-stop (Logitech F310)")
+    sim_parser.add_argument("--gamepad-debug", action="store_true",
+                            help="Log raw HID reports on change (for button mapping)")
+    sim_parser.set_defaults(interface=None)
 
     # -- eval: accurate headless evaluation (1000Hz) --
     eval_parser = subparsers.add_parser("eval", help="Evaluation (1000Hz physics, headless)")
-    _add_common_args(eval_parser)
-    _add_sim_args(eval_parser)
-    eval_parser.set_defaults(gui=False, viser=False)
+    _add_base_args(eval_parser, "configs/sim.yaml")
+    eval_parser.add_argument("--gantry", action="store_true",
+                             help="Gantry mode: elastic band + sinusoid (no policy needed)")
+    eval_parser.add_argument("--duration", type=float, default=None,
+                             help="Auto-stop after N seconds")
+    eval_parser.add_argument("--steps", type=int, default=None,
+                             help="Auto-stop after N policy steps")
+    eval_parser.add_argument("--record", nargs="?", const="eval.mp4", default=None,
+                             metavar="PATH", help="Record video to MP4")
+    eval_parser.set_defaults(gui=False, viser=False, play=False, interface=None,
+                             gamepad=False, gamepad_debug=False)
 
     # -- real: onboard robot deployment --
     real_parser = subparsers.add_parser("real", help="Onboard robot deployment (run on G1)")
-    _add_common_args(real_parser)
+    _add_base_args(real_parser, "configs/real.yaml")
     real_parser.add_argument("--interface", default="eth0",
                              help="Network interface (default: eth0 on G1 Orin)")
     real_parser.add_argument("--gantry", action="store_true",
                              help="Gantry arm test: prepare -> sinusoid on right shoulder")
-    real_parser.set_defaults(duration=None, steps=None, play=False,
-                             gui=False, viser=False)
+    real_parser.add_argument("--duration", type=float, default=None,
+                             help="Auto-stop after N seconds")
+    real_parser.set_defaults(steps=None, play=False, gui=False, viser=False,
+                             record=None, gamepad=False, gamepad_debug=False)
 
     # -- mirror: read-only DDS subscriber to visualize real robot --
     mirror_parser = subparsers.add_parser("mirror", help="Mirror real robot state into MuJoCo viewer")
-    mirror_parser.add_argument("-c", "--config", default="configs/default.yaml",
-                                help="Path to YAML configuration file")
+    mirror_parser.add_argument("-c", "--config", default="configs/sim.yaml",
+                                help="Path to YAML config (default: configs/sim.yaml)")
+    mirror_parser.add_argument("--robot", default=None,
+                                help="Robot variant override (g1_29dof or g1_23dof)")
     mirror_parser.add_argument("--interface", default="en8",
                                 help="Network interface to real robot (default: en8)")
-    mirror_parser.add_argument("--gui", action="store_true",
-                                help="Launch MuJoCo GLFW viewer")
-    mirror_parser.add_argument("--viser", action="store_true",
-                                help="Launch viser web viewer")
-    mirror_parser.add_argument("--port", type=int, default=8080,
-                                help="Viser web viewer port (default: 8080)")
-    mirror_parser.set_defaults(gantry=False, duration=None, steps=None, play=False)
+    mirror_parser.add_argument("--domain-id", type=int, default=None,
+                                help="DDS domain ID override")
+    _add_viewer_args(mirror_parser)
+    mirror_parser.set_defaults(gantry=False, duration=None, steps=None, play=False,
+                               preset=None, policy=None, default_policy=None,
+                               policy_dir=None, no_log=True, log_dir="logs/",
+                               no_est=False, estimator=False, estimator_verbose=False,
+                               estimate_imu=False, record=None, gamepad=False,
+                               gamepad_debug=False)
 
     return parser
 
@@ -458,7 +471,7 @@ def main(argv: Optional[list] = None) -> None:
         if not preset_path.exists():
             parser.error(f"Unknown preset: {args.preset}")
         config = load_config(str(preset_path))
-        if args.config != "configs/default.yaml":
+        if args.config not in ("configs/sim.yaml", "configs/real.yaml"):
             config = merge_configs(config, load_config(args.config))
     else:
         config = load_config(args.config)

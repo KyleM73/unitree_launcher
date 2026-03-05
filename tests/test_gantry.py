@@ -26,7 +26,7 @@ from test_gantry import run_test
 
 @pytest.fixture
 def default_config_path():
-    return str(Path(__file__).parent.parent / "configs" / "default.yaml")
+    return str(Path(__file__).parent.parent / "configs" / "sim.yaml")
 
 
 def _make_args(config_path):

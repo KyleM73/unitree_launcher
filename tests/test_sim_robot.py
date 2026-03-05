@@ -27,13 +27,15 @@ from unitree_launcher.robot.sim_robot import SimRobot
 @pytest.fixture
 def default_config():
     """Default 29-DOF config."""
-    return load_config("configs/default.yaml")
+    return load_config("configs/sim.yaml")
 
 
 @pytest.fixture
 def config_23dof():
     """23-DOF config."""
-    return load_config("configs/g1_23dof.yaml")
+    cfg = load_config("configs/sim.yaml")
+    cfg.robot.variant = "g1_23dof"
+    return cfg
 
 
 @pytest.fixture

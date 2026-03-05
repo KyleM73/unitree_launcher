@@ -128,7 +128,7 @@ class RecordingEstimator(StateEstimator):
 
 def build_sim(policy_path: str):
     """Build all components, same as main.py."""
-    config = load_config("configs/default.yaml")
+    config = load_config("configs/sim.yaml")
     robot = SimRobot(config)
     robot_joints = G1_29DOF_JOINTS
 

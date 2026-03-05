@@ -35,7 +35,7 @@ from unitree_launcher.policy.joint_mapper import JointMapper
 from unitree_launcher.robot.sim_robot import SimRobot
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DEFAULT_CONFIG = os.path.join(PROJECT_ROOT, "configs", "default.yaml")
+DEFAULT_CONFIG = os.path.join(PROJECT_ROOT, "configs", "sim.yaml")
 
 
 # ============================================================================
@@ -230,9 +230,8 @@ class TestPolicyReload:
 class TestSmoke23DOF:
     def test_headless_sim_23dof_smoke(self, tmp_path):
         """Run 10 steps with 23-DOF model via step()."""
-        config_path = os.path.join(PROJECT_ROOT, "configs", "g1_23dof.yaml")
         s = _build_isaaclab_runtime(
-            tmp_path, variant="g1_23dof", config_path=config_path,
+            tmp_path, variant="g1_23dof", config_path=DEFAULT_CONFIG,
         )
         rt = s.runtime
         safety = s.safety

@@ -32,7 +32,7 @@ from unitree_launcher.policy.joint_mapper import JointMapper
 from unitree_launcher.robot.base import RobotCommand, RobotState
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DEFAULT_CONFIG = os.path.join(PROJECT_ROOT, "configs", "default.yaml")
+DEFAULT_CONFIG = os.path.join(PROJECT_ROOT, "configs", "sim.yaml")
 
 
 # ============================================================================
@@ -65,7 +65,7 @@ class TestParseSimArgs:
         assert args.policy == "test.onnx"
         assert args.gui is False
         assert args.viser is False
-        assert args.config == "configs/default.yaml"
+        assert args.config == "configs/sim.yaml"
 
     def test_parse_sim_headless_with_duration(self):
         args = _parse(["sim", "--policy", "p.onnx",
@@ -127,8 +127,8 @@ class TestParseRealArgs:
 
 class TestParsePreset:
     def test_preset_flag_parsed(self):
-        args = _parse(["sim", "--preset", "g1_sim_bm", "--policy", "p.onnx"])
-        assert args.preset == "g1_sim_bm"
+        args = _parse(["sim", "--preset", "unsafe", "--policy", "p.onnx"])
+        assert args.preset == "unsafe"
 
     def test_preset_default_none(self):
         args = _parse(["sim", "--policy", "p.onnx"])
@@ -575,11 +575,10 @@ class TestViserCLIArgs:
         assert args.gui is True
         assert args.viser is True
 
-    def test_parse_viser_real_mode(self):
-        """--viser works in real mode."""
-        args = _parse(["real", "--policy", "p.onnx", "--interface", "eth0", "--viser"])
-        assert args.viser is True
-        assert args.port == 8080
+    def test_real_mode_no_viser_flag(self):
+        """Real mode does not accept --viser (headless only)."""
+        with pytest.raises(SystemExit):
+            _parse(["real", "--policy", "p.onnx", "--viser"])
 
 
 # ============================================================================

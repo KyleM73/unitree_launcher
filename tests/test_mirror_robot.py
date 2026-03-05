@@ -87,7 +87,7 @@ class MockLowCmd:
 def config_29dof():
     """Default 29-DOF config."""
     from pathlib import Path
-    cfg_path = Path(__file__).parent.parent / "configs" / "default.yaml"
+    cfg_path = Path(__file__).parent.parent / "configs" / "sim.yaml"
     return load_config(str(cfg_path))
 
 
@@ -95,8 +95,10 @@ def config_29dof():
 def config_23dof():
     """23-DOF config."""
     from pathlib import Path
-    cfg_path = Path(__file__).parent.parent / "configs" / "g1_23dof.yaml"
-    return load_config(str(cfg_path))
+    cfg_path = Path(__file__).parent.parent / "configs" / "sim.yaml"
+    cfg = load_config(str(cfg_path))
+    cfg.robot.variant = "g1_23dof"
+    return cfg
 
 
 @pytest.fixture

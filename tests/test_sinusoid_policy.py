@@ -29,7 +29,7 @@ def _make_state(n_dof=29):
 
 class TestSinusoidPolicy:
     def test_step_returns_valid_command(self):
-        config = load_config(f"{PROJECT_ROOT}/configs/default.yaml")
+        config = load_config(f"{PROJECT_ROOT}/configs/sim.yaml")
         mapper = JointMapper(G1_29DOF_JOINTS)
         policy = SinusoidPolicy(mapper, config)
         state = _make_state()
@@ -40,7 +40,7 @@ class TestSinusoidPolicy:
         assert np.all(np.isfinite(cmd.joint_positions))
 
     def test_starts_at_home(self):
-        config = load_config(f"{PROJECT_ROOT}/configs/default.yaml")
+        config = load_config(f"{PROJECT_ROOT}/configs/sim.yaml")
         mapper = JointMapper(G1_29DOF_JOINTS)
         policy = SinusoidPolicy(mapper, config)
         state = _make_state()
@@ -53,7 +53,7 @@ class TestSinusoidPolicy:
 
     def test_negative_direction_only(self):
         """Sinusoid target never exceeds home position."""
-        config = load_config(f"{PROJECT_ROOT}/configs/default.yaml")
+        config = load_config(f"{PROJECT_ROOT}/configs/sim.yaml")
         mapper = JointMapper(G1_29DOF_JOINTS)
         policy = SinusoidPolicy(mapper, config)
         state = _make_state()
@@ -68,7 +68,7 @@ class TestSinusoidPolicy:
 
     def test_reaches_amplitude(self):
         """At half period, target reaches home - amplitude."""
-        config = load_config(f"{PROJECT_ROOT}/configs/default.yaml")
+        config = load_config(f"{PROJECT_ROOT}/configs/sim.yaml")
         mapper = JointMapper(G1_29DOF_JOINTS)
         policy = SinusoidPolicy(mapper, config, freq_hz=0.2)
         state = _make_state()
@@ -86,7 +86,7 @@ class TestSinusoidPolicy:
         assert abs(min_pos - expected_min) < 1e-4
 
     def test_reset_restarts_sinusoid(self):
-        config = load_config(f"{PROJECT_ROOT}/configs/default.yaml")
+        config = load_config(f"{PROJECT_ROOT}/configs/sim.yaml")
         mapper = JointMapper(G1_29DOF_JOINTS)
         policy = SinusoidPolicy(mapper, config)
         state = _make_state()
@@ -107,7 +107,7 @@ class TestSinusoidPolicy:
 
     def test_other_joints_at_home(self):
         """Non-test joints stay at home position."""
-        config = load_config(f"{PROJECT_ROOT}/configs/default.yaml")
+        config = load_config(f"{PROJECT_ROOT}/configs/sim.yaml")
         mapper = JointMapper(G1_29DOF_JOINTS)
         policy = SinusoidPolicy(mapper, config)
         state = _make_state()

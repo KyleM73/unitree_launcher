@@ -32,7 +32,7 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 def _make_config() -> Config:
     """Load default config with transition disabled for test isolation."""
-    cfg = load_config(os.path.join(PROJECT_ROOT, "configs", "default.yaml"))
+    cfg = load_config(os.path.join(PROJECT_ROOT, "configs", "sim.yaml"))
     cfg.control.transition_steps = 0
     return cfg
 

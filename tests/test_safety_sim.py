@@ -25,7 +25,7 @@ from unitree_launcher.robot.base import RobotCommand
 from unitree_launcher.robot.sim_robot import SimRobot
 
 PROJECT_ROOT = __import__("pathlib").Path(__file__).resolve().parent.parent
-DEFAULT_CONFIG = str(PROJECT_ROOT / "configs" / "default.yaml")
+DEFAULT_CONFIG = str(PROJECT_ROOT / "configs" / "sim.yaml")
 
 
 @pytest.fixture
@@ -174,8 +174,8 @@ class TestClamp23DOF:
     """Verify clamp_command works correctly with 23-DOF config."""
 
     def test_clamp_command_23dof(self):
-        config_path = str(PROJECT_ROOT / "configs" / "g1_23dof.yaml")
-        config = load_config(config_path)
+        config = Config()
+        config.robot.variant = "g1_23dof"
         safety = SafetyController(config, n_dof=23)
 
         # Create command exceeding all limits

@@ -28,7 +28,7 @@ from unitree_launcher.policy.isaaclab_policy import IsaacLabPolicy
 from unitree_launcher.policy.joint_mapper import JointMapper
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_CONFIG = str(PROJECT_ROOT / "configs" / "default.yaml")
+DEFAULT_CONFIG = str(PROJECT_ROOT / "configs" / "sim.yaml")
 
 
 # ============================================================================
