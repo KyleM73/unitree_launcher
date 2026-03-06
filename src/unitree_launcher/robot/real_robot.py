@@ -25,7 +25,7 @@ from typing import Callable, Optional
 import numpy as np
 
 from unitree_launcher.config import Config, _get_joints_for_variant
-from unitree_launcher.robot.base import RobotCommand, RobotInterface, RobotState
+from unitree_launcher.robot.base import RobotCommand, RobotInterface, RobotState, SdkState
 
 logger = logging.getLogger(__name__)
 
@@ -156,16 +156,37 @@ class RealRobot(RobotInterface):
             if self._wireless_handler is not None:
                 self._wireless_handler(remote)
 
+        # The C++ binding exposes motor_state as a single object with flat
+        # arrays (motor_state.q[:], motor_state.dq[:], etc.), not per-motor
+        # objects like the Python DDS LowState_.
+        ms = state.motor_state
+        n_motors = 35
+
+        # Build SdkState from all available LowState_ fields.
+        # Use getattr with defaults since the C++ binding may not expose all.
+        sdk_state = SdkState(
+            tick=int(getattr(state, 'tick', 0)),
+            mode_pr=int(getattr(state, 'mode_pr', 0)),
+            mode_machine=int(getattr(state, 'mode_machine', 0)),
+            motor_ddq=np.array(getattr(ms, 'ddq', [0.0] * n_motors)[:n_motors], dtype=np.float32),
+            motor_temperature=np.array(getattr(ms, 'temperature', [[0, 0]] * n_motors)[:n_motors], dtype=np.int16),
+            motor_voltage=np.array(getattr(ms, 'vol', [0.0] * n_motors)[:n_motors], dtype=np.float32),
+            motor_state_flags=np.array(getattr(ms, 'motorstate', [0] * n_motors)[:n_motors], dtype=np.uint32),
+            imu_rpy=np.array(getattr(state.imu_state, 'rpy', [0.0, 0.0, 0.0])[:3], dtype=np.float32),
+            imu_temperature=int(getattr(state.imu_state, 'temperature', 0)),
+        )
+
         return RobotState(
             timestamp=time.time(),
-            joint_positions=np.array(state.motor_state.q[:self._n_dof], dtype=np.float64),
-            joint_velocities=np.array(state.motor_state.dq[:self._n_dof], dtype=np.float64),
-            joint_torques=np.array(state.motor_state.tau_est[:self._n_dof], dtype=np.float64),
+            joint_positions=np.array(ms.q[:self._n_dof], dtype=np.float64),
+            joint_velocities=np.array(ms.dq[:self._n_dof], dtype=np.float64),
+            joint_torques=np.array(ms.tau_est[:self._n_dof], dtype=np.float64),
             imu_quaternion=np.array(state.imu_state.quaternion[:4], dtype=np.float64),
             imu_angular_velocity=np.array(state.imu_state.gyroscope[:3], dtype=np.float64),
             imu_linear_acceleration=np.array(state.imu_state.accelerometer[:3], dtype=np.float64),
             base_position=np.full(3, np.nan),
             base_velocity=np.full(3, np.nan),
+            sdk_state=sdk_state,
         )
 
     def send_command(self, cmd: RobotCommand) -> None:

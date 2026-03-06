@@ -34,6 +34,7 @@ class Policy(ABC):
 
         # Action state
         self._last_action = np.zeros(mapper.n_policy, dtype=np.float64)
+        self._last_observation: Optional[np.ndarray] = None
 
         # Smoothing config (subclasses can override)
         self._action_beta = 1.0      # EMA factor (1.0 = no smoothing)
@@ -128,6 +129,13 @@ class Policy(ABC):
     def last_action(self) -> np.ndarray:
         """Copy of the last action (for observation feedback)."""
         return self._last_action.copy()
+
+    @property
+    def last_observation(self) -> Optional[np.ndarray]:
+        """Copy of the last observation fed to the model, or None."""
+        if self._last_observation is None:
+            return None
+        return self._last_observation.copy()
 
     # ------------------------------------------------------------------
     # Shared infrastructure

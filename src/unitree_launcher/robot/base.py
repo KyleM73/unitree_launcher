@@ -17,6 +17,50 @@ import numpy as np
 # ============================================================================
 
 @dataclass
+class SdkState:
+    """Raw hardware state from the Unitree SDK (LowState_ fields).
+
+    Captures everything the SDK exposes that isn't already in RobotState.
+    All fields are numpy arrays for efficient logging. Populated by
+    RealRobot/MirrorRobot from LowState_; None on SimRobot.
+
+    Fields from LowState_:
+        tick:               Hardware frame counter (uint32).
+        mode_pr:            Motor mode PR (uint8).
+        mode_machine:       Machine state mode (uint8).
+
+    Fields from MotorState_ (per joint, N_MOTORS=35):
+        motor_mode:         Motor mode flags.
+        motor_ddq:          Joint accelerations (rad/s²).
+        motor_temperature:  Motor temperatures (2 sensors per motor, °C).
+        motor_voltage:      Motor bus voltage (V).
+        motor_sensor:       Proprietary sensor data (2 per motor).
+        motor_state_flags:  Motor error/status flags.
+
+    Fields from IMUState_:
+        imu_rpy:            Roll-pitch-yaw (rad), firmware-derived.
+        imu_temperature:    IMU sensor temperature (°C).
+    """
+    # Frame-level
+    tick: int = 0
+    mode_pr: int = 0
+    mode_machine: int = 0
+
+    # Per-motor (35 motors on G1, indices 0..34)
+    motor_mode: Optional[np.ndarray] = None            # (35,) uint8
+    motor_ddq: Optional[np.ndarray] = None             # (35,) float32
+    motor_temperature: Optional[np.ndarray] = None     # (35, 2) int16, °C
+    motor_voltage: Optional[np.ndarray] = None         # (35,) float32, V
+    motor_sensor: Optional[np.ndarray] = None          # (35, 2) uint32
+    motor_state_flags: Optional[np.ndarray] = None     # (35,) uint32
+
+    # IMU extras
+    imu_rpy: Optional[np.ndarray] = None               # (3,) float32, rad
+    imu_temperature: int = 0                            # °C
+
+
+
+@dataclass
 class RobotState:
     """Snapshot of robot state at a given time."""
     timestamp: float
@@ -28,6 +72,7 @@ class RobotState:
     imu_linear_acceleration: np.ndarray  # (3,)
     base_position: np.ndarray         # (3,) world frame (sim only, NaN for real)
     base_velocity: np.ndarray         # (3,) world frame (sim only, NaN for real)
+    sdk_state: Optional[SdkState] = None  # Raw SDK data (real/mirror only)
 
     @staticmethod
     def zeros(n_dof: int) -> RobotState:

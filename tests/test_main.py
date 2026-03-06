@@ -1,4 +1,4 @@
-"""Tests for main.py CLI (sim/eval/real/mirror modes).
+"""Tests for main.py CLI (sim/eval/real/mirror/replay modes).
 
 Covers argument parsing, config integration, component wiring,
 apply_cli_overrides, GLFW key map, key callback dispatch,

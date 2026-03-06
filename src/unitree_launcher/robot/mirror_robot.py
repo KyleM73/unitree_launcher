@@ -21,7 +21,7 @@ import numpy as np
 
 from unitree_launcher.compat import RecurrentThread, patch_unitree_b2_import, patch_unitree_crc, patch_unitree_threading, resolve_network_interface
 from unitree_launcher.config import Config, _get_joints_for_variant
-from unitree_launcher.robot.base import RobotCommand, RobotInterface, RobotState
+from unitree_launcher.robot.base import RobotCommand, RobotInterface, RobotState, SdkState
 
 logger = logging.getLogger(__name__)
 
@@ -297,18 +297,36 @@ class MirrorRobot(RobotInterface):
         """DDS callback: convert LowState_ to RobotState and store."""
         now = time.monotonic()
 
+        ms = msg.motor_state
+        n_motors = 35
+        sdk_state = SdkState(
+            tick=int(getattr(msg, 'tick', 0)),
+            mode_pr=int(getattr(msg, 'mode_pr', 0)),
+            mode_machine=int(getattr(msg, 'mode_machine', 0)),
+            motor_mode=np.array([ms[i].mode for i in range(n_motors)], dtype=np.uint8),
+            motor_ddq=np.array([ms[i].ddq for i in range(n_motors)], dtype=np.float32),
+            motor_temperature=np.array([ms[i].temperature for i in range(n_motors)], dtype=np.int16),
+            motor_voltage=np.array([ms[i].vol for i in range(n_motors)], dtype=np.float32),
+            motor_sensor=np.array([ms[i].sensor for i in range(n_motors)], dtype=np.uint32),
+            motor_state_flags=np.array([ms[i].motorstate for i in range(n_motors)], dtype=np.uint32),
+            imu_rpy=np.array(
+                [msg.imu_state.rpy[j] for j in range(3)], dtype=np.float32
+            ),
+            imu_temperature=int(getattr(msg.imu_state, 'temperature', 0)),
+        )
+
         state = RobotState(
             timestamp=time.time(),
             joint_positions=np.array(
-                [msg.motor_state[i].q for i in range(self._n_dof)],
+                [ms[i].q for i in range(self._n_dof)],
                 dtype=np.float64,
             ),
             joint_velocities=np.array(
-                [msg.motor_state[i].dq for i in range(self._n_dof)],
+                [ms[i].dq for i in range(self._n_dof)],
                 dtype=np.float64,
             ),
             joint_torques=np.array(
-                [msg.motor_state[i].tau_est for i in range(self._n_dof)],
+                [ms[i].tau_est for i in range(self._n_dof)],
                 dtype=np.float64,
             ),
             imu_quaternion=np.array(
@@ -323,9 +341,9 @@ class MirrorRobot(RobotInterface):
                 [msg.imu_state.accelerometer[j] for j in range(3)],
                 dtype=np.float64,
             ),
-            # Real robot has no world-frame base pose from DDS
             base_position=np.full(3, np.nan),
             base_velocity=np.full(3, np.nan),
+            sdk_state=sdk_state,
         )
 
         with self._state_lock:

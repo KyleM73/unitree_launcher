@@ -89,6 +89,14 @@ class LogReplay:
             return 0
         return len(ts)
 
+    @property
+    def log_rate(self) -> float:
+        """Average logging rate in Hz."""
+        ts = self._data.get("timestamps")
+        if ts is None or len(ts) < 2:
+            return 0.0
+        return (len(ts) - 1) / float(ts[-1] - ts[0])
+
     def get_state_at(self, step: int) -> RobotState:
         """Reconstruct a RobotState from logged data at the given step index."""
         if not self._loaded:
@@ -125,7 +133,11 @@ class LogReplay:
         return self._data["actions"][step].copy()
 
     def to_csv(self, output_path: str) -> None:
-        """Export logged data to CSV."""
+        """Export logged data to CSV.
+
+        Dynamically includes all dataset keys present in the log file,
+        expanding multi-dimensional columns with _0, _1, ... suffixes.
+        """
         if not self._loaded:
             raise RuntimeError("Call load() first")
 
@@ -133,42 +145,48 @@ class LogReplay:
         if n == 0:
             return
 
-        n_dof = self._data["joint_pos"].shape[1] if "joint_pos" in self._data else 0
+        # Build ordered list of (key, n_cols) for all present datasets.
+        # Use canonical order from DataLogger, then any extra keys.
+        from unitree_launcher.datalog.logger import DataLogger
+        key_order = list(DataLogger.DATASET_KEYS)
+        for key in self._data:
+            if key not in key_order:
+                key_order.append(key)
+
+        # Build ordered list of (key, flat_size) for all present datasets.
+        # Multi-dimensional per-step arrays (e.g. (35,2)) are flattened.
+        columns: list[tuple[str, int]] = []
+        for key in key_order:
+            if key not in self._data:
+                continue
+            arr = self._data[key]
+            # flat_size = product of all dims except the first (time) axis
+            flat_size = int(np.prod(arr.shape[1:])) if arr.ndim > 1 else 1
+            columns.append((key, flat_size))
 
         # Build header
-        header = ["timestamp"]
-        for i in range(n_dof):
-            header.append(f"joint_pos_{i}")
-        for i in range(n_dof):
-            header.append(f"joint_vel_{i}")
-        for i in range(n_dof):
-            header.append(f"joint_torque_{i}")
-        header.extend(["imu_qw", "imu_qx", "imu_qy", "imu_qz"])
-        header.extend(["imu_gx", "imu_gy", "imu_gz"])
-        header.extend(["imu_ax", "imu_ay", "imu_az"])
-        header.extend(["base_x", "base_y", "base_z"])
-        header.extend(["base_vx", "base_vy", "base_vz"])
-        header.extend(["vel_cmd_x", "vel_cmd_y", "vel_cmd_yaw"])
-        header.extend(["system_state", "inference_ms", "loop_ms"])
+        header = []
+        for key, flat_size in columns:
+            if flat_size == 1:
+                header.append(key)
+            else:
+                header.extend(f"{key}_{i}" for i in range(flat_size))
 
         with open(output_path, "w", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(header)
 
             for i in range(n):
-                row = [f"{self._data['timestamps'][i]:.6f}"]
-                row.extend(f"{v:.6f}" for v in self._data["joint_pos"][i])
-                row.extend(f"{v:.6f}" for v in self._data["joint_vel"][i])
-                row.extend(f"{v:.6f}" for v in self._data["joint_torques"][i])
-                row.extend(f"{v:.6f}" for v in self._data["imu_quat"][i])
-                row.extend(f"{v:.6f}" for v in self._data["imu_gyro"][i])
-                row.extend(f"{v:.6f}" for v in self._data["imu_accel"][i])
-                row.extend(f"{v:.6f}" for v in self._data["base_pos"][i])
-                row.extend(f"{v:.6f}" for v in self._data["base_vel"][i])
-                row.extend(f"{v:.6f}" for v in self._data["vel_cmd"][i])
-                row.append(str(int(self._data["system_state"][i])))
-                row.append(f"{self._data['inference_ms'][i]:.3f}")
-                row.append(f"{self._data['loop_ms'][i]:.3f}")
+                row: list[str] = []
+                for key, flat_size in columns:
+                    val = self._data[key][i]
+                    if flat_size == 1:
+                        if isinstance(val, (np.integer, int)):
+                            row.append(str(int(val)))
+                        else:
+                            row.append(f"{float(val):.6f}")
+                    else:
+                        row.extend(f"{float(v):.6f}" for v in np.ravel(val))
                 writer.writerow(row)
 
     def summary(self) -> str:
@@ -181,11 +199,15 @@ class LogReplay:
         fmt = self._format or "unknown"
         n_dof = self._data["joint_pos"].shape[1] if "joint_pos" in self._data and n > 0 else 0
 
+        rate = self.log_rate
+        dt_ms = (1000.0 / rate) if rate > 0 else 0.0
+
         lines = [
             f"Log: {self._log_dir.name}",
             f"Format: {fmt}",
             f"Steps: {n}",
             f"Duration: {dur:.2f}s",
+            f"Log rate: {rate:.1f} Hz ({dt_ms:.1f}ms per frame)",
             f"DOFs: {n_dof}",
         ]
 

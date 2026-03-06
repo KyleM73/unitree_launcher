@@ -34,6 +34,10 @@ class MockMotorState:
         self.dq = 0.0
         self.ddq = 0.0
         self.tau_est = 0.0
+        self.temperature = [0, 0]
+        self.vol = 0.0
+        self.sensor = [0, 0]
+        self.motorstate = 0
 
 
 class MockMotorCmd:

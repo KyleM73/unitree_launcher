@@ -5,12 +5,14 @@ Modes:
     eval   -- accurate evaluation (1000Hz physics, headless)
     real   -- onboard robot deployment (C++ unitree_cpp)
     mirror -- read-only DDS visualization of real robot (gui/viser)
+    replay -- play back logged data (gui/viser/summary/csv)
 
 Entry points (via ``uv run``):
     uv run sim --gui --policy stance.onnx
     uv run eval --steps 500 --policy stance.onnx
     uv run real --policy assets/policies/beyondmimic_29dof.onnx
     uv run mirror --gui --interface en8
+    uv run replay logs/run_name/ --gui
 """
 from __future__ import annotations
 
@@ -425,6 +427,18 @@ def build_parser() -> argparse.ArgumentParser:
                                estimate_imu=False, record=None, gamepad=False,
                                gamepad_debug=False)
 
+    # -- replay: play back logged data in viewer --
+    replay_parser = subparsers.add_parser("replay", help="Replay logged robot data in viewer")
+    replay_parser.add_argument("log_dir", help="Path to log run directory")
+    _add_viewer_args(replay_parser)
+    replay_parser.add_argument("--format", choices=["csv", "summary"], default="summary",
+                               help="Text output format when no viewer (default: summary)")
+    replay_parser.add_argument("--output", "-o", help="Output file path (default: stdout)")
+    replay_parser.add_argument("--speed", type=float, default=1.0,
+                               help="Playback speed multiplier (default: 1.0)")
+    replay_parser.add_argument("--loop", action="store_true",
+                               help="Loop playback when trajectory ends")
+
     return parser
 
 
@@ -450,9 +464,17 @@ def main(argv: Optional[list] = None) -> None:
         run_mirror(args)
         return
 
+    # ---- Replay mode: play back logged data ----
+    if args.mode == "replay":
+        if getattr(args, 'gui', False) and _is_docker() and platform.system() == "Darwin":
+            parser.error("--gui is not supported in Docker on macOS. Use --viser instead.")
+        from unitree_launcher.replay import run_replay
+        run_replay(args)
+        return
+
     # ---- Validate display flags ----
-    if getattr(args, 'gui', False) and _is_docker():
-        parser.error("--gui is not supported in Docker (no GLFW display). Use --viser instead.")
+    if getattr(args, 'gui', False) and _is_docker() and platform.system() == "Darwin":
+        parser.error("--gui is not supported in Docker on macOS. Use --viser instead.")
 
     # ---- Validate ----
     is_gantry = getattr(args, 'gantry', False)
@@ -911,6 +933,17 @@ def cli_mirror():
         if "--gui" in user_args:
             _reexec_with_mjpython_args(["mirror"] + user_args)
     main(["mirror"] + user_args)
+
+
+def cli_replay():
+    """Entry point for ``uv run replay`` command.
+
+    On macOS with --gui, re-execs with mjpython for GLFW support.
+    """
+    user_args = sys.argv[1:]
+    if platform.system() == "Darwin" and "--gui" in user_args:
+        _reexec_with_mjpython_args(["replay"] + user_args)
+    main(["replay"] + user_args)
 
 
 if __name__ == "__main__":

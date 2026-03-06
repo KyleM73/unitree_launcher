@@ -45,4 +45,3 @@ logging:
   enabled: true
   format: npz
   compression: none
-  log_frequency: 10

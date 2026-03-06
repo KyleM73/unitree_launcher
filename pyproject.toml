@@ -15,6 +15,7 @@ sim = "unitree_launcher.main:cli_sim"
 eval = "unitree_launcher.main:cli_eval"
 real = "unitree_launcher.main:cli_real"
 mirror = "unitree_launcher.main:cli_mirror"
+replay = "unitree_launcher.main:cli_replay"
 
 [project.optional-dependencies]
 sim = [

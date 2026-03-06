@@ -310,6 +310,7 @@ class BeyondMimicPolicy(Policy):
 
         # 2. Build observation
         obs = self.build_observation(state, anchor_pos, anchor_quat)
+        self._last_observation = obs
 
         # 3. Inference with time_step (hold at start frame for hold_steps)
         raw_action = self.get_action(obs, time_step=self._time_step)

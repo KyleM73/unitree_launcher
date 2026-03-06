@@ -34,4 +34,3 @@ logging:
   enabled: true
   format: hdf5
   compression: gzip
-  log_frequency: 50

@@ -868,7 +868,9 @@ class Runtime:
 
             # 6. Get robot state
             state = self.robot.get_state()
+            raw_state = state  # pre-estimator (same object if no estimator)
             if self._estimator is not None:
+                raw_state = state.copy()
                 self._estimator.update(state)
                 state = self._estimator.populate_robot_state(state)
             if self.safety.check_state_limits(state):
@@ -912,11 +914,20 @@ class Runtime:
             # 11. Log
             if self._logger is not None:
                 loop_time = time.perf_counter() - loop_start
-                # Get last action from policy (in robot order for logging)
+                # Get last action/observation from policy
                 policy_action = self.policy.last_action
                 log_action = self.joint_mapper.policy_to_robot(policy_action)
-                # Observation not available post-step(); log zeros
-                log_obs = np.zeros(160)
+                log_obs = self.policy.last_observation
+                if log_obs is None:
+                    log_obs = np.zeros(1)
+                est_info = None
+                if self._estimator is not None:
+                    est_info = {
+                        "contact_left": self._estimator.left_contact,
+                        "contact_right": self._estimator.right_contact,
+                        "gyro_bias": self._estimator._ekf.gyro_bias,
+                        "accel_bias": self._estimator._ekf.accel_bias,
+                    }
                 self._logger.log_step(
                     timestamp=time.time(),
                     robot_state=state,
@@ -929,6 +940,8 @@ class Runtime:
                         "inference_ms": inference_time * 1000.0,
                         "loop_ms": loop_time * 1000.0,
                     },
+                    raw_state=raw_state,
+                    estimator_info=est_info,
                 )
 
             # 12. Update telemetry

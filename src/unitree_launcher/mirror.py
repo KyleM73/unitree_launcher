@@ -49,15 +49,26 @@ class RealtimeMirror:
         self._fj_addr = self.model.jnt_qposadr[fj_id]
 
     def update(self, state: RobotState) -> None:
-        """Set display model to match a RobotState and run forward kinematics."""
+        """Set display model to match a RobotState and run forward kinematics.
+
+        Uses base_position from state if available (non-NaN, e.g. from sim
+        logs or estimator). Falls back to fixed height for mirror mode where
+        base position is unknown.
+        """
         for i in range(_N_DOF):
             self.data.qpos[self._qpos_addrs[i]] = state.joint_positions[i]
             self.data.qvel[self._dof_addrs[i]] = state.joint_velocities[i]
 
         fj = self._fj_addr
-        self.data.qpos[fj + 0] = 0.0
-        self.data.qpos[fj + 1] = 0.0
-        self.data.qpos[fj + 2] = self._base_height
+        bp = state.base_position
+        if np.isfinite(bp[0]):
+            self.data.qpos[fj + 0] = bp[0]
+            self.data.qpos[fj + 1] = bp[1]
+            self.data.qpos[fj + 2] = bp[2]
+        else:
+            self.data.qpos[fj + 0] = 0.0
+            self.data.qpos[fj + 1] = 0.0
+            self.data.qpos[fj + 2] = self._base_height
         self.data.qpos[fj + 3] = state.imu_quaternion[0]  # w
         self.data.qpos[fj + 4] = state.imu_quaternion[1]  # x
         self.data.qpos[fj + 5] = state.imu_quaternion[2]  # y

@@ -366,7 +366,7 @@ class TestLogReplayCSV:
         assert len(lines) == 51  # header + 50 data rows
 
         header = lines[0].split(",")
-        assert header[0] == "timestamp"
+        assert header[0] == "timestamps"
         assert "joint_pos_0" in header
         assert "system_state" in header
 

@@ -138,6 +138,7 @@ class IsaacLabPolicy(Policy):
         """Build observation, run inference, apply control law, return command."""
         # 1. Build observation
         obs = self._build_observation(state, velocity_command)
+        self._last_observation = obs
 
         # 2. Inference
         raw_action = self._run_inference(obs)

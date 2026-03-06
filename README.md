@@ -10,6 +10,7 @@ Control stack for the Unitree G1 humanoid robot. Supports MuJoCo simulation (mac
 | **eval** | `uv run eval` | Accurate evaluation (1000 Hz physics, headless) |
 | **real** | `uv run real` | Onboard G1 deployment (C++ DDS backend) |
 | **mirror** | `uv run mirror` | Read-only DDS visualization of the real robot |
+| **replay** | `uv run replay` | Play back logged data (GUI, Viser, or summary/CSV) |
 
 ## Supported Policies
 
@@ -38,6 +39,10 @@ uv run sim --viser --policy assets/policies/beyondmimic_29dof.onnx
 
 # Headless evaluation
 uv run eval --steps 500 --policy assets/policies/stance_29dof.onnx
+
+# Replay logged data
+uv run replay logs/run_name/ --gui
+uv run replay logs/run_name/ --viser --speed 0.5 --loop
 
 # Run tests
 uv run pytest tests/ -x
@@ -246,6 +251,7 @@ src/unitree_launcher/
   main.py                     # CLI entry point, viewer/headless runners
   config.py                   # Joint constants, dataclasses, YAML loading
   mirror.py                   # Mirror mode entry point (DDS → MuJoCo viewer)
+  replay.py                   # Replay mode entry point (logged data → viewer)
   gantry.py                   # Elastic band + gantry simulation utilities
   trajectory.py               # Collision-aware IK trajectory planning
   recording.py                # MuJoCo video recording (MP4)
@@ -282,7 +288,7 @@ src/unitree_launcher/
     lie_group.py              # SO(3)/SE(3) Lie group operations
   datalog/
     logger.py                 # HDF5/NPZ time-series logging
-    replay.py                 # Log loading, CSV export
+    replay.py                 # Log loading, state reconstruction, CSV export
   viz/
     viser_viewer.py           # Web-based 3D viewer
     conversions.py            # MuJoCo geom → trimesh

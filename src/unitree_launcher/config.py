@@ -862,7 +862,6 @@ class LoggingConfig:
     enabled: bool = True
     format: str = "hdf5"
     compression: str = "gzip"
-    log_frequency: int = 50
 
 
 @dataclass
