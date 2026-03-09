@@ -32,8 +32,8 @@ class SystemState(Enum):
 
 class ControlMode(Enum):
     HOLD = "hold"            # Static PD at home pose (gantry / pre-default-policy)
-    DEFAULT = "default"      # Default policy running (IL velocity tracking, zero vel = stance)
-    ACTIVE_POLICY = "active" # Running the --policy (BM, another IL, etc.)
+    DEFAULT = "default"      # Default policy running (velocity tracking, zero vel = stance)
+    ACTIVE_POLICY = "active" # Running the --policy
     DAMPING = "damping"      # Pure velocity damping (kp=0, kd=kd_damp)
     PREPARE = "prepare"      # Linear blend from current pos to default (re-reads each step)
     TRANSITION = "transition"    # Blending from captured command to live policy
@@ -163,7 +163,7 @@ class SafetyController:
         """Check if robot has fallen beyond the tilt threshold.
 
         Called every control tick. If tilt exceeds threshold, triggers
-        E-stop (latching). Matching RoboJuDo's safety_check() behavior.
+        E-stop (latching).
 
         Args:
             imu_quaternion: (4,) wxyz quaternion from IMU.

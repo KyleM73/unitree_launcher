@@ -168,6 +168,7 @@ def run_headless(
     policy_freq = runtime.config.control.policy_frequency
     dt = 1.0 / policy_freq
     telemetry_interval = policy_freq  # Print every ~1 second
+    last_telem_step = -1
     try:
         while True:
             step_start = time.time()
@@ -182,10 +183,15 @@ def run_headless(
             # Periodic telemetry for SSH monitoring
             if step_count % telemetry_interval == 0:
                 t = runtime.get_telemetry()
-                print(
-                    f"[{t['loop_hz']:.0f} Hz | {t['inference_ms']:.1f}ms inf | "
-                    f"{t['base_height']:.3f}m | {t['system_state']} | step {t['step_count']}]"
-                )
+                # Skip during prepare/hold (stale zeros) and don't repeat after e-stop
+                if t['step_count'] > 0 and t['step_count'] != last_telem_step:
+                    last_telem_step = t['step_count']
+                    h = t['base_height']
+                    height_str = f"{h:.3f}m" if h == h else "—"  # NaN check
+                    print(
+                        f"[{t['loop_hz']:.0f} Hz | {t['inference_ms']:.1f}ms | "
+                        f"{height_str} | {t['system_state']} | step {t['step_count']}]"
+                    )
 
             if max_steps is not None and step_count >= max_steps:
                 print(f"[headless] Reached {max_steps} steps. Stopping")
@@ -406,6 +412,12 @@ def build_parser() -> argparse.ArgumentParser:
                              help="Gantry arm test: prepare -> sinusoid on right shoulder")
     real_parser.add_argument("--duration", type=float, default=None,
                              help="Auto-stop after N seconds")
+    real_parser.add_argument("--auto", action="store_true",
+                             help="Auto-start policy after prepare (skip manual start)")
+    real_parser.add_argument("--mirror-iface", default=None, metavar="IFACE",
+                             help="Serve state over TCP for remote WiFi mirror")
+    real_parser.add_argument("--zero", action="store_true",
+                             help="Zero-torque mode: no control, just publish state for mirror")
     real_parser.set_defaults(steps=None, play=False, gui=False, viser=False,
                              record=None, gamepad=False, gamepad_debug=False)
 
@@ -417,6 +429,8 @@ def build_parser() -> argparse.ArgumentParser:
                                 help="Robot variant override (g1_29dof or g1_23dof)")
     mirror_parser.add_argument("--interface", default="en8",
                                 help="Network interface to real robot (default: en8)")
+    mirror_parser.add_argument("--peer", default=None,
+                                help="Robot IP for unicast DDS (required for WiFi)")
     mirror_parser.add_argument("--domain-id", type=int, default=None,
                                 help="DDS domain ID override")
     _add_viewer_args(mirror_parser)
@@ -478,14 +492,15 @@ def main(argv: Optional[list] = None) -> None:
 
     # ---- Validate ----
     is_gantry = getattr(args, 'gantry', False)
+    is_zero_torque = getattr(args, 'zero', False)
     # When --policy-dir is given without --policy, pick the first ONNX file.
-    if not args.policy and args.policy_dir:
+    if not is_zero_torque and not args.policy and args.policy_dir:
         import glob as _glob
         _candidates = sorted(_glob.glob(str(Path(args.policy_dir) / "*.onnx")))
         if _candidates:
             args.policy = _candidates[0]
-    if not is_gantry and not args.policy:
-        parser.error("--policy is required (or use --gantry for gantry mode)")
+    if not is_gantry and not args.policy and not is_zero_torque:
+        parser.error("--policy is required (or use --gantry or --zero)")
 
     # ---- Config ----
     if args.preset:
@@ -585,6 +600,14 @@ def main(argv: Optional[list] = None) -> None:
         if wireless is not None and hasattr(robot, 'set_wireless_handler'):
             robot.set_wireless_handler(wireless.parse)
 
+        # Mirror bridge for WiFi visualization
+        gantry_mirror_bridge = None
+        mirror_iface = getattr(args, 'mirror_iface', None)
+        if mirror_iface and args.mode == "real":
+            from unitree_launcher.mirror_bridge import MirrorBridge
+            gantry_mirror_bridge = MirrorBridge(mirror_iface)
+            gantry_mirror_bridge.start(robot)
+
         # Mode sequence: settle → prepare → normal operation.
         # Sim: DAMPING settle (5s) lets the robot hang under gravity + elastic band
         # before blending to home. Real: no settle needed (robot is on gantry).
@@ -592,7 +615,7 @@ def main(argv: Optional[list] = None) -> None:
         seq = []
         if args.mode in ("sim", "eval"):
             seq.append((ControlMode.DAMPING, 10.0))
-        seq.append((ControlMode.PREPARE, 20.0))
+        seq.append((ControlMode.PREPARE, 5.0))
         runtime._mode_sequence = seq
         runtime._initial_mode_sequence = list(seq)
 
@@ -605,11 +628,14 @@ def main(argv: Optional[list] = None) -> None:
                 step_fn=lambda: runtime.sim_step_count,
             )
 
-        # start() + safety.start(): sinusoid auto-activates after PREPARE
+        if args.mode == "real" and not getattr(args, 'auto', False):
+            runtime.require_manual_start = True
+
         runtime.start()
         safety.start()
+        prepare_dur = next(d for m, d in seq if m == ControlMode.PREPARE)
         print(
-            f"[main] Gantry: PREPARE(20s) → {sinusoid.joint_name} "
+            f"[main] Gantry: PREPARE({prepare_dur:.0f}s) → {sinusoid.joint_name} "
             f"sinusoid ({sinusoid.freq_hz}Hz, {sinusoid.amplitude:.3f}rad)"
         )
 
@@ -632,6 +658,8 @@ def main(argv: Optional[list] = None) -> None:
                     rate_limit=(args.mode == "real"),
                 )
         finally:
+            if gantry_mirror_bridge is not None:
+                gantry_mirror_bridge.stop()
             if gamepad is not None:
                 gamepad.stop()
             if recorder:
@@ -641,6 +669,54 @@ def main(argv: Optional[list] = None) -> None:
                 robot.graceful_shutdown()
             else:
                 robot.disconnect()
+        return
+
+    # ---- Zero-torque mode: Kp=0 Kd=0, just read and serve state ----
+    if is_zero_torque:
+        import numpy as np
+        from unitree_launcher.robot.base import RobotCommand
+        robot.connect()
+
+        # Actively command zero torque (Kp=0, Kd=0)
+        n = robot.n_dof
+        zero_cmd = RobotCommand(
+            joint_positions=np.zeros(n),
+            joint_velocities=np.zeros(n),
+            joint_torques=np.zeros(n),
+            kp=np.zeros(n),
+            kd=np.zeros(n),
+        )
+        robot.send_command(zero_cmd)
+
+        mirror_bridge = None
+        mirror_iface = getattr(args, 'mirror_iface', None)
+        if mirror_iface:
+            from unitree_launcher.mirror_bridge import MirrorBridge
+            mirror_bridge = MirrorBridge()
+            mirror_bridge.start(robot)
+
+        print("[main] Zero-torque mode (Kp=0, Kd=0)")
+        if mirror_bridge:
+            from unitree_launcher.mirror_bridge import MIRROR_PORT
+            print(f"[main] Serving state on port {MIRROR_PORT}")
+        print("[main] Ctrl+C to stop")
+        try:
+            while True:
+                # Keep commanding zero torque — C++ backend re-publishes at 500 Hz
+                # but we refresh the gains periodically in case of reset
+                robot.send_command(zero_cmd)
+                time.sleep(0.1)
+        except KeyboardInterrupt:
+            print("\n[main] Stopping (keeping zero torque)")
+        finally:
+            if mirror_bridge:
+                mirror_bridge.stop()
+            # Send zero torque a few more times before disconnecting,
+            # do NOT call graceful_shutdown (it sends damping)
+            for _ in range(10):
+                robot.send_command(zero_cmd)
+                time.sleep(0.01)
+            robot.disconnect()
         return
 
     # ---- Default policy ----
@@ -655,13 +731,11 @@ def main(argv: Optional[list] = None) -> None:
 
     # Match simulation parameters to the training environment.
     if isinstance(active_policy, BeyondMimicPolicy) and hasattr(robot, 'set_home_positions'):
-        # 1. Set initial robot pose to policy's default joint positions.
         default_native = active_joint_mapper.policy_to_robot(
             active_policy.default_joint_pos
         )
         robot.set_home_positions(default_native)
 
-        # 2. Set per-joint armature to match training sim.
         import numpy as _np
         _kp = active_policy.stiffness
         if _kp is not None:
@@ -669,9 +743,7 @@ def main(argv: Optional[list] = None) -> None:
             armature = _kp / (_natural_freq ** 2)
             robot.set_armature(armature)
 
-        # 3. Override actuator kp/kv to match BM training gains.
-        #    The XML defaults are IsaacLab gains (from mjlab armature formula).
-        #    BM uses its own stiffness/damping from ONNX metadata.
+        # Override actuator gains to match policy's training gains.
         if hasattr(robot, 'set_actuator_gains') and _kp is not None:
             _kd = active_policy.damping
             if _kd is None:
@@ -766,6 +838,15 @@ def main(argv: Optional[list] = None) -> None:
     robot.connect()
     if wireless is not None and hasattr(robot, 'set_wireless_handler'):
         robot.set_wireless_handler(wireless.parse)
+
+    # ---- Mirror bridge (re-publish state on WiFi for remote visualization) ----
+    mirror_bridge = None
+    mirror_iface = getattr(args, 'mirror_iface', None)
+    if mirror_iface:
+        from unitree_launcher.mirror_bridge import MirrorBridge
+        mirror_bridge = MirrorBridge(mirror_iface)
+        mirror_bridge.start(robot)
+
     if logger is not None:
         logger.start()
 
@@ -809,8 +890,10 @@ def main(argv: Optional[list] = None) -> None:
     # so viewers, wireless E-stop, and telemetry all work during prepare.
     if args.mode == "real":
         from unitree_launcher.control.safety import ControlMode as _CM
-        runtime._mode_sequence = [(_CM.PREPARE, 20.0)]
-        runtime._initial_mode_sequence = [(_CM.PREPARE, 20.0)]
+        runtime._mode_sequence = [(_CM.PREPARE, 5.0)]
+        runtime._initial_mode_sequence = [(_CM.PREPARE, 5.0)]
+        if not getattr(args, 'auto', False):
+            runtime.require_manual_start = True
 
     use_gui = args.gui
     use_viser = args.viser
@@ -844,6 +927,8 @@ def main(argv: Optional[list] = None) -> None:
         signal.signal(signal.SIGTERM, prev_sigterm)
         signal.signal(signal.SIGHUP, prev_sighup)
 
+        if mirror_bridge is not None:
+            mirror_bridge.stop()
         if gamepad is not None:
             gamepad.stop()
         if recorder:

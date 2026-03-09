@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 
 
 class RealRobot(RobotInterface):
-    """Real robot backend using unitree_cpp (RoboJuDo's C++ binding).
+    """Real robot backend using unitree_cpp.
 
     The C++ layer handles:
     - Background command re-publishing at control_dt (20ms)
@@ -50,6 +50,7 @@ class RealRobot(RobotInterface):
         self._controller = None
         self._safety = None
         self._wireless_handler: Optional[Callable[[bytes], None]] = None
+        self._estop_logged = False
 
     def set_safety(self, safety) -> None:
         """Set safety controller reference for watchdog E-stop."""
@@ -89,7 +90,7 @@ class RealRobot(RobotInterface):
         }
         self._controller = UnitreeController(config_dict)
 
-        # Wait for state data (matching RoboJuDo's self_check pattern)
+        # Wait for state data
         for _ in range(30):
             time.sleep(0.1)
             if self._controller.self_check():
@@ -145,7 +146,9 @@ class RealRobot(RobotInterface):
         if remote is not None and len(remote) >= 24:
             keys = struct.unpack("H", remote[2:4])[0]
             if keys & (1 << 8) and self._safety is not None:
-                logger.critical("Wireless A-button E-stop!")
+                if not self._estop_logged:
+                    logger.critical("Wireless A-button E-stop!")
+                    self._estop_logged = True
                 self._safety.estop()
                 # Send damping via set_gains + step
                 self._controller.set_gains(

@@ -389,6 +389,7 @@ class TestMirrorRobotWatchdog:
         mock_crc = MagicMock()
 
         with patch("unitree_launcher.robot.mirror_robot.patch_unitree_threading"), \
+             patch("unitree_launcher.robot.mirror_robot.patch_unitree_crc"), \
              patch("unitree_launcher.robot.mirror_robot.resolve_network_interface", return_value="lo0"), \
              patch.dict("sys.modules", {
                  "unitree_sdk2py.core.channel": MagicMock(
@@ -431,6 +432,7 @@ class TestMirrorRobotConfig:
         mock_crc = MagicMock()
 
         with patch("unitree_launcher.robot.mirror_robot.patch_unitree_threading"), \
+             patch("unitree_launcher.robot.mirror_robot.patch_unitree_crc"), \
              patch("unitree_launcher.robot.mirror_robot.resolve_network_interface", return_value="eth0"), \
              patch.dict("sys.modules", {
                  "unitree_sdk2py.core.channel": MagicMock(
@@ -467,6 +469,7 @@ class TestMirrorRobotConfig:
         mock_sub_cls = MagicMock()
 
         with patch("unitree_launcher.robot.mirror_robot.patch_unitree_threading"), \
+             patch("unitree_launcher.robot.mirror_robot.patch_unitree_crc"), \
              patch("unitree_launcher.robot.mirror_robot.resolve_network_interface", return_value="lo0"), \
              patch.dict("sys.modules", {
                  "unitree_sdk2py.core.channel": MagicMock(

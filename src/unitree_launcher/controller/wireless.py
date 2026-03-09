@@ -5,7 +5,7 @@ controller has its own radio link to the G1 — it does NOT route through the
 dev machine or USB. Data arrives as raw bytes in ``robot_state.wireless_remote``
 and is parsed here into button events and stick axes.
 
-Button mapping (matching RoboJuDo):
+Button mapping:
     A        -> [SHUTDOWN] (emergency stop)
     B        -> [MOTION_FADE_OUT]
     X        -> [MOTION_FADE_IN]
@@ -28,7 +28,7 @@ import numpy as np
 
 from unitree_launcher.controller.input import InputController
 
-# Button indices in the 16-bit button field (matching RoboJuDo)
+# Button indices in the 16-bit button field
 _BTN_R1 = 0
 _BTN_START = 2
 _BTN_SELECT = 3
@@ -61,7 +61,6 @@ class WirelessInput(InputController):
         """Parse wireless controller bytes from robot state.
 
         Called each control tick with ``robot_state.wireless_remote`` bytes.
-        Format matches RoboJuDo's ``unitreeRemoteController.parse()``.
 
         Args:
             remote_data: Raw bytes from the robot's wireless remote field.
@@ -99,7 +98,7 @@ class WirelessInput(InputController):
             if pressed[_BTN_DOWN]:
                 self._commands.add("[POLICY_PREV]")
 
-        # Parse stick axes (floats at byte offsets matching RoboJuDo)
+        # Parse stick axes (little-endian floats at fixed byte offsets)
         lx = struct.unpack("<f", remote_data[4:8])[0]    # LeftX -> vy
         rx = struct.unpack("<f", remote_data[8:12])[0]    # RightX -> yaw
         ly = struct.unpack("<f", remote_data[20:24])[0]   # LeftY -> vx

@@ -59,16 +59,17 @@ uv run sim --gantry --gui --duration 40
 # Sim with viser
 uv run sim --gantry --viser --duration 40
 
-# Real robot (on G1, after deploy)
-uv run real --gantry -c configs/g1_deploy.yaml --duration 40
+# Real robot (on G1, after deploy — press Start when ready)
+uv run real --gantry --duration 40
 
 # Compare logged data
 uv run python scripts/compare_sim2real.py logs/<sim_run>/ logs/<real_run>/
 ```
 
 The test sequence:
-1. **Prepare** (10-20s): Smooth blend from current pose to home position
-2. **Sinusoid**: Right shoulder pitch sweeps through quarter ROM (negative direction only, 0.2 Hz)
+1. **Prepare** (5s): Smooth blend from current pose to home position
+2. **Hold**: Waits for Start button (real) or Space (sim) before continuing
+3. **Sinusoid**: Right shoulder pitch sweeps through quarter ROM (negative direction only, 0.2 Hz)
 
 All infrastructure is active: wireless E-stop (A button), gamepad, keyboard, data logging, video recording (`--record`).
 
@@ -93,8 +94,8 @@ ssh unitree@192.168.123.164
 cd ~/unitree_launcher
 ./scripts/build_cpp_backend.sh
 
-# Run
-uv run real -c configs/g1_deploy.yaml --policy assets/policies/stance_29dof.onnx
+# Run (press Start on wireless controller after prepare completes)
+uv run real --policy assets/policies/stance_29dof.onnx
 ```
 
 ### Wireless Controller (Real Robot)
@@ -104,9 +105,9 @@ uv run real -c configs/g1_deploy.yaml --policy assets/policies/stance_29dof.onnx
 | **A** | E-stop (software, checked every tick) |
 | **L2+B** | Hardware damping mode (firmware-level, always works) |
 | **B** | Stop policy (return to stance) |
-| **X** | Start / re-activate policy |
-| **Y** | Reset policy (stop + reset + re-activate) |
-| **Start** | Start policy |
+| **X** | Resume / re-activate policy |
+| **Y** | Reset policy (stop + reset + re-prepare) |
+| **Start** | Start policy (also activates after prepare hold) |
 | **Select** | Stop policy |
 | **Left stick** | Forward/back (Y) and strafe (X) |
 | **Right stick X** | Yaw rate |
@@ -114,17 +115,19 @@ uv run real -c configs/g1_deploy.yaml --policy assets/policies/stance_29dof.onnx
 
 ### Prepare Phase
 
-On real hardware, a 20-second prepare phase blends from the current pose to the default stance:
-- 300-step linear ramp (6s) from current motor positions to home pose
+On real hardware, a 5-second prepare phase blends from the current pose to the default stance:
+- Linear ramp (80% of duration) from current motor positions to home pose
 - Policies warm up (ONNX session + observation history) during prepare
 - Wireless A-button E-stop is active throughout
 - At 90%, policy state is reset for clean activation
+- After prepare, the robot **holds pose** until you press **Start** (wireless) or **Space** (keyboard)
+- Use `--auto` to skip the hold and activate the policy immediately
 
 ## Keyboard Controls (Simulation)
 
 | Key | Action |
 |-----|--------|
-| `Space` | Toggle policy (start / stop) |
+| `Space` | Toggle policy (start / stop, also activates after prepare hold) |
 | `Backspace` | E-stop (latching) |
 | `Enter` | Clear E-stop |
 | `Delete` | Reset robot and policy |
@@ -145,16 +148,13 @@ Sidebar controls: Start/Stop, E-stop, Reset, policy selector, velocity sliders, 
 
 ## Configuration
 
-YAML configs in `configs/`. CLI arguments override config values.
+YAML configs in `configs/`. Each mode auto-selects its config — no `-c` needed unless overriding.
 
-| Config | Use |
-|--------|-----|
-| `default.yaml` | Base config for sim |
-| `g1_deploy.yaml` | Onboard real deployment |
-| `g1_sim_bm.yaml` | BeyondMimic simulation |
-| `g1_real_bm.yaml` | BeyondMimic on real robot |
-| `g1_29dof.yaml` | 29-DOF variant defaults |
-| `g1_23dof.yaml` | 23-DOF variant defaults |
+| Config | Auto-selected by | Description |
+|--------|------------------|-------------|
+| `sim.yaml` | `sim`, `eval`, `mirror` | Simulation defaults (500 Hz physics, domain ID 1) |
+| `real.yaml` | `real` | Onboard deployment (eth0, domain ID 0, tilt/frame-drop checks) |
+| `unsafe.yaml` | `--preset unsafe` | Disables tilt check and joint position limits |
 
 Key settings:
 ```yaml
@@ -345,3 +345,12 @@ uv run real --estimate-imu --policy assets/policies/filtered_imu_policy.onnx
 - **Hardware fallback**: L2+B on wireless controller triggers firmware-level damping
 - **Exception handling**: Any control loop exception triggers immediate E-stop
 - **E-stop latching**: Persists until explicitly cleared
+
+## Acknowledgments
+
+This project is an independent implementation inspired by the design and architecture of:
+
+- [RoboJuDo](https://github.com/HansZ8/RoboJuDo) by HansZ8 — Plug-and-play deployment framework for humanoid robots (CC BY 4.0)
+- [unitree_cpp](https://github.com/HansZ8/unitree_cpp) by GDDG08 — C++ binding for Unitree G1 motor control (CC BY 4.0)
+
+Third-party licenses are in the [`licenses/`](licenses/) directory.

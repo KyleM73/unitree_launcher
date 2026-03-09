@@ -154,9 +154,9 @@ class Policy(ABC):
         return results[0].flatten().astype(np.float64)
 
     def _smooth_action(self, raw_action: np.ndarray) -> np.ndarray:
-        """Apply EMA smoothing, clipping, and scaling (RoboJuDo pattern).
+        """Apply EMA smoothing, clipping, and scaling.
 
-        Order: EMA -> clip -> scale (matching RoboJuDo base_policy.py).
+        Order: EMA -> clip -> scale.
         """
         # 1. EMA smoothing
         action = (

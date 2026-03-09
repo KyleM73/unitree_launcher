@@ -7,8 +7,8 @@ Callers manage timing:
 - **headless/eval**: tight ``while runtime.step(): pass`` loop (max speed)
 - **gui/viser/real**: ``runtime.start_threaded()`` (daemon thread + sleep)
 
-Supports dual-policy mode: a default policy (IsaacLab velocity tracking) for
-stance/idle and an active policy (BM, IL, etc.) for execution.
+Supports dual-policy mode: a default policy for stance/idle and an active
+policy for execution.
 
 """
 from __future__ import annotations
@@ -37,9 +37,9 @@ class Runtime:
 
     Supports dual-policy mode:
 
-    - **Default policy** (IsaacLab velocity tracking): runs in IDLE/STOPPED
-      states with zero velocity command for balanced stance.
-    - **Active policy** (``--policy``): runs in RUNNING state (BM, IL, etc.).
+    - **Default policy**: runs in IDLE/STOPPED states with zero velocity
+      command for balanced stance.
+    - **Active policy** (``--policy``): runs in RUNNING state.
 
     If no default policy is provided, IDLE/STOPPED uses static PD hold
     at home pose (standby gains).
@@ -58,7 +58,7 @@ class Runtime:
             ``None`` when running a mode sequence without a policy.
         logger: Optional data logger.
         policy_dir: Optional directory of ONNX files for ``-/=`` key cycling.
-        default_policy: Optional IsaacLab policy for stance/velocity tracking.
+        default_policy: Optional policy for stance/velocity tracking.
         default_joint_mapper: Joint mapper for the default policy.
         mode_sequence: Ordered list of ``(ControlMode, duration_seconds)``
             pairs.  When set, the control loop auto-advances through these
@@ -171,6 +171,10 @@ class Runtime:
         # Prepare mode state
         self._prepare_reset_done: bool = False
         self._prepare_done: bool = False  # True after PREPARE completes; cleared on stop/reset
+
+        # Manual start gate: hold pose after prepare until explicit [START]/[TOGGLE]
+        self.require_manual_start: bool = False
+        self._awaiting_start: bool = False
 
         # Transition interpolation state: cosine-ramp from current position
         # to the incoming policy's starting position before handing off.
@@ -296,14 +300,20 @@ class Runtime:
         """Process discrete commands from input controllers."""
         for cmd in commands:
             if cmd == "[TOGGLE]":
-                if self.safety.state in (SystemState.IDLE, SystemState.STOPPED):
+                if self._awaiting_start:
+                    self._awaiting_start = False
+                    print("[runtime] Manual start — activating policy")
+                elif self.safety.state in (SystemState.IDLE, SystemState.STOPPED):
                     self.safety.start()
                     if not self._running:
                         self.start()
                 elif self.safety.state == SystemState.RUNNING:
                     self.safety.stop()
             elif cmd == "[START]":
-                if self.safety.state in (SystemState.IDLE, SystemState.STOPPED):
+                if self._awaiting_start:
+                    self._awaiting_start = False
+                    print("[runtime] Manual start — activating policy")
+                elif self.safety.state in (SystemState.IDLE, SystemState.STOPPED):
                     self.safety.start()
                     if not self._running:
                         self.start()
@@ -455,11 +465,10 @@ class Runtime:
 
         Re-reads actual motor position each step (tracks settling on real
         hardware). Gains are constant (default policy stiffness/damping).
-        Matches RoboJuDo's prepare() exactly.
         """
         _, duration = self._mode_sequence[self._seq_index]
         total_steps = int(duration * self.config.control.policy_frequency)
-        ramp_steps = int(total_steps * 0.5)
+        ramp_steps = int(total_steps * 0.8)
 
         current = state.joint_positions
         desired = self._default_policy.default_pos
@@ -478,11 +487,9 @@ class Runtime:
     def _build_damping_command(self, state: RobotState) -> RobotCommand:
         """Build pure velocity-damping command (kp=0, per-joint kd, pos=current).
 
-        Uses per-joint kd from ``interp_kd_end`` (IsaacLab training gains)
-        when available, otherwise falls back to the flat ``kd_damp`` config
-        value.  Per-joint gains keep damping forces within each actuator's
-        ``forcerange`` — a flat kd=5 exceeds the wrist actuators' ±5 Nm
-        limit at modest velocities, causing oscillation.
+        Uses per-joint kd from ``interp_kd_end`` when available, otherwise
+        falls back to the flat ``kd_damp`` config value.  Per-joint gains
+        keep damping forces within each actuator's ``forcerange``.
         """
         n = self.robot.n_dof
         if self._interp_kd_end is not None:
@@ -716,7 +723,6 @@ class Runtime:
                     reset_step = int(total_steps * 0.9)
                     if self._seq_step == reset_step and not self._prepare_reset_done:
                         self._prepare_reset_done = True
-                        print(f"[runtime] Prepare: resetting zero position at step {self._seq_step}")
                         if self.policy is not None:
                             self.policy.reset()
                         if self._default_policy is not None:
@@ -739,24 +745,25 @@ class Runtime:
                 self.sim_step_count += 1
 
                 self._seq_step += 1
-                if self._seq_step % 100 == 0:
-                    pct = int(100 * self._seq_step / total_steps) if total_steps > 0 else 100
-                    print(
-                        f"[runtime] mode={mode.value} "
-                        f"step={self._seq_step}/{total_steps} ({pct}%)"
-                    )
+                if total_steps > 0 and self._seq_step % (total_steps // 10 or 1) == 0:
+                    pct = int(100 * self._seq_step / total_steps)
+                    print(f"[runtime] {mode.value} {pct}%")
 
                 if self._seq_step >= total_steps:
                     self._seq_index += 1
                     self._seq_step = 0
                     if self._seq_index >= len(self._mode_sequence):
-                        print("[runtime] Mode sequence completed")
                         # Clear mode sequence so step() falls through
                         # to normal operation. Mark prepare done so
                         # branch 4 activates the policy instead of
                         # replaying PREPARE.
                         self._mode_sequence = None
                         self._prepare_done = True
+                        if self.require_manual_start:
+                            self._awaiting_start = True
+                            print("[runtime] Prepare complete — press Start to activate policy")
+                        else:
+                            print("[runtime] Prepare complete")
                         return True
                     next_mode, next_dur = self._mode_sequence[self._seq_index]
                     self._control_mode = next_mode
@@ -772,6 +779,7 @@ class Runtime:
             if self.safety.state != SystemState.RUNNING:
                 self._policy_active = False
                 self._prepare_done = False
+                self._awaiting_start = False
                 self._clear_transition()
                 state = self.robot.get_state()
                 if self._estimator is not None:
@@ -806,6 +814,24 @@ class Runtime:
                 if self._initial_mode_sequence and self._mode_sequence is None and not self._prepare_done:
                     self._restart_with_prepare()
                     return True
+
+                # Hold pose and wait for explicit start command
+                if self._awaiting_start:
+                    state = self.robot.get_state()
+                    if self._estimator is not None:
+                        self._estimator.update(state)
+                        state = self._estimator.populate_robot_state(state)
+                    # Hold the final prepare pose with prepare gains
+                    if self._last_seq_cmd is not None:
+                        cmd = self._last_seq_cmd
+                    else:
+                        cmd = self._build_damping_command(state)
+                    cmd = self.safety.clamp_command(cmd, state)
+                    self.robot.send_command(cmd)
+                    self.robot.step()
+                    self.sim_step_count += 1
+                    return True
+
                 # Capture current state as interpolation start
                 state_now = self.robot.get_state()
                 start_pos = state_now.joint_positions.copy()
@@ -835,8 +861,6 @@ class Runtime:
                     print("[runtime] Active policy started")
 
                 # Interpolation target: the policy's starting pose and gains.
-                # starting_pos uses the first reference frame for BM,
-                # default_pos for other policies.
                 target_pos = self.policy.starting_pos.copy()
                 target_kp = self.policy.stiffness.copy()
                 target_kd = self.policy.damping.copy()

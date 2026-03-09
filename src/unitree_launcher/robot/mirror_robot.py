@@ -87,8 +87,13 @@ class MirrorRobot(RobotInterface):
 
     # ---- RobotInterface implementation ----
 
-    def connect(self) -> None:
-        """Initialize DDS and verify connection by waiting for first state message."""
+    def connect(self, peer: str = None) -> None:
+        """Initialize DDS and verify connection by waiting for first state message.
+
+        Args:
+            peer: Optional robot IP for unicast DDS discovery (required for WiFi,
+                where multicast typically doesn't work).
+        """
         if self._connected:
             return
 
@@ -105,9 +110,41 @@ class MirrorRobot(RobotInterface):
         from unitree_sdk2py.idl.default import unitree_hg_msg_dds__LowCmd_
         from unitree_sdk2py.utils.crc import CRC
 
-        # Real robot uses domain_id=0
         iface = resolve_network_interface(self._config.network.interface)
-        ChannelFactoryInitialize(0, iface)
+
+        if peer:
+            # Unicast DDS discovery for WiFi (multicast often blocked by routers).
+            # Bypass ChannelFactoryInitialize — it passes its own XML to Domain()
+            # which would override our unicast peer config.
+            from cyclonedds.domain import Domain, DomainParticipant
+            from unitree_sdk2py.core.channel import ChannelFactory
+            xml = f'''<?xml version="1.0" encoding="UTF-8" ?>
+<CycloneDDS>
+    <Domain Id="any">
+        <General>
+            <Interfaces>
+                <NetworkInterface name="{iface}" priority="default" multicast="false"/>
+            </Interfaces>
+            <AllowMulticast>false</AllowMulticast>
+        </General>
+        <Discovery>
+            <Peers>
+                <Peer Address="{peer}"/>
+            </Peers>
+            <ParticipantIndex>auto</ParticipantIndex>
+        </Discovery>
+    </Domain>
+</CycloneDDS>'''
+            domain = Domain(0, xml)
+            participant = DomainParticipant(0)
+            # Inject into ChannelFactory singleton using its Init pattern:
+            # class-level attrs with name mangling (_ChannelFactory__xxx)
+            ChannelFactory._ChannelFactory__domain = domain
+            ChannelFactory._ChannelFactory__participant = participant
+            ChannelFactory._ChannelFactory__initialized = True
+            logger.info(f"DDS unicast mode: peer={peer}, interface={iface}")
+        else:
+            ChannelFactoryInitialize(0, iface)
 
         # Command publisher
         self._low_cmd_msg = unitree_hg_msg_dds__LowCmd_()

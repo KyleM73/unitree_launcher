@@ -105,7 +105,7 @@ class RobotCommand:
 
     @staticmethod
     def damping(n_dof: int, kd: float = 8.0) -> RobotCommand:
-        """Create a damping-mode command (Kp=0, Kd=8, matching RoboJuDo)."""
+        """Create a damping-mode command (Kp=0, Kd=8)."""
         return RobotCommand(
             joint_positions=np.zeros(n_dof),
             joint_velocities=np.zeros(n_dof),

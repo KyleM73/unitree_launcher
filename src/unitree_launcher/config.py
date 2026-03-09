@@ -840,7 +840,7 @@ class SafetyConfig:
     torque_limits: bool = True
     fault_threshold: float = 0.99
     tilt_check: bool = True
-    tilt_threshold_rad: float = 1.0  # ~57 degrees (matching RoboJuDo)
+    tilt_threshold_rad: float = 1.0  # ~57 degrees
     frame_drop_check: bool = True
     frame_drop_threshold: float = 0.2  # 200ms
 
