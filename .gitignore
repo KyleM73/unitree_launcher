@@ -45,3 +45,4 @@ uv.lock
 reference/
 sim2real_ws/
 .claude/
+assets/policies/*.onnx
