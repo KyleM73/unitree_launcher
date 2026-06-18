@@ -43,3 +43,5 @@ uv.lock
 
 # Reference implementations (large, not our code)
 reference/
+sim2real_ws/
+.claude/
